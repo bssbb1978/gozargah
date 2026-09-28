@@ -152,6 +152,28 @@ export const PANEL_JS = String.raw`
     loadUsers(); loadSettings(); loadEvents(); renderDash();
   }
 
+  function runAiAdvisor() {
+    var btn = $('#ai-advisor-btn');
+    var result = $('#ai-advisor-result');
+    if (GZ.mock) {
+      result.textContent = S.lang === 'fa'
+        ? 'پیش‌نمایش آفلاین است؛ برای تحلیل واقعی، Workers AI را در Worker فعال کنید.'
+        : 'Offline preview: enable Workers AI on the Worker to run a live analysis.';
+      return;
+    }
+    btn.disabled = true;
+    result.textContent = t('aiAdvisorLoading');
+    api('/ai/diagnostics', { method: 'POST', body: JSON.stringify({ language: S.lang }) })
+      .then(function (data) {
+        var label = data.model ? ' · ' + t('aiAdvisorModel') + ': ' + data.model : '';
+        result.textContent = String(data.text || '') + label;
+      })
+      .catch(function (e) { result.textContent = e.message === 'ai_rate_limited'
+        ? (S.lang === 'fa' ? 'سهمیهٔ درخواست تحلیل پر شده است؛ ۱۰ دقیقه دیگر دوباره امتحان کنید.' : 'Advisor request limit reached; try again in 10 minutes.')
+        : e.message; })
+      .then(function () { btn.disabled = false; });
+  }
+
   /* ---------------- dashboard ---------------- */
   function renderDash() {
     var st = S.status || {};
@@ -225,6 +247,7 @@ export const PANEL_JS = String.raw`
       var btns =
         '<button class="btn sm primary" data-act="links" data-id="' + u.id + '">' + esc(t('clientLinks')) + '</button>' +
         (u.isAdmin ? '' :
+          '<button class="btn sm ' + (u.enabled ? 'danger' : 'primary') + '" data-act="toggle" data-id="' + u.id + '">' + esc(t(u.enabled ? 'disableUser' : 'enableUser')) + '</button>' +
           '<button class="btn sm" data-act="status" data-id="' + u.id + '">' + esc(t('statusPage')) + '</button>' +
           '<button class="btn sm" data-act="edit" data-id="' + u.id + '">' + esc(t('edit')) + '</button>' +
           '<button class="btn sm danger" data-act="del" data-id="' + u.id + '">' + esc(t('delete')) + '</button>');
@@ -244,8 +267,18 @@ export const PANEL_JS = String.raw`
         else if (act === 'status') openStatusPage(u);
         else if (act === 'edit') openEditUser(u);
         else if (act === 'del') confirmDelete(u);
+        else if (act === 'toggle') toggleUser(u);
       });
     });
+  }
+
+  function toggleUser(u) {
+    var enabled = !u.enabled;
+    var question = t(enabled ? 'confirmEnableUser' : 'confirmDisableUser');
+    if (!window.confirm(question)) return;
+    api('/users/' + u.id, { method: 'PATCH', body: JSON.stringify({ enabled: enabled }) })
+      .then(function () { loadUsers(); toast(t('saved'), 'ok'); })
+      .catch(function (e) { toast(e.message, 'err'); });
   }
 
   function linkRows(r) {
@@ -534,6 +567,7 @@ export const PANEL_JS = String.raw`
 
     $('#add-user-btn').addEventListener('click', openAddUser);
     $('#save-settings').addEventListener('click', saveSettings);
+    $('#ai-advisor-btn').addEventListener('click', runAiAdvisor);
   });
 })();
 `;

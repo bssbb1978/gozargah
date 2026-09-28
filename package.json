@@ -1,6 +1,6 @@
 {
   "name": "gozargah",
-  "version": "1.3.0",
+  "version": "1.4.1",
   "private": true,
   "description": "Gozargah - a beautiful, secure, multi-user VLESS/Trojan panel on Cloudflare Workers with real byte accounting, per-operator tuning, Xray auto-best and D1 storage",
   "main": "src/index.ts",

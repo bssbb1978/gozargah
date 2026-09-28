@@ -1,8 +1,10 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
 import type { D1Database } from '@cloudflare/workers-types';
 import { getUserByIdFresh, recordUsageDelta } from '../db/users';
+import { consumeAiDiagnosticQuota } from '../db/store';
+import { createDiagnostics, getAiModelCandidates, rankCatalogModels } from '../ai/diagnostics';
 
 let mf: Miniflare;
 let db: D1Database;
@@ -39,7 +41,7 @@ describe('Cloudflare Worker + D1 integration', () => {
   it('serves health without initializing admin state', async () => {
     const response = await mf.dispatchFetch('https://gozargah.test/healthz');
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true, version: '1.3.0' });
+    expect(await response.json()).toMatchObject({ ok: true, version: '1.4.1' });
   });
 
   it('rejects webhook requests without Telegram secret', async () => {
@@ -106,5 +108,79 @@ describe('Cloudflare Worker + D1 integration', () => {
     await post(301, '1');
     const admin = await db.prepare('SELECT enabled FROM users WHERE id = 1').first<{ enabled: number }>();
     expect(admin?.enabled).toBe(1);
+  });
+
+  it('falls back to an on-Worker deterministic advisor when AI is not bound', async () => {
+    const result = await createDiagnostics({ GZ_DB: db }, 'fa');
+    expect(result.ai).toBe(false);
+    expect(result.text).toContain('عیب‌یابی محلیِ قاعده‌محور');
+    expect(result.text).toContain('بدون فراخوانی بیرونی');
+  });
+
+  it('enforces an atomic D1-backed budget for AI analysis', async () => {
+    const now = 1_800_000_000_000;
+    for (let i = 0; i < 5; i++) expect(await consumeAiDiagnosticQuota(db, 'test-ip-hash', now)).toBe(true);
+    expect(await consumeAiDiagnosticQuota(db, 'test-ip-hash', now)).toBe(false);
+    expect(await consumeAiDiagnosticQuota(db, 'test-ip-hash', now + 10 * 60_000)).toBe(true);
+  });
+
+  it('tries configured Workers AI models in priority order and sends aggregate data only', async () => {
+    expect(getAiModelCandidates(' @cf/example/new , invalid url, @cf/example/backup ')).toEqual([
+      '@cf/example/new', '@cf/example/backup',
+    ]);
+    expect(rankCatalogModels({ result: [
+      { id: '@cf/example/older', task: 'Text Generation', updated_at: '2025-01-01' },
+      { id: '@cf/example/newer', task: 'Text Generation', updated_at: '2026-08-01' },
+      { id: '@cf/example/image', task: 'Image Classification', updated_at: '2026-09-01' },
+      { id: '@other/vendor/model', task: 'Text Generation', updated_at: '2026-09-02' },
+    ] })).toEqual(['@cf/example/newer', '@cf/example/older']);
+    const captured: string[] = [];
+    const result = await createDiagnostics({
+      GZ_DB: db,
+      AI_MODELS: '@cf/example/unavailable,@cf/example/working',
+      AI: { run: async (model, input) => {
+        captured.push(JSON.stringify(input));
+        if (model.endsWith('unavailable')) throw new Error('model disabled');
+        return { response: 'پیشنهاد: وضعیت سهمیه‌ها را بازبینی کنید.' };
+      } },
+    }, 'fa');
+    expect(result).toMatchObject({ ai: true, model: '@cf/example/working' });
+    expect(captured).toHaveLength(2);
+    expect(captured.join('')).not.toContain('Test user');
+    expect(captured.join('')).not.toContain('admin-uuid');
+    expect(captured.join('')).not.toContain('test-pass');
+  });
+
+  it('discovers fresh Cloudflare text models without exposing the catalog token', async () => {
+    const requests: Array<{ url: string; authorization: string }> = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ url: String(input), authorization: new Headers(init?.headers).get('authorization') || '' });
+      return Response.json({ success: true, result: [
+        { id: '@cf/test/older', task: 'Text Generation', updated_at: '2025-01-01' },
+        { id: '@cf/test/newest', task: 'Text Generation', updated_at: '2026-08-01' },
+      ] });
+    });
+    try {
+      const result = await createDiagnostics({
+        GZ_DB: db,
+        AI_CATALOG_ACCOUNT_ID: '11111111111111111111111111111111',
+        AI_CATALOG_API_TOKEN: 'test-catalog-token-value',
+        AI: { run: async (model) => ({ response: model }) },
+      }, 'en');
+      expect(result.model).toBe('@cf/test/newest');
+      expect(requests).toHaveLength(1);
+      expect(requests[0].url).toContain('https://api.cloudflare.com/client/v4/accounts/');
+      expect(requests[0].authorization).toBe('Bearer test-catalog-token-value');
+      expect(JSON.stringify(result)).not.toContain('test-catalog-token-value');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('protects the AI diagnostic endpoint behind panel authentication', async () => {
+    const response = await mf.dispatchFetch('https://gozargah.test/gozargah/api/ai/diagnostics', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ language: 'fa' }),
+    });
+    expect(response.status).toBe(401);
   });
 });

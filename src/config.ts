@@ -2,7 +2,7 @@
  * Gozargah — global config, types and shared errors.
  */
 
-export const VERSION = '1.3.0';
+export const VERSION = '1.4.1';
 export const SCHEMA_VERSION = 3;
 
 /** D1 binding name (see wrangler.toml) */
@@ -16,6 +16,14 @@ export interface Env {
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   TELEGRAM_ADMIN_IDS?: string;
+  /** Optional native Cloudflare Workers AI binding for aggregate diagnostics. */
+  AI?: { run: (model: string, input: unknown) => Promise<unknown> };
+  /** Explicit prioritized model IDs; if absent, optional live model discovery is used. */
+  AI_MODELS?: string;
+  /** Optional Workers AI Read-scoped token for the fixed Cloudflare model-search API. */
+  AI_CATALOG_API_TOKEN?: string;
+  /** Cloudflare account ID for model discovery; not a secret. */
+  AI_CATALOG_ACCOUNT_ID?: string;
   /** Optional service binding for controlled egress/tests; normally omitted. */
   TELEGRAM_API?: Fetcher;
 }

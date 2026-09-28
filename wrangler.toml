@@ -12,5 +12,10 @@ binding = "GZ_DB"
 database_name = "gozargah"
 database_id = "00000000-0000-0000-0000-000000000000"
 
+# Optional, native Cloudflare-hosted inference used only by the read-only
+# aggregate operations advisor. Remove this binding to disable AI entirely.
+[ai]
+binding = "AI"
+
 [observability]
 enabled = true

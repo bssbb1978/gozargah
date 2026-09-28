@@ -60,6 +60,11 @@ const DDL = [
      count INTEGER NOT NULL,
      window_start INTEGER NOT NULL
    )`,
+  `CREATE TABLE IF NOT EXISTS ai_throttle (
+     ip_hash TEXT PRIMARY KEY,
+     count INTEGER NOT NULL,
+     window_start INTEGER NOT NULL
+   )`,
   `CREATE TABLE IF NOT EXISTS telegram_fsm (
      chat_id TEXT PRIMARY KEY,
      state TEXT NOT NULL CHECK (state IN ('awaiting_disable_id', 'awaiting_enable_id')),
@@ -211,6 +216,20 @@ export async function recordLoginFailure(db: D1Database, ipHash: string): Promis
   } else {
     await db.prepare('UPDATE auth_throttle SET count = count + 1 WHERE ip_hash = ?1').bind(ipHash).run();
   }
+}
+
+/** Atomic D1-backed budget for expensive AI diagnostics (five calls per 10 minutes/IP). */
+export async function consumeAiDiagnosticQuota(db: D1Database, ipHash: string, now = Date.now()): Promise<boolean> {
+  await ensureSchema(db);
+  const windowMs = 10 * 60_000;
+  const row = await db.prepare(
+    'INSERT INTO ai_throttle (ip_hash, window_start, count) VALUES (?1, ?2, 1) ' +
+    'ON CONFLICT(ip_hash) DO UPDATE SET ' +
+    'count = CASE WHEN ai_throttle.window_start <= ?3 THEN 1 ELSE ai_throttle.count + 1 END, ' +
+    'window_start = CASE WHEN ai_throttle.window_start <= ?3 THEN ?2 ELSE ai_throttle.window_start END ' +
+    'WHERE ai_throttle.window_start <= ?3 OR ai_throttle.count < ?4 RETURNING count',
+  ).bind(ipHash, now, now - windowMs, 5).first<{ count: number }>();
+  return row !== null;
 }
 
 export async function clearLoginThrottle(db: D1Database, ipHash: string): Promise<void> {
