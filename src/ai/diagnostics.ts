@@ -96,6 +96,47 @@ async function selectModels(env: Env): Promise<string[]> {
   return discovered.length ? discovered : [...DEFAULT_MODELS];
 }
 
+function localAdvice(summary: Record<string, number | string>, language: 'fa' | 'en', aiUnavailable: boolean): string {
+  const notes: string[] = [];
+  const total = Number(summary.totalUsers) || 0;
+  const enabled = Number(summary.enabledUsers) || 0;
+  const disabled = Number(summary.disabledUsers) || 0;
+  const seen = Number(summary.recentlySeen24h) || 0;
+  const fallbacks = Number(summary.configuredFallbackCount) || 0;
+  if (summary.database !== 'connected') {
+    notes.push(language === 'fa'
+      ? 'D1 متصل نیست؛ کاربران، تنظیمات و محدودیت درخواست‌ها پایدار نخواهند بود.'
+      : 'D1 is not connected; users, settings, and request limits are not persistent.');
+  } else if (total === 0) {
+    notes.push(language === 'fa' ? 'هنوز کاربری در D1 ثبت نشده است.' : 'No users are registered in D1 yet.');
+  }
+  if (total > 0 && enabled === 0) {
+    notes.push(language === 'fa' ? 'هیچ کاربر فعالی وجود ندارد؛ وضعیت دسترسی کاربران را بررسی کنید.' : 'No users are enabled; review account access states.');
+  } else if (disabled > 0) {
+    notes.push(language === 'fa' ? 'برای تعدادی از کاربران دسترسی غیرفعال است؛ وضعیت هر کارت را بررسی کنید.' : 'Some accounts are disabled; review their status in the user cards.');
+  }
+  if (enabled > 0 && seen === 0) {
+    notes.push(language === 'fa'
+      ? 'در ۲۴ ساعت اخیر فعالیتی ثبت نشده؛ این به‌تنهایی نشانهٔ فیلتر نیست. دامنهٔ متصل به Worker، وضعیت کلاینت و اتصال شبکه را جداگانه بررسی کنید.'
+      : 'No activity was recorded in the last 24 hours. This alone does not indicate filtering; check the Worker domain, client status, and network separately.');
+  }
+  if (fallbacks === 0) {
+    notes.push(language === 'fa'
+      ? 'هیچ ProxyIP جایگزینی تنظیم نشده؛ فقط برای مقصدهای پشت Cloudflare کاربرد دارد و راهکار عمومی قطعی فیلترینگ نیست.'
+      : 'No ProxyIP fallback is configured. It only applies to Cloudflare-fronted destinations and is not a general censorship workaround.');
+  }
+  if (!notes.length) {
+    notes.push(language === 'fa'
+      ? 'از شمارنده‌های موجود مشکل قطعی مشخص نیست. وضعیت شبکهٔ کاربر و سلامت دامنه را از همان شبکه به‌صورت جداگانه بررسی کنید.'
+      : 'The available counters show no definite issue. Check the user network and domain health independently from the affected network.');
+  }
+  const heading = language === 'fa' ? 'عیب‌یابی محلیِ قاعده‌محور (بدون مدل AI):' : 'Local rule-based diagnostics (no AI model):';
+  const status = aiUnavailable
+    ? (language === 'fa' ? '\nسرویس مدل AI در دسترس نبود؛ binding، شناسه/مجوز مدل و محدودیت حساب را بررسی کنید. این تحلیل روی Worker و بدون فراخوانی مدل تولید شد.' : '\nThe AI model service was unavailable; check its binding, model ID/permission, and account limits. This analysis ran on the Worker without a model call.')
+    : (language === 'fa' ? '\nمدل AI تنظیم نشده؛ این تحلیل روی Worker و بدون فراخوانی بیرونی تولید شد.' : '\nNo AI model is configured; this analysis ran locally on the Worker without an inference call.');
+  return heading + '\n• ' + notes.slice(0, 3).join('\n• ') + status;
+}
+
 function outputText(result: unknown): string {
   if (typeof result === 'string') return result;
   if (!result || typeof result !== 'object') return '';
@@ -131,9 +172,7 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
       ai: false,
       model: null,
       summary,
-      text: language === 'fa'
-        ? 'اتصال Workers AI تنظیم نشده است. برای فعال‌سازی، binding با نام AI را در تنظیمات Worker اضافه کنید. دادهٔ عملیاتی بالا بدون AI هم قابل مشاهده است.'
-        : 'Workers AI is not configured. Add a binding named AI to enable the advisor. The operational summary above is available without AI.',
+      text: localAdvice(summary, language, false),
     };
   }
 
@@ -168,8 +207,6 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
     ai: false,
     model: null,
     summary,
-    text: language === 'fa'
-      ? 'مدل‌های Workers AI در دسترس نبودند یا اجرای آن‌ها ناموفق شد. اتصال AI، شناسهٔ مدل و سهمیهٔ حساب را بررسی کنید؛ هیچ تغییری در تنظیمات شبکه انجام نشده است.'
-      : 'Workers AI models were unavailable or failed. Check the AI binding, model IDs, and account limits. No network settings were changed.',
+    text: localAdvice(summary, language, true),
   };
 }

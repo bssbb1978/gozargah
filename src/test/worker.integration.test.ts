@@ -41,7 +41,7 @@ describe('Cloudflare Worker + D1 integration', () => {
   it('serves health without initializing admin state', async () => {
     const response = await mf.dispatchFetch('https://gozargah.test/healthz');
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true, version: '1.4.0' });
+    expect(await response.json()).toMatchObject({ ok: true, version: '1.4.1' });
   });
 
   it('rejects webhook requests without Telegram secret', async () => {
@@ -108,6 +108,13 @@ describe('Cloudflare Worker + D1 integration', () => {
     await post(301, '1');
     const admin = await db.prepare('SELECT enabled FROM users WHERE id = 1').first<{ enabled: number }>();
     expect(admin?.enabled).toBe(1);
+  });
+
+  it('falls back to an on-Worker deterministic advisor when AI is not bound', async () => {
+    const result = await createDiagnostics({ GZ_DB: db }, 'fa');
+    expect(result.ai).toBe(false);
+    expect(result.text).toContain('عیب‌یابی محلیِ قاعده‌محور');
+    expect(result.text).toContain('بدون فراخوانی بیرونی');
   });
 
   it('enforces an atomic D1-backed budget for AI analysis', async () => {
