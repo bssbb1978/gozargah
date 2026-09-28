@@ -2,8 +2,8 @@
  * Gozargah — global config, types and shared errors.
  */
 
-export const VERSION = '1.2.0';
-export const SCHEMA_VERSION = 2;
+export const VERSION = '1.3.0';
+export const SCHEMA_VERSION = 3;
 
 /** D1 binding name (see wrangler.toml) */
 export const DB_BINDING = 'GZ_DB';
@@ -12,6 +12,12 @@ export interface Env {
   /** D1 database — optional at runtime; without it the worker runs in
    *  deterministic "no-database" mode and the panel shows a setup guide. */
   GZ_DB?: D1Database;
+  /** Optional Telegram bot integration. Store these as Worker secrets/vars. */
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_WEBHOOK_SECRET?: string;
+  TELEGRAM_ADMIN_IDS?: string;
+  /** Optional service binding for controlled egress/tests; normally omitted. */
+  TELEGRAM_API?: Fetcher;
 }
 
 /** Error type carrying a short machine code for the panel API. */

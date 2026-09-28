@@ -106,7 +106,7 @@
 
 </div>
 
-فقط یک اکانت Cloudflare لازم است — **پلن رایگان کافی است**. (روش wrangler به Node.js 18+ نیاز دارد؛ روش Paste هیچ ابزاری نمی‌خواهد.)
+فقط یک اکانت Cloudflare لازم است. (روش توسعه و استقرار با Wrangler به Node.js 22.12+ نیاز دارد؛ روش Paste به Node نیاز ندارد.)
 
 ### روش ۱ — Paste در داشبورد (بدون هیچ ابزاری)
 
@@ -146,7 +146,7 @@ npm run deploy
 - هر کاربر: **UUID اختصاصی + رمز Trojan + سهمیه (GB) + تاریخ انقضا + فعال/غیرفعال**
 - **دو حالت انقضا:** تاریخ ثابت، یا «از اولین اتصال» — ساعت فقط وقتی شروع می‌شود که کاربر واقعاً وصل شود
 - **ریست دوره‌ای مصرف:** روزانه / هفتگی / ۳۰ روزه — پنجرهٔ چرخشی بدون نیاز به Cron Worker
-- مصرف واقعی up/down هر کاربر زنده در کارت او نمایش داده می‌شود (نوار گرادیانی)
+- مصرف واقعی up/down هر کاربر زنده در کارت او نمایش داده می‌شود (نوار گرادیانی)؛ نشست‌های فعال حداکثر هر ۲ دقیقه سهمیه/انقضا/وضعیت را با D1 بازبینی می‌کنند و در صورت لغو دسترسی بسته می‌شوند
 - برای هر کاربر: لینک‌های VLESS/Trojan + QR + پنج لینک اشتراک + صفحهٔ وضعیت شخصی
 
 | مسیر | توضیح |
@@ -171,6 +171,21 @@ npm run deploy
 | ریست دوره‌ای | خاموش | صفر شدن خودکار مصرف در بازهٔ انتخابی |
 | رمز عبور | `admin` | حداقل ۸ کاراکتر |
 
+## 🤖 ربات تلگرام اختیاری (FSM روی D1)
+
+ربات، اگر تنظیم شود، فقط به شناسه‌های عددیِ مجاز در چت خصوصی پاسخ می‌دهد. حالت مکالمه در D1 نگه‌داری می‌شود (با انقضای ۱۵ دقیقه‌ای)، شناسهٔ هر update برای جلوگیری از اجرای مجدد ثبت می‌شود، و حساب مدیریتی از تغییر وضعیت محافظت شده است. فرمان‌ها: `/status`، `/users`، `/disable`، `/enable`، `/cancel`. ربات هیچ‌وقت رمز پنل، UUID یا لینک اشتراک را ارسال نمی‌کند. غیرفعال‌سازی فوراً اتصال‌های جدید را رد می‌کند؛ نشست‌های برقرار حداکثر هر ۲ دقیقه با D1 دوباره بررسی و در صورت غیرفعال‌شدن، اتمام سهمیه، انقضا یا حذف کاربر بسته می‌شوند. این بررسی دوره‌ای مصرف خواندن/نوشتن D1 دارد.
+
+1. در Cloudflare برای هر مقدار یک Secret بسازید: `TELEGRAM_BOT_TOKEN`، `TELEGRAM_WEBHOOK_SECRET` و `TELEGRAM_ADMIN_IDS` (شناسه‌های عددی تلگرام با ویرگول، مثل `12345678,87654321`).
+2. پس از Deploy، در محیط امنی که متغیرها در آن تعریف شده‌اند، webhook را ثبت کنید:
+
+```bash
+curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
+  -d "url=https://${WORKER_HOST}/_telegram/webhook" \
+  -d "secret_token=${TELEGRAM_WEBHOOK_SECRET}"
+```
+
+Webhook با هدر محرمانهٔ Telegram، allowlist فرستنده و الزام چت خصوصی بررسی می‌شود. برای خاموش‌کردن ربات، Secretها را حذف و دوباره Deploy کنید. توکن‌ها را در Git یا چت قرار ندهید.
+
 ## 📱 کلاینت‌های همخوان
 
 v2rayNG · v2rayN · Streisand · Shadowrocket · Hiddify · Clash-Meta/Stash · Sing-box · Karing · Nekobox
@@ -189,9 +204,9 @@ v2rayNG · v2rayN · Streisand · Shadowrocket · Hiddify · Clash-Meta/Stash ·
 ```bash
 npm install          # نصب وابستگی‌های توسعه
 npm run typecheck    # بررسی تایپ TypeScript
-npm test             # ۲۷ چک موتور: اپراتورها، فرمت‌ها، سهمیه، QR، هدرها
+npm test             # ۲۷ چک موتور + تست یکپارچگی Worker/D1 با Vitest و Miniflare
 npm run preview      # پیش‌نمایش آفلاین پنل با دادهٔ ماک (preview.html)
-npm run build        # باندل نهایی worker در dist/
+npm run build        # اعتبارسنجی و باندل Worker با Wrangler 4
 ```
 
 <details>
@@ -199,9 +214,9 @@ npm run build        # باندل نهایی worker در dist/
 
 **Gozargah** (Persian for *gateway*) is a complete multi-user proxy panel that runs natively on Cloudflare Workers — the entire product lives in a single JS file: admin dashboard, proxy engine, subscription generator, per-user status page and all UI assets are embedded.
 
-- **Protocols:** VLESS & Trojan over WebSocket + TLS, per-user path detection via host header
+- **Protocols:** VLESS & Trojan over WebSocket + TLS, per-user path detection via host header (no unsupported Shadowsocks/UDP claims)
 - **Storage:** Cloudflare D1 (relational — users / events / throttle), in-isolate cache, promise-dedup, optimistic locking
-- **Accounting:** real byte counting per user (up/down), live usage bars, quotas & expiry
+- **Accounting:** real byte counting per user (up/down), live usage bars, quotas & expiry; active sessions revalidate account state and persist usage every 2 minutes (D1 usage/cost trade-off)
 - **Expiry modes:** fixed date **or** days-from-first-use (the clock starts on the first actual connection) + rolling auto-reset cycles (daily / weekly / 30d) — no Cron worker needed
 - **Operator tuning:** explicit `?op=` presets for MCI, Irancell, Rightel, Shatel & TCI — per-ISP uTLS fingerprint, Xray-capped TLS-fragment preset and an HTTPS port wheel. Honesty gate: no preset is applied unless the user asks; ECH is strictly opt-in (`?ech=1`)
 - **Xray format:** profile with observatory + leastPing balancer (`auto-best`) — a throttled path is demoted automatically; fragment clone included for operator presets
@@ -209,14 +224,23 @@ npm run build        # باندل نهایی worker در dist/
 - **Security:** PBKDF2-SHA256 (100k iterations), HMAC-signed expiring sessions, persistent D1-backed rate limiting
 - **Subscriptions:** Base64 / Clash-Meta / Sing-box / Xray-core generated in-worker, auto `User-Agent` detection
 - **UI:** Gozargah Nexus UI — cinematic dark glassmorphism, full RTL, FA/EN
-- **Tests:** `npm test` — 27 engine checks (operators KB & caps, all formats, quota semantics, UA routing, headers, QR)
+- **Telegram admin bot:** opt-in, allowlisted private-chat commands with D1-backed FSM, update deduplication, short state TTL and protected admin accounts
+- **Tests:** `npm test` — 27 engine checks plus Vitest/Miniflare Worker+D1 integration tests
 
 **Deploy:** grab `dist/gozargah-worker.js` from [Releases](../../releases/latest), paste it into a new Worker, create a D1 database bound as `GZ_DB`, open `https://<worker>.workers.dev/gozargah` — login `admin`. Free plan is enough.
 
 </details>
 
+## ⚠️ مرزهای واقعی پلتفرم و صداقتِ قابلیت‌ها
+
+این نسخه روی ورودی HTTP/WebSocket و سوکت TCP خروجیِ Workers بنا شده است؛ Worker در این معماری listener خام TCP یا UDP/53 ندارد. بنابراین **Shadowsocks AEAD ورودی، فوروارد UDP-DNS روی پورت ۵۳ و NAT64 پیاده‌سازی نشده‌اند** و این پروژه آن‌ها را پشتیبانی‌شده معرفی نمی‌کند. پیاده‌سازی واقعی‌شان به لایهٔ ورودی/شبکه‌ای نیاز دارد که دیتاگرام یا TCP خام را پشتیبانی کند؛ شبیه‌سازی با WebSocket نام آن پروتکل را به پشتیبانی واقعی تبدیل نمی‌کند.
+
+همچنین اسکن خودکار رنج‌های IP برای «IP تمیز» و ادعای «هوش مصنوعی ضد DPI» اضافه نشده‌اند. فهرست مدل‌های Workers AI به‌تنهایی معیار قابل اتکایی برای «قوی‌ترین مدل» نیست: انتخاب خودکار نیازمند فهرستِ نسخه‌دار، ارزیابی وظیفه‌محور، کنترل هزینه/دسترسی و fallback است؛ scraping مستندات در هر درخواست هم پویا و پایدار نیست. هیچ AI نمی‌تواند عبور از فیلتر را تضمین کند. تعویض دامنه فقط در برابر مسدودسازی همان دامنه ممکن است کمک کند و مانع مسدودسازی IP، SNI یا الگوی ترافیک نمی‌شود. پیش از استفادهٔ عملی، محدودیت‌ها و شرایط جاری Cloudflare را برای workload خود بررسی کنید.
+
 ## 🛣 نقشهٔ راه
 
+- [x] ربات تلگرام اختیاری با FSM پایدار در D1، allowlist و dedupe — v1.3
+- [x] تست یکپارچگی Worker/D1 با Vitest + Miniflare — v1.3
 - [x] پریست‌های اپراتورهای ایران + فرگمنت داخل کپ‌های Xray — v1.2
 - [x] خروجی Xray-core با observatory و بالانسر leastPing — v1.2
 - [x] صفحهٔ وضعیت کاربر با QR و ایمپورت یک‌کلیکی — v1.2

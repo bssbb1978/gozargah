@@ -18,12 +18,16 @@ import { dialWithFallback } from './proxy';
 import { parseVless, vlessOkResponse } from '../protocols/vless';
 import { parseTrojan } from '../protocols/trojan';
 import {
-  findUserByTrojanHash, getUserByUuid, GzUser, isUserAllowed, lazyMaintenance, maybeFlushUsage, queueUsage,
+  findUserByTrojanHash, getUserByIdFresh, getUserByUuid, GzUser, isUserAllowed,
+  lazyMaintenance, maybeFlushUsage, queueUsage, recordUsageDelta,
 } from '../db/users';
 import { envlessSettings } from '../settings';
 import { DEFAULTS } from '../config';
 
 /** Implicit single user in no-database mode. */
+// Bounded revocation/quota lag without a database round-trip per traffic chunk.
+const SESSION_REVALIDATE_MS = 120_000;
+
 const IMPLICIT_USER: GzUser = {
   id: 0, name: 'admin', uuid: '', trojanPass: '',
   quotaBytes: 0, usedUp: 0, usedDown: 0, expiryAt: 0,
@@ -101,13 +105,28 @@ async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, 
   }
 
   if (info.user) {
+    // Bypass the short-lived isolate cache at the authorization boundary so a
+    // just-disabled or rotated account cannot start a new tunnel from stale data.
+    if (info.user.id > 0 && env.GZ_DB) {
+      try {
+        const fresh = await getUserByIdFresh(env.GZ_DB, info.user.id);
+        if (!fresh) {
+          try { server.close(1008); } catch { /* ignore */ }
+          return;
+        }
+        info.user = fresh;
+      } catch {
+        try { server.close(1011); } catch { /* ignore */ }
+        return;
+      }
+    }
     const verdict = isUserAllowed(info.user);
     if (!verdict.ok) {
       glog('user blocked (' + verdict.reason + ') id=' + info.user.id);
       try { server.close(1008); } catch { /* ignore */ }
       return;
     }
-    // v1.2: first-use stamping + rolling quota reset (fire-and-forget)
+    // First-use stamping + rolling reset; live sessions recheck policy below.
     if (info.user.id > 0 && env.GZ_DB) {
       const cycle = ((await getResetCycle(env)) ?? 'none') as 'none' | 'daily' | 'weekly' | 'monthly';
       ctx.waitUntil(
@@ -166,18 +185,89 @@ async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, 
     )
     .catch(() => { try { server.close(); } catch { /* ignore */ } });
 
+  const trackedUser = info.user && env.GZ_DB && info.user.id > 0 ? info.user : null;
+  const trackedDb = trackedUser ? env.GZ_DB! : null;
+  let committedUp = 0;
+  let committedDown = 0;
+  const commitUsage = async (): Promise<void> => {
+    if (!trackedUser || !trackedDb) return;
+    const snapshotUp = up;
+    const snapshotDown = down;
+    await recordUsageDelta(trackedDb, trackedUser.id, snapshotUp - committedUp, snapshotDown - committedDown);
+    committedUp = snapshotUp;
+    committedDown = snapshotDown;
+  };
+
+  const stopMonitor = new AbortController();
+  const monitor = trackedUser && trackedDb
+    ? superviseSession(trackedUser.id, stopMonitor.signal, async () => {
+        await commitUsage();
+        const current = await getUserByIdFresh(trackedDb, trackedUser.id);
+        return current ? isUserAllowed(current) : { ok: false, reason: 'deleted' };
+      }, () => {
+        try { server.close(1008); } catch { /* ignore */ }
+        try { dial.socket.close(); } catch { /* ignore */ }
+      })
+    : Promise.resolve();
+
   await Promise.allSettled([upPipe, downPipe]);
+  stopMonitor.abort();
+  await monitor;
   try { dial.socket.close(); } catch { /* ignore */ }
   try { server.close(); } catch { /* ignore */ }
 
-  if (info.user && env.GZ_DB && info.user.id > 0) {
-    queueUsage(info.user.id, up, down);
-    await maybeFlushUsage(env.GZ_DB);
-    glog('conn closed user=' + info.user.id + ' up=' + up + ' down=' + down + ' via=' + dial.via);
+  if (trackedUser && trackedDb) {
+    try {
+      await commitUsage();
+    } catch {
+      // Preserve counters if D1 is briefly unavailable; the coalescer retries later.
+      queueUsage(trackedUser.id, up - committedUp, down - committedDown);
+      await maybeFlushUsage(trackedDb);
+    }
+    glog('conn closed user=' + trackedUser.id + ' up=' + up + ' down=' + down + ' via=' + dial.via);
   }
 }
 
 /* ------------------------------------------------------------------ */
+
+async function superviseSession(
+  userId: number,
+  signal: AbortSignal,
+  check: () => Promise<{ ok: boolean; reason: string }>,
+  revoke: () => void,
+): Promise<void> {
+  while (!signal.aborted) {
+    if (await waitOrAbort(SESSION_REVALIDATE_MS, signal)) return;
+    if (signal.aborted) return;
+    try {
+      const verdict = await check();
+      if (!verdict.ok) {
+        glog('live session revoked (' + verdict.reason + ') id=' + userId);
+        revoke();
+        return;
+      }
+    } catch {
+      // Fail closed when D1 cannot prove that a long-lived session is still authorized.
+      glog('live session check failed; closing id=' + userId);
+      revoke();
+      return;
+    }
+  }
+}
+
+function waitOrAbort(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = (aborted: boolean) => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      resolve(aborted);
+    };
+    const onAbort = () => finish(true);
+    const timer = setTimeout(() => finish(false), ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 function isHexByte(b: number): boolean {
   return (b >= 0x30 && b <= 0x39) || (b >= 0x61 && b <= 0x66);

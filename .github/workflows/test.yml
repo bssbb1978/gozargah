@@ -14,7 +14,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.12
           cache: npm
 
       - name: Install dependencies
@@ -23,7 +23,7 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Engine tests
+      - name: Engine + Worker/D1 integration tests
         run: npm test
 
       - name: Build (dry-run bundle)

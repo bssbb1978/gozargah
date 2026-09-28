@@ -71,6 +71,24 @@ export async function getUserByUuid(db: D1Database, uuid: string): Promise<GzUse
   return users.find((u) => u.uuid === uuid) ?? null;
 }
 
+/** Uncached lookup for live-session revocation and quota supervision. */
+export async function getUserByIdFresh(db: D1Database, id: number): Promise<GzUser | null> {
+  await ensureSchema(db);
+  const row = await db.prepare('SELECT * FROM users WHERE id = ?1').bind(id).first<UserRow>();
+  return row ? toUser(row) : null;
+}
+
+/** Persist one session's usage delta atomically so live quota checks see it. */
+export async function recordUsageDelta(db: D1Database, id: number, up: number, down: number): Promise<void> {
+  const sent = Math.max(0, Math.floor(up));
+  const received = Math.max(0, Math.floor(down));
+  if (sent === 0 && received === 0) return;
+  await ensureSchema(db);
+  await db.prepare('UPDATE users SET used_up = used_up + ?1, used_down = used_down + ?2 WHERE id = ?3')
+    .bind(sent, received, id).run();
+  invalidateUsers();
+}
+
 export async function getAdminUser(db: D1Database): Promise<GzUser | null> {
   await ensureSchema(db);
   const row = await db.prepare('SELECT * FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1').first<UserRow>();
