@@ -8,6 +8,7 @@ import { Env, GzError, VERSION } from '../config';
 import { EffectiveSettings } from '../settings';
 import {
   addEvent, recentEvents, saveSettings, SettingsBlob, loadSettings, invalidateCache,
+  consumeAiDiagnosticQuota,
 } from '../db/store';
 import {
   createUser, deleteUser, GzUser, invalidateUsers, listUsers, updateUser, flushUsage,
@@ -20,6 +21,7 @@ import { buildLinks, subTokenFor } from '../subscription';
 import { qrSvg } from '../utils/qr';
 import { logRing } from '../utils/log';
 import { pbkdf2Hex, randomHex } from '../utils/crypto';
+import { createDiagnostics } from '../ai/diagnostics';
 
 const JSON_CT = 'application/json; charset=utf-8';
 
@@ -90,6 +92,15 @@ export async function handlePanelApi(
 
     if (action === 'me' && method === 'GET') {
       return json({ ok: true, version: VERSION, dbOk: eff.dbOk, isDefaultPassword: eff.isDefaultPassword });
+    }
+
+    if (action === 'ai/diagnostics' && method === 'POST') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const allowed = await consumeAiDiagnosticQuota(db, await ipHash(request));
+      if (!allowed) return json({ error: 'ai_rate_limited' }, 429);
+      const body = (await request.json().catch(() => ({}))) as { language?: unknown };
+      const language = body.language === 'en' ? 'en' : 'fa';
+      return json(await createDiagnostics(env, language));
     }
 
     if (action === 'settings' && method === 'GET') {

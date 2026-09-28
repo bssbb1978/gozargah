@@ -3,6 +3,8 @@ import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
 import type { D1Database } from '@cloudflare/workers-types';
 import { getUserByIdFresh, recordUsageDelta } from '../db/users';
+import { consumeAiDiagnosticQuota } from '../db/store';
+import { createDiagnostics, getAiModelCandidates } from '../ai/diagnostics';
 
 let mf: Miniflare;
 let db: D1Database;
@@ -39,7 +41,7 @@ describe('Cloudflare Worker + D1 integration', () => {
   it('serves health without initializing admin state', async () => {
     const response = await mf.dispatchFetch('https://gozargah.test/healthz');
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true, version: '1.3.0' });
+    expect(await response.json()).toMatchObject({ ok: true, version: '1.4.0' });
   });
 
   it('rejects webhook requests without Telegram secret', async () => {
@@ -106,5 +108,40 @@ describe('Cloudflare Worker + D1 integration', () => {
     await post(301, '1');
     const admin = await db.prepare('SELECT enabled FROM users WHERE id = 1').first<{ enabled: number }>();
     expect(admin?.enabled).toBe(1);
+  });
+
+  it('enforces an atomic D1-backed budget for AI analysis', async () => {
+    const now = 1_800_000_000_000;
+    for (let i = 0; i < 5; i++) expect(await consumeAiDiagnosticQuota(db, 'test-ip-hash', now)).toBe(true);
+    expect(await consumeAiDiagnosticQuota(db, 'test-ip-hash', now)).toBe(false);
+    expect(await consumeAiDiagnosticQuota(db, 'test-ip-hash', now + 10 * 60_000)).toBe(true);
+  });
+
+  it('tries configured Workers AI models in priority order and sends aggregate data only', async () => {
+    expect(getAiModelCandidates(' @cf/example/new , invalid url, @cf/example/backup ')).toEqual([
+      '@cf/example/new', '@cf/example/backup',
+    ]);
+    const captured: string[] = [];
+    const result = await createDiagnostics({
+      GZ_DB: db,
+      AI_MODELS: '@cf/example/unavailable,@cf/example/working',
+      AI: { run: async (model, input) => {
+        captured.push(JSON.stringify(input));
+        if (model.endsWith('unavailable')) throw new Error('model disabled');
+        return { response: 'پیشنهاد: وضعیت سهمیه‌ها را بازبینی کنید.' };
+      } },
+    }, 'fa');
+    expect(result).toMatchObject({ ai: true, model: '@cf/example/working' });
+    expect(captured).toHaveLength(2);
+    expect(captured.join('')).not.toContain('Test user');
+    expect(captured.join('')).not.toContain('admin-uuid');
+    expect(captured.join('')).not.toContain('test-pass');
+  });
+
+  it('protects the AI diagnostic endpoint behind panel authentication', async () => {
+    const response = await mf.dispatchFetch('https://gozargah.test/gozargah/api/ai/diagnostics', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ language: 'fa' }),
+    });
+    expect(response.status).toBe(401);
   });
 });

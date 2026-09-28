@@ -152,6 +152,16 @@ ${particles()}
       <!-- dashboard -->
       <div id="tab-dash">
         <div class="stat-grid" id="stat-grid"></div>
+        <section class="glass" style="padding:18px 20px;margin-bottom:18px">
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <div style="flex:1;min-width:220px">
+              <h4 data-i18n="aiAdvisorTitle" style="margin:0 0 5px"></h4>
+              <div class="hint" data-i18n="aiAdvisorHint"></div>
+            </div>
+            <button class="btn primary sm" id="ai-advisor-btn" type="button" data-i18n="aiAdvisorRun"></button>
+          </div>
+          <div id="ai-advisor-result" role="status" aria-live="polite" style="white-space:pre-wrap;line-height:1.9;margin-top:12px"></div>
+        </section>
         <div class="events glass" style="padding-bottom:6px">
           <h4 data-i18n="events"></h4>
           <div id="ev-list"><div class="ev" data-i18n="noEvents"></div></div>
