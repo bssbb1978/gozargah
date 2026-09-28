@@ -1,10 +1,10 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
 import type { D1Database } from '@cloudflare/workers-types';
 import { getUserByIdFresh, recordUsageDelta } from '../db/users';
 import { consumeAiDiagnosticQuota } from '../db/store';
-import { createDiagnostics, getAiModelCandidates } from '../ai/diagnostics';
+import { createDiagnostics, getAiModelCandidates, rankCatalogModels } from '../ai/diagnostics';
 
 let mf: Miniflare;
 let db: D1Database;
@@ -121,6 +121,12 @@ describe('Cloudflare Worker + D1 integration', () => {
     expect(getAiModelCandidates(' @cf/example/new , invalid url, @cf/example/backup ')).toEqual([
       '@cf/example/new', '@cf/example/backup',
     ]);
+    expect(rankCatalogModels({ result: [
+      { id: '@cf/example/older', task: 'Text Generation', updated_at: '2025-01-01' },
+      { id: '@cf/example/newer', task: 'Text Generation', updated_at: '2026-08-01' },
+      { id: '@cf/example/image', task: 'Image Classification', updated_at: '2026-09-01' },
+      { id: '@other/vendor/model', task: 'Text Generation', updated_at: '2026-09-02' },
+    ] })).toEqual(['@cf/example/newer', '@cf/example/older']);
     const captured: string[] = [];
     const result = await createDiagnostics({
       GZ_DB: db,
@@ -136,6 +142,32 @@ describe('Cloudflare Worker + D1 integration', () => {
     expect(captured.join('')).not.toContain('Test user');
     expect(captured.join('')).not.toContain('admin-uuid');
     expect(captured.join('')).not.toContain('test-pass');
+  });
+
+  it('discovers fresh Cloudflare text models without exposing the catalog token', async () => {
+    const requests: Array<{ url: string; authorization: string }> = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ url: String(input), authorization: new Headers(init?.headers).get('authorization') || '' });
+      return Response.json({ success: true, result: [
+        { id: '@cf/test/older', task: 'Text Generation', updated_at: '2025-01-01' },
+        { id: '@cf/test/newest', task: 'Text Generation', updated_at: '2026-08-01' },
+      ] });
+    });
+    try {
+      const result = await createDiagnostics({
+        GZ_DB: db,
+        AI_CATALOG_ACCOUNT_ID: '11111111111111111111111111111111',
+        AI_CATALOG_API_TOKEN: 'test-catalog-token-value',
+        AI: { run: async (model) => ({ response: model }) },
+      }, 'en');
+      expect(result.model).toBe('@cf/test/newest');
+      expect(requests).toHaveLength(1);
+      expect(requests[0].url).toContain('https://api.cloudflare.com/client/v4/accounts/');
+      expect(requests[0].authorization).toBe('Bearer test-catalog-token-value');
+      expect(JSON.stringify(result)).not.toContain('test-catalog-token-value');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('protects the AI diagnostic endpoint behind panel authentication', async () => {

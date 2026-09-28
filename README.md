@@ -59,7 +59,12 @@
 
 داشبورد یک تحلیل‌گر اختیاری دارد که با binding بومی `AI` روی Workers AI اجرا می‌شود. ورودی مدل فقط شمارنده‌های تجمیعی پنل است (تعداد کاربران فعال/غیرفعال، فعالیت ۲۴ساعته، شمار کاربران دارای سهمیه و تعداد مسیرهای پشتیبان). **هیچ IP، نام کاربر، UUID، رمز، لینک اشتراک یا محتوای ترافیک ارسال نمی‌شود.** خروجی صرفاً توصیهٔ تشخیصی است؛ مدل هیچ تنظیمی را تغییر نمی‌دهد و نمی‌تواند تضمین کند فیلتر یا DPI دور زده می‌شود.
 
-در `wrangler.toml`، binding `[ai]` با نام `AI` آماده است. برای فعال‌بودن قابلیت در استقرار Cloudflare، binding را در Worker متصل کنید. شناسه‌های مدل به‌ترتیب اولویت امتحان می‌شوند و در صورت خطا به مدل بعدی می‌رود؛ برای پیکربندی دلخواه، متغیر Worker به نام `AI_MODELS` را با شناسه‌های مجاز و جداشده با ویرگول تنظیم کنید. این ترتیب «رتبه‌بندی هوشمندی» یا کشف خودکار فهرست مدل‌های Cloudflare نیست؛ دسترسی و هزینهٔ مدل به حساب شما بستگی دارد. برای جلوگیری از مصرف ناخواسته، سقف درخواست با D1 و به‌ازای IP به ۵ درخواست در هر ۱۰ دقیقه محدود شده است. حذف binding قابلیت را خاموش می‌کند.
+در `wrangler.toml`، binding `[ai]` با نام `AI` آماده است. برای کشف فهرست جاری مدل‌های متنی Cloudflare، شناسهٔ اکانت را به‌صورت متغیر `AI_CATALOG_ACCOUNT_ID` و یک Secret با نام `AI_CATALOG_API_TOKEN` (حداقل مجوز **Workers AI Read**) تنظیم کنید. فهرست از API رسمی Cloudflare گرفته، مدل‌های متنی نامعتبر/آزمایشی/منسوخ فیلتر و حداکثر هشت مورد نگه‌داری می‌شوند؛ وقتی تاریخ انتشار/به‌روزرسانی موجود باشد، جدیدترها زودتر امتحان می‌شوند. نتیجه در isolate حداکثر ۶ ساعت cache می‌شود. این یک **ترتیب ترجیح عملیاتی** است، نه بنچمارک یا اثبات «هوشمندترین مدل»؛ دسترسی، هزینه و کیفیت مدل باید در حساب خودتان بررسی شود، و ممکن است فراخوانی مدل پولی هزینه داشته باشد. با `AI_MODELS` می‌توانید شناسه‌های دلخواه را به‌ترتیب اولویت مشخص کنید؛ این مقدار بر کشف خودکار مقدم است. اگر توکن کاتالوگ تنظیم نشود یا API در دسترس نباشد، فهرست fallback داخلی به‌کار می‌رود. برای جلوگیری از مصرف ناخواسته، سقف درخواست با D1 و به‌ازای IP به ۵ درخواست در هر ۱۰ دقیقه محدود شده است. حذف binding قابلیت را خاموش می‌کند.
+
+```bash
+npx wrangler secret put AI_CATALOG_API_TOKEN
+# در wrangler.toml یا تنظیمات Worker: AI_CATALOG_ACCOUNT_ID = "<Cloudflare account ID>"
+```
 
 <div align="center">
 
@@ -231,7 +236,7 @@ npm run build        # اعتبارسنجی و باندل Worker با Wrangler 4
 - **Subscriptions:** Base64 / Clash-Meta / Sing-box / Xray-core generated in-worker, auto `User-Agent` detection
 - **UI:** Gozargah Nexus UI — cinematic dark glassmorphism, full RTL, FA/EN
 - **Telegram admin bot:** opt-in, allowlisted private-chat commands with D1-backed FSM, update deduplication, short state TTL and protected admin accounts
-- **Workers AI advisor (optional):** read-only aggregate operations diagnostics with ordered model fallback, no user identifiers/configs/traffic sent, and an atomic D1 per-IP request budget; not an anti-DPI feature
+- **Workers AI advisor (optional):** aggregate-only diagnostics, optional Cloudflare catalog discovery with model fallback, no user identifiers/configs/traffic sent, and an atomic D1 per-IP request budget; not an anti-DPI feature
 - **Tests:** `npm test` — engine checks plus Vitest/Miniflare Worker+D1 integration tests
 
 **Deploy:** grab `dist/gozargah-worker.js` from [Releases](../../releases/latest), paste it into a new Worker, create a D1 database bound as `GZ_DB`, open `https://<worker>.workers.dev/gozargah` — login `admin`. Free plan is enough.
@@ -242,7 +247,7 @@ npm run build        # اعتبارسنجی و باندل Worker با Wrangler 4
 
 این نسخه روی ورودی HTTP/WebSocket و سوکت TCP خروجیِ Workers بنا شده است؛ Worker در این معماری listener خام TCP یا UDP/53 ندارد. بنابراین **Shadowsocks AEAD ورودی، فوروارد UDP-DNS روی پورت ۵۳ و NAT64 پیاده‌سازی نشده‌اند** و این پروژه آن‌ها را پشتیبانی‌شده معرفی نمی‌کند. پیاده‌سازی واقعی‌شان به لایهٔ ورودی/شبکه‌ای نیاز دارد که دیتاگرام یا TCP خام را پشتیبانی کند؛ شبیه‌سازی با WebSocket نام آن پروتکل را به پشتیبانی واقعی تبدیل نمی‌کند.
 
-مشاور Workers AI این پروژه فقط برای تحلیل تجمیعی و خواندنی پنل است؛ **هوش مصنوعی ضد DPI یا تغییر خودکار مسیر شبکه نیست**. اسکن خودکار رنج‌های IP برای یافتن «IP تمیز» هم اضافه نشده است؛ این کار می‌تواند ترافیک اسکن ناخواسته ایجاد کند و نتیجه‌اش پایداری یا مجازبودن IP را تضمین نمی‌کند. فهرست مدل‌ها به‌تنهایی معیار قابل اتکایی برای «قوی‌ترین مدل» نیست: قابلیت، دسترسی حساب، هزینه و کیفیت وظیفه باید ارزیابی شود. پروژه چند شناسهٔ اولویت‌دار را با fallback اجرا می‌کند، اما فهرست مستندات را در هر درخواست scrape نمی‌کند و ادعای کشف/رتبه‌بندی پویای قوی‌ترین مدل ندارد. هیچ AI نمی‌تواند عبور از فیلتر را تضمین کند. تعویض دامنه فقط در برابر مسدودسازی همان دامنه ممکن است کمک کند و مانع مسدودسازی IP، SNI یا الگوی ترافیک نمی‌شود. پیش از استفادهٔ عملی، محدودیت‌ها و شرایط جاری Cloudflare را برای workload خود بررسی کنید.
+مشاور Workers AI این پروژه فقط برای تحلیل تجمیعی و خواندنی پنل است؛ **هوش مصنوعی ضد DPI یا تغییر خودکار مسیر شبکه نیست**. اسکن خودکار رنج‌های IP برای یافتن «IP تمیز» هم اضافه نشده است؛ این کار می‌تواند ترافیک اسکن ناخواسته ایجاد کند و نتیجه‌اش پایداری یا مجازبودن IP را تضمین نمی‌کند. کشف مدل‌ها از API رسمی با ترتیب زمانی/اولویت fallback به معنی سنجش واقعی «قوی‌ترین مدل» نیست؛ معیار معتبر نیازمند بنچمارک مستقل، بررسی هزینه و دسترسی اکانت است. هیچ AI نمی‌تواند عبور از فیلتر را تضمین کند. تعویض دامنه فقط در برابر مسدودسازی همان دامنه ممکن است کمک کند و مانع مسدودسازی IP، SNI یا الگوی ترافیک نمی‌شود. پیش از استفادهٔ عملی، محدودیت‌ها و شرایط جاری Cloudflare را برای workload خود بررسی کنید.
 
 ## 🛣 نقشهٔ راه
 

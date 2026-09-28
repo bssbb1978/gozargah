@@ -18,8 +18,12 @@ export interface Env {
   TELEGRAM_ADMIN_IDS?: string;
   /** Optional native Cloudflare Workers AI binding for aggregate diagnostics. */
   AI?: { run: (model: string, input: unknown) => Promise<unknown> };
-  /** Ordered model IDs tried by the read-only advisor; comma-separated Worker var. */
+  /** Explicit prioritized model IDs; if absent, optional live model discovery is used. */
   AI_MODELS?: string;
+  /** Optional Workers AI Read-scoped token for the fixed Cloudflare model-search API. */
+  AI_CATALOG_API_TOKEN?: string;
+  /** Cloudflare account ID for model discovery; not a secret. */
+  AI_CATALOG_ACCOUNT_ID?: string;
   /** Optional service binding for controlled egress/tests; normally omitted. */
   TELEGRAM_API?: Fetcher;
 }

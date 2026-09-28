@@ -16,8 +16,7 @@ export interface AiBinding {
 }
 
 const DEFAULT_MODELS = [
-  // Ordered preference, not an objective intelligence ranking. Availability
-  // and billing are account-dependent; operators may override with AI_MODELS.
+  // Safe fallback list for deployments that do not configure catalog discovery.
   '@cf/deepseek-ai/deepseek-v4-pro-0813',
   '@cf/deepseek-ai/deepseek-v4-flash-0731',
   '@cf/zai-org/glm-5.3-flash',
@@ -26,11 +25,75 @@ const DEFAULT_MODELS = [
   '@cf/meta/llama-3.1-8b-instruct',
 ] as const;
 
+const MODEL_ID = /^@[a-z0-9][a-z0-9._/-]{2,120}$/i;
+const CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
+let catalogCache: { account: string; expiresAt: number; models: string[] } | null = null;
+let catalogPromise: Promise<string[]> | null = null;
+
 export function getAiModelCandidates(configured?: string): string[] {
-  const requested = (configured || '').split(',').map((x) => x.trim());
-  const clean = requested.filter((x) => /^@[a-z0-9][a-z0-9._/-]{2,120}$/i.test(x));
-  const models = clean.length ? clean : [...DEFAULT_MODELS];
-  return [...new Set(models)].slice(0, 8);
+  const clean = (configured || '').split(',').map((x) => x.trim()).filter((x) => MODEL_ID.test(x));
+  return [...new Set(clean.length ? clean : DEFAULT_MODELS)].slice(0, 8);
+}
+
+/** Extract only Cloudflare-hosted text models; newest catalog entries go first when dated. */
+export function rankCatalogModels(payload: unknown): string[] {
+  if (!payload || typeof payload !== 'object') return [];
+  const root = payload as Record<string, unknown>;
+  const rows = Array.isArray(root.result) ? root.result : Array.isArray(payload) ? payload : [];
+  const found: Array<{ id: string; date: number; index: number }> = [];
+  rows.forEach((row, index) => {
+    if (!row || typeof row !== 'object') return;
+    const item = row as Record<string, unknown>;
+    const id = [item.id, item.model_id, item.name].find((value) => typeof value === 'string' && MODEL_ID.test(value)) as string | undefined;
+    if (!id || !id.startsWith('@cf/')) return;
+    const task = String(item.task ?? item.task_name ?? '').toLowerCase();
+    if (task && !/(text|generation|language|chat)/.test(task)) return;
+    const dateValue = item.updated_at ?? item.created_at ?? item.created_on ?? item.release_date;
+    const parsed = typeof dateValue === 'number' ? dateValue : Date.parse(String(dateValue ?? ''));
+    found.push({ id, date: Number.isFinite(parsed) ? parsed : 0, index });
+  });
+  found.sort((a, b) => (a.date && b.date ? b.date - a.date : a.index - b.index));
+  return [...new Set(found.map((item) => item.id))].slice(0, 8);
+}
+
+async function discoverModels(env: Env): Promise<string[]> {
+  const account = env.AI_CATALOG_ACCOUNT_ID || '';
+  const token = env.AI_CATALOG_API_TOKEN || '';
+  if (!/^[a-f0-9]{32}$/i.test(account) || token.length < 12) return [];
+  if (catalogCache?.account === account && catalogCache.expiresAt > Date.now()) return catalogCache.models;
+  if (catalogPromise) return catalogPromise;
+  catalogPromise = (async () => {
+    try {
+      const url = new URL('https://api.cloudflare.com/client/v4/accounts/' + account + '/ai/models/search');
+      url.searchParams.set('task', 'text-generation');
+      url.searchParams.set('hide_experimental', 'true');
+      url.searchParams.set('include_deprecated', 'false');
+      url.searchParams.set('per_page', '100');
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { authorization: 'Bearer ' + token, accept: 'application/json' },
+        redirect: 'error',
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) return [];
+      const payload = await response.json() as unknown;
+      const models = rankCatalogModels(payload);
+      if (models.length) catalogCache = { account, expiresAt: Date.now() + CATALOG_TTL_MS, models };
+      return models;
+    } catch {
+      return [];
+    } finally {
+      catalogPromise = null;
+    }
+  })();
+  return catalogPromise;
+}
+
+async function selectModels(env: Env): Promise<string[]> {
+  const configured = (env.AI_MODELS || '').split(',').map((x) => x.trim()).filter((x) => MODEL_ID.test(x));
+  if (configured.length) return [...new Set(configured)].slice(0, 8);
+  const discovered = await discoverModels(env);
+  return discovered.length ? discovered : [...DEFAULT_MODELS];
 }
 
 function outputText(result: unknown): string {
@@ -74,7 +137,7 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
     };
   }
 
-  const models = getAiModelCandidates(env.AI_MODELS);
+  const models = await selectModels(env);
   const system = language === 'fa'
     ? 'شما مشاور عملیات فقط-خواندنی برای پنل Cloudflare Worker هستید. بر اساس فقط شمارنده‌های تجمیعی، حداکثر سه پیشنهاد عملی و کوتاه به فارسی بده. هیچ‌گاه ادعای تضمین عبور از فیلترینگ/DPI نکن، روش پنهان‌سازی یا دورزدن محدودیت شبکه ارائه نده، تنظیمات را تغییر نده و اگر داده کافی نیست صریح بگو. موارد قابل پیشنهاد: امنیت حساب، سهمیه/انقضا، بازبینی سلامت Worker/D1، بررسی دستی و مجاز دامنه یا مسیر. پاسخ را با محدودیت‌ها و عدم قطعیت همراه کن.'
     : 'You are a read-only operations advisor for a Cloudflare Worker panel. Give at most three concise, practical recommendations based only on aggregate counters. Never claim guaranteed censorship/DPI bypass, provide stealth/evasion instructions, or change settings. If evidence is insufficient, say so. You may suggest account security, quota/expiry review, Worker/D1 health checks, and authorized manual domain/path checks. State uncertainty and platform limitations.';
