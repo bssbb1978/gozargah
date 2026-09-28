@@ -25,6 +25,7 @@ import { landingHtml } from './panel/landing';
 import { userPageHtml } from './panel/userpage';
 import { LOGO_FAV_B64 } from './assets/logo';
 import { glog, logRing } from './utils/log';
+import { handleTelegramWebhook } from './telegram';
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -66,6 +67,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
     });
   }
+  if (rawPath === '_telegram/webhook') return handleTelegramWebhook(request, env);
 
   // 3) panel
   const eff = await getEffectiveSettings(env, host);

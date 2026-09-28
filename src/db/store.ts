@@ -60,6 +60,15 @@ const DDL = [
      count INTEGER NOT NULL,
      window_start INTEGER NOT NULL
    )`,
+  `CREATE TABLE IF NOT EXISTS telegram_fsm (
+     chat_id TEXT PRIMARY KEY,
+     state TEXT NOT NULL CHECK (state IN ('awaiting_disable_id', 'awaiting_enable_id')),
+     updated_at INTEGER NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS telegram_updates (
+     update_id INTEGER PRIMARY KEY,
+     processed_at INTEGER NOT NULL
+   )`,
 ];
 
 /** v1.2 additions for databases created with v1.x (guarded ALTERs). */
