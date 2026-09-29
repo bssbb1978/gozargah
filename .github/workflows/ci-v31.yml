@@ -100,15 +100,41 @@ jobs:
       - name: "Gate 3 — go test -race -count=1 (native arch: ${{ matrix.os }})"
         if: matrix.native_race
         working-directory: client
+        shell: bash
         # Race detector runs on the native host architecture only.
         # Covers the concurrent goroutines the release gate cares about:
         # netstate sliding window, bandit ensemble (LinUCB+Beta-TS),
-        # surgery v2 splitters, canary background prober, shared
-        # measure.Tracker feeders. Run for BOTH TLS identities — the
-        # production one (axr_utls) first.
+        # evade governor, surgery v2 splitters, canary background prober,
+        # shared measure.Tracker feeders. Run for BOTH TLS identities —
+        # the production one (axr_utls) first. The per-package result +
+        # the failure detail ALWAYS land in the step summary (readable
+        # via check-runs output.summary) even when the job is cancelled
+        # before the diagnostics step runs.
         run: |
-          go test -race -v -count=1 -tags axr_utls ./...
-          go test -race -count=1 ./...
+          set -uo pipefail
+          out1=$(go test -race -count=1 -tags axr_utls ./... 2>&1)
+          st1=$?
+          out2=$(go test -race -count=1 ./... 2>&1)
+          st2=$?
+          {
+            echo "### Gate 3 — go test -race ($RUNNER_OS)"
+            echo '```'
+            echo "--- uTLS identity (exit $st1)"
+            echo "$out1" | grep -E "^(--- FAIL|FAIL|ok  |panic:|WARNING: DATA RACE)" | head -60
+            if [ "$st1" -ne 0 ]; then
+              echo "--- uTLS failure detail"
+              echo "$out1" | grep -B3 -A30 -E -- "--- FAIL|DATA RACE|panic:" | head -150
+            fi
+            echo "--- stdlib identity (exit $st2)"
+            echo "$out2" | grep -E "^(--- FAIL|FAIL|ok  |panic:|WARNING: DATA RACE)" | head -60
+            if [ "$st2" -ne 0 ]; then
+              echo "--- stdlib failure detail"
+              echo "$out2" | grep -B3 -A30 -E -- "--- FAIL|DATA RACE|panic:" | head -150
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$st1" -ne 0 ]; then exit "$st1"; fi
+          if [ "$st2" -ne 0 ]; then exit "$st2"; fi
 
       - name: Cross-compile (stripped symbol tables, uTLS identity)
         working-directory: client
