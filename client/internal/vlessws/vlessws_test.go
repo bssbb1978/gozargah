@@ -610,8 +610,10 @@ func TestUpgradeShapeOrderInvariants(t *testing.T) {
 			}
 			pu, pc := pos("Upgrade"), pos("Connection")
 			pk, pv, pp := pos("Sec-WebSocket-Key"), pos("Sec-WebSocket-Version"), pos("Sec-WebSocket-Protocol")
-			if pu > pc || pc > pk || pk > pv || pv > pp {
-				t.Fatalf("seed %d tpl %d: order Upgrade,Connection < Key < Version < Protocol violated: %d %d %d %d %d",
+			// The relative order of Upgrade/Connection IS the jitter —
+			// both must only precede the Sec-WebSocket pair.
+			if pu > pk || pc > pk || pk > pv || pv > pp {
+				t.Fatalf("seed %d tpl %d: order violated (both uc < Key < Version < Protocol): pu=%d pc=%d pk=%d pv=%d pp=%d",
 					seed, tpl, pu, pc, pk, pv, pp)
 			}
 		}
