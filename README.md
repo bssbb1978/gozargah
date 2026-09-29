@@ -1,63 +1,42 @@
+# Gozargah 2.11.0 — AEAD, DNS64 & Evidence-Scoped Adaptation
 
-# Gozargah 2.10.0 — Evidence-Scoped Network Intelligence
+## 2.11.0 — Protocol and DNS data-plane additions
 
-## 2.10.0 — Evidence-Scoped Network Intelligence
-### 2.10.0 highlights
-- `/api/network/state` now adds a conservative condition classification (`HEALTHY`, `DEGRADED`, `SEVERELY_DEGRADED`, `PARTIALLY_UNREACHABLE`, `UPSTREAM_UNAVAILABLE`, `UNKNOWN`) scoped to configured Worker-egress paths.
-- TCP socket, live dial, and manual HTTPS HEAD observations are kept as distinct bounded D1 sample kinds in the existing health-sample table; no schema migration is needed.
-- Error causes are classified only from recognizable stage evidence. Opaque timeouts stay `UNKNOWN`; all-path failure never proves a physical international outage or DPI.
-- Local deterministic selection remains primary; Workers AI remains optional and cannot override capability checks.
-- The full capability descriptor assigns each protocol/transport pair one of `WORKER_NATIVE`, `ORIGIN_ENGINE_REQUIRED`, `UNSUPPORTED`, `DISABLED`, or `EXPERIMENTAL` (no experimental profiles are currently generated).
-- Profiles without a real generator are never advertised as ready; UDP-only WireGuard/Hysteria2 are explicitly unsupported by this Worker data plane.
-- Origin profiles are emitted only for the configured transport allowlist and are labeled declared-but-not-tested; setting a hostname is not treated as an engine health check.
-- Security and ALPN metadata are tied to the actual profile templates; unsupported combinations are excluded from adaptive policy.
-- Multi-signal policy gating combines measured health, forecast, local learner, and network confidence before promotion.
-- D1 persists consensus/agreement/switch-risk state; `/{panelPath}/api/network/fusion` exposes it for observability.
-- Adaptive Guard blocks low-consensus/high-switch-risk promotions and falls back to staged/recovery behavior.
+### Highlights
+- Adds Shadowsocks SIP004 AEAD (`aes-256-gcm`) over TLS/WebSocket using the SIP003 `v2ray-plugin`; generated as a third native profile in share links, Base64, Clash Meta, Sing-box, and the adaptive manifest.
+- Adds an authenticated RFC 8484 endpoint at `/{subPath}/{token}/dns-query` (GET and POST), with a per-user D1 rate budget and real byte accounting.
+- Adds DNS-only VLESS UDP handling for destination port 53. VLESS datagrams travel inside the existing WebSocket session and are forwarded through HTTPS DoH; arbitrary UDP is not relayed and no raw UDP socket is opened.
+- Adds optional DNS64 AAAA synthesis for RFC 6052 NAT64 prefixes, defaulting to `64:ff9b::/96`. DNSSEC-DO queries are not synthesized; NAT64 translation still requires a reachable translator on the client/egress network.
+- DoH resolvers have bounded, local EWMA/reliability ranking, a 10-minute stale-health reset, timeout, and fallback. The ranking is deterministic operational telemetry—not a DPI classifier or an autonomous AI policy.
+- Reuses the D1-backed Telegram FSM and Vitest + Miniflare suite; adds integration coverage for authenticated DoH, DNS64, rate budgets, and usage accounting.
+- No `ALTER TABLE` migration is needed; `dns_throttle` is created by the existing guarded D1 schema initializer.
 
-- Bayesian reliability + UCB exploration in the local edge ensemble.
-- Failure-domain isolation by protocol/transport family.
-- `stable / diversify / safe` strategy modes driven by observed network state.
-- Emergency safe mode prefers measured, low-failure profiles during broad degradation.
-- 3 changes per 30-minute window with 15-minute promotion hold to prevent policy flapping.
-- Existing D1 telemetry, per-user preference, canary staging and rollback are preserved.
+### Honest platform boundary
+Cloudflare Workers does not expose a raw UDP/53 listener here. “UDP DNS forwarding” means VLESS UDP DNS encapsulated over WebSocket and resolved through DoH, not general UDP tunneling. Shadowsocks is TCP-only and requires a compatible SIP003 client plugin. DNS64 synthesizes AAAA records but does not create a NAT64 gateway. A Worker cannot restore access if the client has no route to the Worker/Cloudflare edge; no AI can manufacture a missing network path or guarantee DPI bypass.
 
+### Existing 2.10 network intelligence retained
+- `/api/network/state` classifies configured Worker-egress observations conservatively (`HEALTHY`, `DEGRADED`, `SEVERELY_DEGRADED`, `PARTIALLY_UNREACHABLE`, `UPSTREAM_UNAVAILABLE`, `UNKNOWN`).
+- Opaque timeouts remain `UNKNOWN`; failure of configured Worker-egress paths is not proof of DPI or a physical international outage.
+- Local deterministic selection remains primary; optional Workers AI cannot override capability checks.
+- Adaptive protocol policy combines measured health, local learner, Bayesian reliability, predictive assessment, signal fusion and D1-backed promotion guards.
+- Canary staging, bounded promotions, rollback history and failure-domain isolation remain in place.
 
-- canary/staged policy promotion with a bounded 10-minute hold window
-- automatic promotion when the candidate is materially better or the active profile is unhealthy
-- rollback history in D1 via `adaptive_guard_state`
-- observational network anomaly score and signal class (`normal`, `broad_degradation`, `selective_degradation`, `insufficient_evidence`)
-- new authenticated endpoint: `/{panelPath}/api/network/guard`
-- audit events for adaptive policy promotions/staging/rollback
-- local deterministic learner remains the final policy guard; Workers AI remains optional
-
-### 2.10.0 engineering documents
-
+### Engineering documents
 - [Capability Matrix](CAPABILITY-MATRIX.md)
+- [DNS data plane and limits](DNS-DATA-PLANE.md)
 - [Adaptive Engine](ADAPTIVE-ENGINE.md)
 - [AI Engine and limits](AI-ENGINE.md)
 - [Failure Domains](FAILURE-DOMAINS.md)
 - [Recovery Model](RECOVERY-MODEL.md)
-- [2.10.0 Test Report](TEST-REPORT-2.10.0.md)
-- [Persian Upgrade Report](UPGRADE-REPORT-FA-2.10.0.md)
-
-2.5 continues the live protocol controller from 2.4 and adds a guard layer that
-stages small policy changes before promotion, rolls back on active-profile failure,
-and keeps a persistent previous/staged plan in D1.
+- [2.11.0 Test Report](TEST-REPORT-2.11.0.md)
+- [Persian Upgrade Report](UPGRADE-REPORT-FA-2.11.0.md)
 
 New endpoints:
 - `GET /{panelPath}/api/network/autoplan`
 - `GET /{panelPath}/api/network/policy-state`
 - `GET /{panelPath}/api/network/guard`
-- `GET /{subPath}/{token}/adaptive` (live adaptive manifest v5)
-
-The scheduled health loop refreshes health and policy every five minutes, so the
-D1 state remains warm even without an active subscriber. Raw TCP/UDP inbound is
-not available in this Worker data plane. This release advertises only profile
-pairs with a real generator; UDP-native protocols remain `UNSUPPORTED` until a
-real UDP-capable adapter is implemented and validated.
-
-This release adds deterministic multi-signal path scoring, circuit-breaker recovery, connection-outcome telemetry, stable per-user ordering, and AI-model cooldown/failover. It does not claim to defeat a complete upstream international outage and does not fingerprint or rewrite protocol bytes.
+- `GET /{subPath}/{token}/adaptive`
+- `GET|POST /{subPath}/{token}/dns-query`
 
 <div align="center">
 
@@ -79,7 +58,7 @@ This release adds deterministic multi-signal path scoring, circuit-breaker recov
 [![Website](https://img.shields.io/website?url=https%3A%2F%2Fgozargah.dpdns.org%2F&style=flat-square&labelColor=0B1020&up_color=7C3AED)](https://gozargah.dpdns.org/)
 [![Platform](https://img.shields.io/badge/☁️_Cloudflare_Workers-native-7C3AED?style=flat-square&labelColor=0B1020)](#-چرا-گذرگاه)
 [![Storage](https://img.shields.io/badge/storage-D1_Relational-D946EF?style=flat-square&labelColor=0B1020)](#-سفر-یک-درخواست)
-[![Protocols](https://img.shields.io/badge/protocols-VLESS_·_Trojan-00D9FF?style=flat-square&labelColor=0B1020)](#-چرا-گذرگاه)
+[![Protocols](https://img.shields.io/badge/protocols-VLESS_·_Trojan_·_SS_AEAD-00D9FF?style=flat-square&labelColor=0B1020)](#-چرا-گذرگاه)
 [![Operators](https://img.shields.io/badge/operators-MCI_·_Irancell_·_Rightel_·_Shatel_·_TCI-22C55E?style=flat-square&labelColor=0B1020)](#-تیون-عمیق-اپراتور)
 [![Xray](https://img.shields.io/badge/Xray-auto--best_leastPing-00D9FF?style=flat-square&labelColor=0B1020)](#-فرمت-xray--اتصال-خودکار-بهترین-مسیر)
 [![UI](https://img.shields.io/badge/UI-Gozargah_Nexus-7C3AED?style=flat-square&labelColor=0B1020)](#-رابط-کاربری--gozargah-nexus-ui)
@@ -97,7 +76,7 @@ This release adds deterministic multi-signal path scoring, circuit-breaker recov
 
 **گذرگاه** یک پنل پروکسی چندکاربرهٔ کامل است که به‌صورت بومی روی Cloudflare Workers زندگی می‌کند: یک فایل جاوااسکریپت که همه‌چیز داخلش تعبیه شده — پنل مدیریت، موتور پروکسی، اشتراک‌ساز، صفحهٔ وضعیت کاربر و تمام دارایی‌های رابط کاربری. نه سرور می‌خواهد، نه نصب، نه هزینه؛ یک اکانت رایگان کلودفلر و پنج دقیقه وقت کافی است تا یک پنل کامل با دیتابیس اختصاصی، داشبورد فارسی/انگلیسی و لینک اشتراک برای هر کاربر داشته باشید.
 
-طراحی گذرگاه از روز اول با سه قاعده پیش رفته: **امنیت واقعی به‌جای نمایشی**، **حسابداری دقیق به‌جای تخمین**، و **مستقل بودن مطلق در زمان اجرا**. نسخهٔ ۱.۲ این قواعد را یک قدم جلوتر می‌برد: کانفیگ‌هایی که خودشان بهترین مسیر را پیدا می‌کنند، پریست‌های اختصاصی برای اپراتورهای ایران، و صفحه‌ای که کاربر شما با یک نگاه می‌فهمد «وصل هستم یا نه». نتیجه پنلی است که نه به سرویس ثالثی وابسته است، نه اطلاعات شما را از اکانت کلودفلر بیرون می‌برد و نه برای کارکردن به هیچ چیز دیگری نیاز دارد.
+طراحی گذرگاه از روز اول با سه قاعده پیش رفته: **امنیت واقعی به‌جای نمایشی**، **حسابداری دقیق به‌جای تخمین**، و **تصمیم‌گیری محلیِ قابل‌توضیح**. قابلیت‌های قدیمی‌تر مانند پریست اپراتورها، کانفیگ تطبیقی و صفحهٔ وضعیت حفظ شده‌اند. در نسخهٔ **2.11.0**، Shadowsocks AEAD روی WebSocket/TLS، DNS-over-HTTPS احراز هویت‌شده، فوروارد DNS از VLESS UDP پورت ۵۳ و DNS64 اضافه شده‌اند. این قابلیت‌ها مرزهای واقعی Worker را تغییر نمی‌دهند: UDP عمومی و NAT64 gateway ارائه نمی‌شود و هیچ مدل AI نمی‌تواند مسیر شبکه‌ای ازدست‌رفته یا عبور تضمینی از DPI ایجاد کند.
 
 ## ✨ چرا گذرگاه؟
 
@@ -242,7 +221,7 @@ npm run deploy
 - **دو حالت انقضا:** تاریخ ثابت، یا «از اولین اتصال» — ساعت فقط وقتی شروع می‌شود که کاربر واقعاً وصل شود
 - **ریست دوره‌ای مصرف:** روزانه / هفتگی / ۳۰ روزه — پنجرهٔ چرخشی بدون نیاز به Cron Worker
 - مصرف واقعی up/down هر کاربر زنده در کارت او نمایش داده می‌شود (نوار گرادیانی)؛ نشست‌های فعال حداکثر هر ۲ دقیقه سهمیه/انقضا/وضعیت را با D1 بازبینی می‌کنند و در صورت لغو دسترسی بسته می‌شوند
-- برای هر کاربر: لینک‌های VLESS/Trojan + QR + پنج لینک اشتراک + صفحهٔ وضعیت شخصی
+- برای هر کاربر: لینک‌های VLESS/Trojan/Shadowsocks AEAD + QR + پنج قالب اشتراک + endpoint اختصاصی DoH + صفحهٔ وضعیت شخصی
 
 | مسیر | توضیح |
 |------|-------|
@@ -250,7 +229,8 @@ npm run deploy
 | `/{subPath}/{token}/clash` | پروفایل Clash-Meta |
 | `/{subPath}/{token}/singbox` | پروفایل Sing-box |
 | `/{subPath}/{token}/xray` | پروفایل Xray-core با auto-best |
-| `/{subPath}/{token}/v2ray` | Base64 لینک‌ها |
+| `/{subPath}/{token}/v2ray` | Base64 لینک‌ها (VLESS / Trojan / Shadowsocks) |
+| `/{subPath}/{token}/dns-query` | DoH احراز هویت‌شده با GET یا POST؛ سهمیه و حسابداری D1 |
 | `?op=mci` | پریست اپراتور: `mci` · `irancell` · `rightel` · `shatel` · `tci` |
 | `?ech=1` | فعال‌سازی ECH (opt-in — پیش‌فرض خاموش) |
 | `/gozargah` | پنل (قابل تغییر) |
@@ -265,6 +245,14 @@ npm run deploy
 | مسیر پنل | `gozargah` | مسیر مخفی پنل |
 | ریست دوره‌ای | خاموش | صفر شدن خودکار مصرف در بازهٔ انتخابی |
 | رمز عبور | `admin` | حداقل ۸ کاراکتر |
+
+### تنظیم resolver DNS
+
+| متغیر | پیش‌فرض | کاربرد |
+|-------|---------|--------|
+| `DNS_UPSTREAMS` | Cloudflare و Google DoH | فهرست جداشده با ویرگول از حداکثر چهار URL HTTPS برای RFC 8484 |
+| `DNS64_ENABLED` | فعال | مقدار `false`، ساخت AAAA مصنوعی را خاموش می‌کند |
+| `DNS64_PREFIX` | `64:ff9b::/96` | پیشوند RFC 6052؛ طول‌های `/32`, `/40`, `/48`, `/56`, `/64`, `/96` |
 
 ## 🤖 ربات تلگرام اختیاری (FSM روی D1)
 
@@ -299,7 +287,7 @@ v2rayNG · v2rayN · Streisand · Shadowrocket · Hiddify · Clash-Meta/Stash ·
 ```bash
 npm install          # نصب وابستگی‌های توسعه
 npm run typecheck    # بررسی تایپ TypeScript
-npm test             # ۲۷ چک موتور + تست یکپارچگی Worker/D1 با Vitest و Miniflare
+npm test             # چک‌های موتور/پروتکل + تست Worker/D1 با Vitest و Miniflare
 npm run preview      # پیش‌نمایش آفلاین پنل با دادهٔ ماک (preview.html)
 npm run build        # اعتبارسنجی و باندل Worker با Wrangler 4
 ```
@@ -309,7 +297,7 @@ npm run build        # اعتبارسنجی و باندل Worker با Wrangler 4
 
 **Gozargah** (Persian for *gateway*) is a complete multi-user proxy panel that runs natively on Cloudflare Workers — the entire product lives in a single JS file: admin dashboard, proxy engine, subscription generator, per-user status page and all UI assets are embedded.
 
-- **Protocols:** VLESS & Trojan over WebSocket + TLS, per-user path detection via host header (no unsupported Shadowsocks/UDP claims)
+- **Protocols:** VLESS, Trojan, and Shadowsocks SIP004 AES-256-GCM over TLS/WebSocket (SIP003 `v2ray-plugin`; TCP only); VLESS UDP is limited to DNS on port 53
 - **Storage:** Cloudflare D1 (relational — users / events / throttle), in-isolate cache, promise-dedup, optimistic locking
 - **Accounting:** real byte counting per user (up/down), live usage bars, quotas & expiry; active sessions revalidate account state and persist usage every 2 minutes (D1 usage/cost trade-off)
 - **Expiry modes:** fixed date **or** days-from-first-use (the clock starts on the first actual connection) + rolling auto-reset cycles (daily / weekly / 30d) — no Cron worker needed
@@ -317,7 +305,8 @@ npm run build        # اعتبارسنجی و باندل Worker با Wrangler 4
 - **Xray format:** profile with observatory + leastPing balancer (`auto-best`) — a throttled path is demoted automatically; fragment clone included for operator presets
 - **User status page:** browsers opening the sub link get a glassmorphic live page (real usage ring, one-tap imports, embedded QR, format switcher, operator chips, alt-port links); proxy clients keep raw configs via UA sniffing
 - **Security:** PBKDF2-SHA256 (100k iterations), HMAC-signed expiring sessions, persistent D1-backed rate limiting
-- **Subscriptions:** Base64 / Clash-Meta / Sing-box / Xray-core generated in-worker, auto `User-Agent` detection
+- **Subscriptions:** Base64 / Clash-Meta / Sing-box / Xray-core generated in-worker, auto `User-Agent` detection; SS plugin profiles appear where the client format supports them
+- **DNS:** Per-user-token RFC 8484 endpoint with D1 rate limiting/accounting, VLESS UDP DNS forwarding over WebSocket, adaptive DoH failover, and optional RFC 6052 DNS64 (not a raw UDP listener or NAT64 gateway)
 - **UI:** Gozargah Nexus UI — cinematic dark glassmorphism, full RTL, FA/EN
 - **Telegram admin bot:** opt-in, allowlisted private-chat commands with D1-backed FSM, update deduplication, short state TTL and protected admin accounts
 - **Workers AI advisor (optional):** aggregate-only diagnostics, optional Cloudflare catalog discovery with model fallback, no user identifiers/configs/traffic sent, and an atomic D1 per-IP request budget; not an anti-DPI feature
@@ -329,26 +318,26 @@ npm run build        # اعتبارسنجی و باندل Worker با Wrangler 4
 
 ## ⚠️ مرزهای واقعی پلتفرم و صداقتِ قابلیت‌ها
 
-این نسخه روی ورودی HTTP/WebSocket و سوکت TCP خروجیِ Workers بنا شده است؛ Worker در این معماری listener خام TCP یا UDP/53 ندارد. بنابراین **Shadowsocks AEAD ورودی، فوروارد UDP-DNS روی پورت ۵۳ و NAT64 پیاده‌سازی نشده‌اند** و این پروژه آن‌ها را پشتیبانی‌شده معرفی نمی‌کند. پیاده‌سازی واقعی‌شان به لایهٔ ورودی/شبکه‌ای نیاز دارد که دیتاگرام یا TCP خام را پشتیبانی کند؛ شبیه‌سازی با WebSocket نام آن پروتکل را به پشتیبانی واقعی تبدیل نمی‌کند.
-
-مشاور Workers AI این پروژه فقط برای تحلیل تجمیعی و خواندنی پنل است؛ **هوش مصنوعی ضد DPI یا تغییر خودکار مسیر شبکه نیست**. اسکن خودکار رنج‌های IP برای یافتن «IP تمیز» هم اضافه نشده است؛ این کار می‌تواند ترافیک اسکن ناخواسته ایجاد کند و نتیجه‌اش پایداری یا مجازبودن IP را تضمین نمی‌کند. کشف مدل‌ها از API رسمی با ترتیب زمانی/اولویت fallback به معنی سنجش واقعی «قوی‌ترین مدل» نیست؛ معیار معتبر نیازمند بنچمارک مستقل، بررسی هزینه و دسترسی اکانت است. هیچ AI نمی‌تواند عبور از فیلتر را تضمین کند. اگر مسیر بین‌الملل و دسترسی به Cloudflare کاملاً قطع شود، خود Worker و Workers AI هم از سمت کاربر قابل دسترسی نیستند؛ کد داخل Worker نمی‌تواند مسیر شبکه‌ای تازه بسازد. دسترسی در آن وضعیت به یک نقطهٔ ورودِ از قبل مستقر در شبکهٔ قابل دسترس یا یک ارتباط مستقل نیاز دارد. تعویض دامنه فقط در برابر مسدودسازی همان دامنه ممکن است کمک کند و مانع مسدودسازی IP، SNI یا الگوی ترافیک نمی‌شود. پیش از استفادهٔ عملی، محدودیت‌ها و شرایط جاری Cloudflare را برای workload خود بررسی کنید.
+- **Shadowsocks AEAD:** روش `aes-256-gcm` با framing استاندارد SIP004، فقط روی WebSocket/TLS و با افزونهٔ سمت کلاینت `v2ray-plugin` (SIP003). UDP عمومی Shadowsocks پشتیبانی نمی‌شود.
+- **DNS روی UDP:** فقط datagramهای DNS در فرمان UDP پروتکل VLESS و مقصد پورت ۵۳ پذیرفته می‌شوند. دیتاگرام داخل WebSocket می‌آید و Worker آن را از طریق HTTPS DoH به یکی از resolverهای تنظیم‌شده می‌فرستد. Worker روی UDP/53 گوش نمی‌دهد و relay عمومی UDP ندارد.
+- **DoH کاربر:** مسیر `/{subPath}/{token}/dns-query` به توکن اشتراک همان کاربر وابسته است، نرخ درخواست در D1 محدود می‌شود و بایت پرس‌وجو/پاسخ در مصرف کاربر حساب می‌شود. resolverها با timeout و failover محدود انتخاب می‌شوند؛ یادگیری این بخش EWMA آماری محلی است، نه تشخیص DPI.
+- **DNS64/NAT64:** در پاسخ AAAA بدون رکورد IPv6، در صورت فعال بودن، Worker می‌تواند از A پاسخ AAAA مطابق RFC 6052 بسازد. پیشوند پیش‌فرض `64:ff9b::/96` است و با `DNS64_PREFIX` قابل تغییر است؛ `DNS64_ENABLED=false` آن را خاموش می‌کند. DNS64 خودش مبدل NAT64 یا مسیر خروجی IPv4-to-IPv6 ایجاد نمی‌کند و فقط وقتی کاربرد دارد که سمت کلاینت/شبکه یک NAT64 translator قابل دسترس داشته باشد. درخواست‌های دارای EDNS DO دست‌کاری نمی‌شوند.
+- **هوش مصنوعی و فیلترینگ:** learner داخلیِ محدود و deterministic از آمار تجمیعی latency/reliability برای انتخاب محافظه‌کارانه استفاده می‌کند. Workers AI اختیاری فقط مشاور خواندنی است. هیچ‌کدام classifier DPI نیستند، payload را بررسی نمی‌کنند و عبور از فیلترینگ را تضمین نمی‌کنند.
+- **قطع کامل مسیر:** اگر از شبکهٔ کاربر هیچ مسیری تا Worker/Cloudflare یا نقطهٔ ورودی مستقل باقی نمانده باشد، کد داخل Worker نمی‌تواند اینترنت یا مسیر شبکه‌ای تازه بسازد؛ قطع کامل دسترسی بین‌المللی از راه دور قابل دورزدن نیست. برای آن وضعیت، نقطهٔ ورودِ از قبل در دسترس یا یک کانال ارتباطی مستقل لازم است.
 
 ## 🛣 نقشهٔ راه
 
 - [x] ربات تلگرام اختیاری با FSM پایدار در D1، allowlist و dedupe — v1.3
 - [x] مشاور خواندنی Workers AI با fallback مدل و محدودیت اتمیک درخواست در D1 — v1.4
 - [x] دکمهٔ قطع/فعال‌سازی هر کاربر از کارت پنل — v1.4
-- [x] تست یکپارچگی Worker/D1 با Vitest + Miniflare — v1.3
+- [x] تست یکپارچگی Worker/D1 با Vitest + Miniflare — v1.3 و گسترش DNS در 2.11
 - [x] پریست‌های اپراتورهای ایران + فرگمنت داخل کپ‌های Xray — v1.2
 - [x] خروجی Xray-core با observatory و بالانسر leastPing — v1.2
 - [x] صفحهٔ وضعیت کاربر با QR و ایمپورت یک‌کلیکی — v1.2
 - [x] انقضای «از اولین اتصال» + ریست دوره‌ای مصرف — v1.2
-- [x] ECH به‌صورت opt-in در همهٔ فرمت‌ها — v1.2
-- [x] تست‌های موتور (`npm test`) — v1.2
-- [ ] Shadowsocks AEAD به‌عنوان پروتکل سوم
-- [ ] فوروارد UDP-DNS (پورت ۵۳) و NAT64
-- [ ] ربات تلگرام با FSM روی D1
-- [ ] تست‌های یکپارچگی (vitest + miniflare)
+- [x] ECH به‌صورت opt-in در فرمت‌های پشتیبانی‌شده — v1.2
+- [x] Shadowsocks AEAD به‌عنوان پروتکل سوم (SIP004 AES-256-GCM + v2ray-plugin) — 2.11
+- [x] فوروارد DNS با VLESS UDP روی پورت ۵۳، DoH و DNS64 — 2.11
 
 ## 📄 لایسنس
 
@@ -372,9 +361,9 @@ MIT — آزاد برای استفاده، تغییر و توسعه. جزئیا�
 - The classifier is observational and does not claim to prove DPI or an international outage.
 
 
-## Protocol capability matrix (current: 2.10.0)
+## Protocol capability matrix (current: 2.11.0)
 
-Every protocol/transport pair is returned with an explicit boundary: `WORKER_NATIVE`, `ORIGIN_ENGINE_REQUIRED`, or `UNSUPPORTED`. The matrix is conservative: a profile is `ready` only if this repository has a matching generator and the configured origin-transport allowlist permits it. `ORIGIN_ENGINE_HOST` is a declaration, not a remote validation or health check. UDP-only WireGuard/Hysteria2, Shadowsocks, generic HTTP proxying, and unimplemented transports remain `UNSUPPORTED`; no metadata-only template is emitted as a usable profile.
+Every protocol/transport pair is returned with an explicit boundary: `WORKER_NATIVE`, `ORIGIN_ENGINE_REQUIRED`, or `UNSUPPORTED`. The matrix is conservative: a profile is `ready` only if this repository has a matching generator. `ORIGIN_ENGINE_HOST` is a declaration, not a remote validation or health check. VLESS/Trojan WebSocket and Shadowsocks AEAD WebSocket profiles are Worker-native; Shadowsocks uses the v2ray-plugin and is TCP-only. UDP-only WireGuard/Hysteria2, generic Shadowsocks UDP, generic HTTP proxying, and unimplemented transports remain `UNSUPPORTED`. Separately, VLESS UDP is supported only for DNS destination port 53 via the DoH adapter; it is not a generic UDP capability.
 
 
 ### 2.3.0 capability endpoints
@@ -382,7 +371,7 @@ Every protocol/transport pair is returned with an explicit boundary: `WORKER_NAT
 - `GET /<sub>/<token>/profiles` — adaptive profile manifest.
 - `GET /<sub>/<token>/capabilities` — public capability metadata for the current subscription token.
 
-Optional env: `ORIGIN_ENGINE_HOST`, `ORIGIN_ENGINE_PORT`, and `ORIGIN_ENGINE_TRANSPORTS` enable template generation for the supported subset (VMess/WebSocket, VLESS/gRPC/XHTTP/HTTPUpgrade, and Trojan/XHTTP as allowed by the transport list). These entries are marked `declared-not-tested` because the Worker has no origin-engine validation adapter. Without an origin engine, only Worker-native VLESS/Trojan over WebSocket is marked ready. WireGuard and Hysteria2 are explicitly unsupported until a real UDP-capable adapter and profile generator exist.
+Optional env: `ORIGIN_ENGINE_HOST`, `ORIGIN_ENGINE_PORT`, and `ORIGIN_ENGINE_TRANSPORTS` enable template generation for the supported subset (VMess/WebSocket, VLESS/gRPC/XHTTP/HTTPUpgrade, and Trojan/XHTTP as allowed by the transport list). These entries are marked `declared-not-tested` because the Worker has no origin-engine validation adapter. Without an origin engine, Worker-native VLESS/Trojan and Shadowsocks AEAD over WebSocket are marked ready. WireGuard, Hysteria2, and generic UDP remain unsupported; the separately documented VLESS DNS-only adapter does not advertise arbitrary UDP.
 
 ## Gozargah 2.3.0 — Adaptive Protocol Orchestrator
 

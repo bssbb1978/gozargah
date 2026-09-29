@@ -2,7 +2,7 @@ import { protocolCatalog, adaptiveProtocolOrder, ALPN_PROFILES, parseOriginTrans
 import { buildAdaptiveProtocolPolicy } from '../protocols/policy';
 
 const native = protocolCatalog(false).filter((x) => x.boundary === 'WORKER_NATIVE' && x.ready);
-if (native.length !== 2 || native[0].protocol !== 'vless' || native[1].protocol !== 'trojan') throw new Error('worker-native capabilities mismatch');
+if (native.length !== 3 || native[0].protocol !== 'vless' || native[1].protocol !== 'shadowsocks' || native[2].protocol !== 'trojan') throw new Error('worker-native capabilities mismatch');
 
 const withoutEngine = protocolCatalog(false);
 const xhttpNeedsEngine = withoutEngine.find((x) => x.protocol === 'vless' && x.transport === 'xhttp');
@@ -24,9 +24,11 @@ for (const [protocol, transport] of [
     throw new Error('missing/unverified origin capability ' + protocol + '/' + transport);
   }
 }
-if (available.some((x) => x.protocol === 'shadowsocks' || x.protocol === 'wireguard' || x.protocol === 'hysteria2' || x.protocol === 'http')) {
+if (available.some((x) => x.protocol === 'wireguard' || x.protocol === 'hysteria2' || x.protocol === 'http')) {
   throw new Error('unsupported protocols must not be marked ready');
 }
+if (!available.some((x) => x.protocol === 'shadowsocks' && x.transport === 'ws')) throw new Error('Shadowsocks AEAD WebSocket capability missing');
+if (withEngine.find((x) => x.protocol === 'shadowsocks' && x.transport === 'udp')?.ready) throw new Error('generic Shadowsocks UDP must remain unsupported');
 if (available.some((x) => x.alpn.includes('h3'))) throw new Error('no emitted profile currently supports HTTP/3');
 const order = adaptiveProtocolOrder(true);
 if (order[0].protocol !== 'vless' || order[0].transport !== 'ws') throw new Error('adaptive order mismatch');

@@ -187,6 +187,8 @@ export async function handlePanelApi(
       return json({ ok: true, policy: matrix.adaptivePolicy, origin: matrix.origin, limitations: {
         worker_native_tcp_inbound: false,
         worker_native_udp_inbound: false,
+        vless_websocket_udp_dns_port53: true,
+        generic_udp_relay: false,
         udp_protocols_require_origin_engine: true,
       } });
     }
@@ -479,6 +481,7 @@ export async function handlePanelApi(
         subSingbox: 'https://' + host + '/' + eff.subPath + '/' + tok + '/singbox',
         subXray: 'https://' + host + '/' + eff.subPath + '/' + tok + '/xray',
         subAdaptive: 'https://' + host + '/' + eff.subPath + '/' + tok + '/adaptive',
+        dnsDoh: 'https://' + host + '/' + eff.subPath + '/' + tok + '/dns-query',
         statusPage: 'https://' + host + '/' + eff.subPath + '/' + tok,
       });
     }

@@ -285,6 +285,8 @@ export const PANEL_JS = String.raw`
     var rows = [
       { l: 'VLESS', v: r.links.vless },
       { l: 'Trojan', v: r.links.trojan },
+      { l: 'Shadowsocks AEAD', v: r.links.shadowsocks },
+      { l: 'DNS-over-HTTPS', v: r.dnsDoh },
       { l: t('subBase'), v: r.subBase },
       { l: t('subClash'), v: r.subClash },
       { l: t('subSingbox'), v: r.subSingbox },

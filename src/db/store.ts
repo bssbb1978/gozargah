@@ -78,6 +78,11 @@ const DDL = [
      count INTEGER NOT NULL,
      window_start INTEGER NOT NULL
    )`,
+  `CREATE TABLE IF NOT EXISTS dns_throttle (
+     user_id INTEGER PRIMARY KEY,
+     count INTEGER NOT NULL,
+     window_start INTEGER NOT NULL
+   )`,
   `CREATE TABLE IF NOT EXISTS profile_health (
      profile_id TEXT PRIMARY KEY,
      latency_ms INTEGER,
@@ -342,6 +347,26 @@ export async function consumeAiDiagnosticQuota(db: D1Database, ipHash: string, n
     'window_start = CASE WHEN ai_throttle.window_start <= ?3 THEN ?2 ELSE ai_throttle.window_start END ' +
     'WHERE ai_throttle.window_start <= ?3 OR ai_throttle.count < ?4 RETURNING count',
   ).bind(ipHash, now, now - windowMs, 5).first<{ count: number }>();
+  return row !== null;
+}
+
+/** Atomic per-user DNS request budget (default callers use 120 queries/minute). */
+export async function consumeDnsQueryQuota(
+  db: D1Database,
+  userId: number,
+  now = Date.now(),
+  limit = 120,
+  windowMs = 60_000,
+): Promise<boolean> {
+  if (!Number.isSafeInteger(userId) || userId <= 0 || !Number.isInteger(limit) || limit < 1 || !Number.isInteger(windowMs) || windowMs < 1) return false;
+  await ensureSchema(db);
+  const row = await db.prepare(
+    'INSERT INTO dns_throttle (user_id, window_start, count) VALUES (?1, ?2, 1) ' +
+    'ON CONFLICT(user_id) DO UPDATE SET ' +
+    'count = CASE WHEN dns_throttle.window_start <= ?3 THEN 1 ELSE dns_throttle.count + 1 END, ' +
+    'window_start = CASE WHEN dns_throttle.window_start <= ?3 THEN ?2 ELSE dns_throttle.window_start END ' +
+    'WHERE dns_throttle.window_start <= ?3 OR dns_throttle.count < ?4 RETURNING count',
+  ).bind(userId, now, now - windowMs, limit).first<{ count: number }>();
   return row !== null;
 }
 

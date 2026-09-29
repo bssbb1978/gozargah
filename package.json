@@ -1,8 +1,8 @@
 {
   "name": "gozargah",
-  "version": "2.10.0",
+  "version": "2.11.0",
   "private": true,
-  "description": "Gozargah - adaptive multi-protocol Cloudflare Worker panel with D1, local online learning, live protocol policy, self-healing, Bayesian/UCB local ensemble, canary rollback, failure-domain isolation and origin-engine orchestration",
+  "description": "Gozargah - adaptive multi-protocol Cloudflare Worker panel with D1, VLESS/Trojan/Shadowsocks AEAD, DNS-over-HTTPS/DNS64, local online learning, adaptive policy and bounded recovery",
   "main": "src/index.ts",
   "engines": {
     "node": ">=22.12"

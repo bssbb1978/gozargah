@@ -2,8 +2,8 @@
  * Gozargah — global config, types and shared errors.
  */
 
-export const VERSION = '2.10.0';
-export const SCHEMA_VERSION = 14;
+export const VERSION = '2.11.0';
+export const SCHEMA_VERSION = 15;
 
 /** D1 binding name (see wrangler.toml) */
 export const DB_BINDING = 'GZ_DB';
@@ -26,6 +26,14 @@ export interface Env {
   AI_CATALOG_ACCOUNT_ID?: string;
   /** Optional service binding for controlled egress/tests; normally omitted. */
   TELEGRAM_API?: Fetcher;
+  /** Optional DoH upstream proxy binding for controlled egress/tests; normally omitted. */
+  DNS_UPSTREAM?: Fetcher;
+  /** Comma-separated HTTPS RFC 8484 resolver URLs, maximum four. */
+  DNS_UPSTREAMS?: string;
+  /** Enable DNS64 synthesis unless explicitly set to "false". */
+  DNS64_ENABLED?: string;
+  /** RFC 6052 NAT64 prefix used for synthesized AAAA records. */
+  DNS64_PREFIX?: string;
   /** Comma-separated ports for scheduled health probes of configured endpoints. */
   HEALTH_PROBE_PORTS?: string;
   /** Optional Xray/sing-box origin engine for protocols not terminated natively by the Worker. */

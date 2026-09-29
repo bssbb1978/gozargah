@@ -99,7 +99,7 @@ export function protocolCatalog(
   enabledOriginTransports: readonly Transport[] = DEFAULT_ORIGIN_TRANSPORTS,
 ): ProtocolCapability[] {
   const enabled = new Set(enabledOriginTransports);
-  const knownPairs = new Set(['vless:ws', 'trojan:ws', ...SUPPORTED_ORIGIN_PAIRS]);
+  const knownPairs = new Set(['vless:ws', 'trojan:ws', 'shadowsocks:ws', ...SUPPORTED_ORIGIN_PAIRS]);
   const out: ProtocolCapability[] = [];
 
   for (const protocol of PROTOCOLS) {
@@ -124,6 +124,19 @@ export function protocolCatalog(
           requirements: ['Cloudflare Worker WebSocket ingress', 'TLS at the configured Worker hostname', 'compatible VLESS/Trojan client'],
           incompatibilities: [], riskClass: 'LOW', ready: true, deploymentValidation: 'not-required',
           reason: 'Implemented by the Worker WebSocket data plane; client-to-Worker TLS is provided by the deployment. No live end-to-end probe is available.',
+        });
+        continue;
+      }
+
+      if (protocol === 'shadowsocks' && transport === 'ws') {
+        out.push({
+          protocol, transport, alpn: ['http/1.1'], security: ['tls'], mode: 'native-edge',
+          boundary: 'WORKER_NATIVE', status: 'WORKER_NATIVE', layer: 'worker',
+          generatorAvailable: true, liveVerificationAvailable: false, clientSupportRequired: true,
+          requirements: ['Cloudflare Worker WebSocket ingress', 'TLS at the configured Worker hostname', 'Shadowsocks AES-256-GCM', 'SIP003 v2ray-plugin WebSocket client'],
+          incompatibilities: ['TCP-only; arbitrary Shadowsocks UDP is not implemented'], riskClass: 'MEDIUM',
+          ready: true, deploymentValidation: 'not-required',
+          reason: 'SIP004 AES-256-GCM is terminated by the Worker over v2ray-plugin WebSocket. DNS-only VLESS UDP is separate; generic Shadowsocks UDP is unsupported.',
         });
         continue;
       }

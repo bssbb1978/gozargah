@@ -4,7 +4,7 @@
  *  1. accept upgrade on ANY path (the protocol itself authenticates the user)
  *  2. consume 0-RTT early data from Sec-WebSocket-Protocol
  *     (nahan advertised this header but never read it — we actually use it)
- *  3. buffered header read + dual-protocol sniff (VLESS byte0=0 / Trojan 56-hex)
+ *  3. buffered header read + VLESS/Trojan/SIP004 AEAD protocol sniff
  *  4. user lookup + enforcement (enabled / expiry / real-byte quota)
  *  5. edgetunnel-style dial: direct first, ProxyIP fallback chain, per-user stable start
  *  6. bidirectional pump with REAL byte accounting, coalesced flush to D1
@@ -17,6 +17,8 @@ import { glog } from '../utils/log';
 import { dialWithFallback } from './proxy';
 import { parseVless, vlessOkResponse } from '../protocols/vless';
 import { parseTrojan } from '../protocols/trojan';
+import { hasValidShadowsocksPrefix, ShadowsocksAeadDecoder, ShadowsocksAeadEncoder, SHADOWSOCKS_KEY_LENGTH } from '../protocols/shadowsocks';
+import { pumpVlessDns } from './vless-dns';
 import {
   findUserByTrojanHash, getUserByIdFresh, getUserByUuid, GzUser, isUserAllowed,
   lazyMaintenance, maybeFlushUsage, queueUsage, recordUsageDelta,
@@ -48,9 +50,16 @@ export function acceptWebSocket(request: Request, env: Env, ctx: ExecutionContex
   let early: Uint8Array | null = null;
   const protoHeader = request.headers.get('sec-websocket-protocol');
   if (protoHeader) {
-    try { early = b64UrlDecode(protoHeader.trim()); } catch { early = null; }
+    // Only consume the repo's base64url early-data form. SIP003 clients may use
+    // Sec-WebSocket-Protocol for a normal WebSocket subprotocol such as "binary".
+    const token = protoHeader.trim().split(',', 1)[0].trim();
+    if (token.length > 0 && token.length <= 2732 && /^[A-Za-z0-9_-]+={0,2}$/.test(token)) {
+      try {
+        const decoded = b64UrlDecode(token);
+        if (decoded.length > 0 && decoded.length <= 2048 && (decoded[0] === 0 || isHexByte(decoded[0]))) early = decoded;
+      } catch { early = null; }
+    }
   }
-  if (early && early.length === 0) early = null;
 
   const requestUrl = new URL(request.url);
   const host = requestUrl.host;
@@ -58,7 +67,7 @@ export function acceptWebSocket(request: Request, env: Env, ctx: ExecutionContex
   const profileId = rawProfile === 'standard' || rawProfile === 'fragmented' || rawProfile === 'alt-port' || rawProfile === 'fragmented-alt'
     ? rawProfile : 'standard';
 
-  ctx.waitUntil(pumpProxy(server, early, env, host, ctx, profileId).catch((e) => {
+  ctx.waitUntil(pumpProxy(server, early, env, host, requestUrl.pathname, ctx, profileId).catch((e) => {
     glog('proxy pump error: ' + (e instanceof Error ? e.message : String(e)));
     try { server.close(1011); } catch { /* ignore */ }
   }));
@@ -67,7 +76,7 @@ export function acceptWebSocket(request: Request, env: Env, ctx: ExecutionContex
 }
 
 interface HeaderInfo {
-  proto: 'vless' | 'trojan';
+  proto: 'vless' | 'trojan' | 'shadowsocks';
   headerLen: number;
   version: number;
   host: string;
@@ -92,14 +101,14 @@ function wsReadable(server: WebSocket): ReadableStream<Uint8Array> {
   });
 }
 
-async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, host: string, ctx: ExecutionContext, profileId: 'standard' | 'fragmented' | 'alt-port' | 'fragmented-alt'): Promise<void> {
+async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, host: string, requestPath: string, ctx: ExecutionContext, profileId: 'standard' | 'fragmented' | 'alt-port' | 'fragmented-alt'): Promise<void> {
   const reader = wsReadable(server).getReader();
 
   // --- buffered header read (early data may carry only a partial header) ---
   let buf = early ?? new Uint8Array(0);
   let info: HeaderInfo | null = null;
   for (let guard = 0; guard < 64 && !info; guard++) {
-    info = await tryParseAndResolve(buf, env, host);
+    info = await tryParseAndResolve(buf, env, host, requestPath);
     if (info) break;
     const { done, value } = await reader.read();
     if (done) throw new GzError('ws closed before full header', 'bad_request');
@@ -107,10 +116,15 @@ async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, 
   }
   if (!info) throw new GzError('could not parse protocol header', 'bad_request');
 
-  if (info.isUDP) {
-    glog('udp requested — closing (tcp-only in v1)');
-    try { server.close(1008); } catch { /* ignore */ }
-    return;
+  let ssDecoder: ShadowsocksAeadDecoder | null = null;
+  let ssInitialPayload: Uint8Array | null = null;
+  if (info.proto === 'shadowsocks') {
+    if (!info.user) throw new GzError('auth failed', 'auth_failed');
+    const raw = new BufferedByteReader(reader, buf);
+    ssDecoder = await ShadowsocksAeadDecoder.create((length, eof) => raw.readExactly(length, eof), info.user.uuid);
+    const target = await readShadowsocksTarget(ssDecoder);
+    info = { ...info, host: target.host, port: target.port, headerLen: 0, isUDP: false };
+    ssInitialPayload = target.payload;
   }
 
   if (info.user) {
@@ -145,6 +159,17 @@ async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, 
     }
   } else {
     throw new GzError('auth failed', 'auth_failed');
+  }
+
+  if (info.isUDP) {
+    if (info.proto === 'vless' && info.port === 53 && info.user) {
+      const input = new BufferedByteReader(reader, buf.slice(info.headerLen));
+      await pumpVlessDns(server, (length, eof) => input.readExactly(length, eof), env, info.user, info.version);
+      return;
+    }
+    glog('unsupported UDP request; only VLESS DNS on port 53 is accepted');
+    try { server.close(1008); } catch { /* ignore */ }
+    return;
   }
 
   // --- dial (direct first, ProxyIP fallback chain, per-user stable start) ---
@@ -246,25 +271,39 @@ async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, 
 
   if (info.proto === 'vless') server.send(vlessOkResponse(info.version));
 
-  // --- client -> remote (leftover bytes after the header go first) ---
+  // --- client -> remote (decode SIP004 for Shadowsocks, otherwise raw stream) ---
   let up = 0;
   let down = 0;
-  let leftover: Uint8Array | null = buf.slice(info.headerLen);
+  let leftover: Uint8Array | null = ssInitialPayload ?? buf.slice(info.headerLen);
+  const ssEncoder = info.proto === 'shadowsocks' ? new ShadowsocksAeadEncoder(info.user!.uuid) : null;
 
   const upPipe = new ReadableStream<Uint8Array>({
     async pull(ctrl) {
-      if (leftover) {
-        const c = leftover;
-        leftover = null;
-        up += c.length;
-        ctrl.enqueue(c);
-        return;
-      }
-      const { done, value } = await reader.read();
-      if (done) { try { ctrl.close(); } catch { /* ignore */ } return; }
-      if (value && value.length) {
-        up += value.length;
-        ctrl.enqueue(value);
+      while (true) {
+        if (leftover) {
+          const c = leftover;
+          leftover = null;
+          if (c.length) {
+            up += c.length;
+            ctrl.enqueue(c);
+            return;
+          }
+        }
+        if (ssDecoder) {
+          const clear = await ssDecoder.readChunk();
+          if (!clear) { try { ctrl.close(); } catch { /* ignore */ } return; }
+          if (!clear.length) continue;
+          up += clear.length;
+          ctrl.enqueue(clear);
+          return;
+        }
+        const { done, value } = await reader.read();
+        if (done) { try { ctrl.close(); } catch { /* ignore */ } return; }
+        if (value && value.length) {
+          up += value.length;
+          ctrl.enqueue(value);
+          return;
+        }
       }
     },
     cancel() { try { server.close(); } catch { /* ignore */ } },
@@ -272,13 +311,13 @@ async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, 
     .pipeTo(dial.socket.writable)
     .catch(() => { try { dial.socket.close(); } catch { /* ignore */ } });
 
-  // --- remote -> client ---
+  // --- remote -> client (encode SIP004 chunks for Shadowsocks) ---
   const downPipe = dial.socket.readable
     .pipeTo(
       new WritableStream<Uint8Array>({
-        write(chunk) {
+        async write(chunk) {
           down += chunk.byteLength;
-          server.send(chunk);
+          server.send(ssEncoder ? await ssEncoder.encode(chunk) : chunk);
         },
         close() { try { server.close(); } catch { /* ignore */ } },
         abort() { try { server.close(1011); } catch { /* ignore */ } },
@@ -327,6 +366,102 @@ async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, 
     }
     glog('conn closed user=' + trackedUser.id + ' up=' + up + ' down=' + down + ' via=' + dial.via);
   }
+}
+
+interface ShadowsocksTarget {
+  host: string;
+  port: number;
+  headerLen: number;
+  payload: Uint8Array;
+}
+
+/** Small bounded byte queue joining WebSocket message boundaries into a stream. */
+class BufferedByteReader {
+  private chunks: Uint8Array[] = [];
+  private available = 0;
+
+  constructor(private readonly reader: ReadableStreamDefaultReader<Uint8Array>, initial: Uint8Array = new Uint8Array(0)) {
+    if (initial.length) {
+      if (initial.length > 1_048_576) throw new GzError('websocket message too large', 'bad_request');
+      this.chunks.push(initial);
+      this.available = initial.length;
+    }
+  }
+
+  async readExactly(length: number, allowCleanEof = false): Promise<Uint8Array | null> {
+    if (!Number.isInteger(length) || length < 1 || length > 65_535) throw new GzError('invalid stream read length', 'bad_request');
+    while (this.available < length) {
+      const { done, value } = await this.reader.read();
+      if (done) {
+        if (allowCleanEof && this.available === 0) return null;
+        throw new GzError('truncated websocket stream', 'bad_request');
+      }
+      if (!value?.length) continue;
+      if (value.length > 1_048_576 || this.available + value.length > 2_097_152) {
+        throw new GzError('websocket buffer too large', 'bad_request');
+      }
+      this.chunks.push(value);
+      this.available += value.length;
+    }
+
+    const out = new Uint8Array(length);
+    let offset = 0;
+    while (offset < length) {
+      const first = this.chunks[0];
+      const size = Math.min(first.length, length - offset);
+      out.set(first.subarray(0, size), offset);
+      offset += size;
+      this.available -= size;
+      if (size === first.length) this.chunks.shift();
+      else this.chunks[0] = first.subarray(size);
+    }
+    return out;
+  }
+}
+
+async function readShadowsocksTarget(decoder: ShadowsocksAeadDecoder): Promise<ShadowsocksTarget> {
+  let clear: Uint8Array = new Uint8Array(0);
+  for (let i = 0; i < 32 && clear.length <= 512; i++) {
+    const chunk = await decoder.readChunk();
+    if (!chunk) throw new GzError('shadowsocks closed before destination header', 'bad_request');
+    clear = concatBytes(clear, chunk);
+    const target = parseShadowsocksTarget(clear);
+    if (target) return { ...target, payload: clear.slice(target.headerLen) };
+  }
+  throw new GzError('invalid shadowsocks destination header', 'bad_request');
+}
+
+function parseShadowsocksTarget(data: Uint8Array): { host: string; port: number; headerLen: number } | null {
+  if (!data.length) return null;
+  const atyp = data[0];
+  let cursor = 1;
+  let host: string;
+  if (atyp === 1) {
+    if (data.length < cursor + 4) return null;
+    host = [...data.slice(cursor, cursor + 4)].join('.');
+    cursor += 4;
+  } else if (atyp === 3) {
+    if (data.length < cursor + 1) return null;
+    const size = data[cursor++];
+    if (size === 0) throw new GzError('empty shadowsocks domain', 'bad_request');
+    if (data.length < cursor + size) return null;
+    try { host = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(data.slice(cursor, cursor + size)); }
+    catch { throw new GzError('invalid shadowsocks domain', 'bad_request'); }
+    if (!host || /[\u0000-\u0020]/.test(host)) throw new GzError('invalid shadowsocks domain', 'bad_request');
+    cursor += size;
+  } else if (atyp === 4) {
+    if (data.length < cursor + 16) return null;
+    const parts: string[] = [];
+    for (let i = 0; i < 8; i++) parts.push(((data[cursor + i * 2] << 8) | data[cursor + i * 2 + 1]).toString(16));
+    host = '[' + parts.join(':') + ']';
+    cursor += 16;
+  } else {
+    throw new GzError('unsupported shadowsocks address type', 'bad_request');
+  }
+  if (data.length < cursor + 2) return null;
+  const port = (data[cursor] << 8) | data[cursor + 1];
+  if (port < 1 || port > 65535) throw new GzError('invalid shadowsocks port', 'bad_request');
+  return { host, port, headerLen: cursor + 2 };
 }
 
 /* ------------------------------------------------------------------ */
@@ -379,38 +514,65 @@ function isShortError(e: unknown): boolean {
   return msg.includes('short');
 }
 
-/** Parse header if enough bytes are buffered; resolve user in the same step. */
-async function tryParseAndResolve(buf: Uint8Array, env: Env, host: string): Promise<HeaderInfo | null> {
-  if (buf.length < 24) return null;
+/** Parse VLESS/Trojan headers or authenticate a SIP004 stream on its dedicated path. */
+async function tryParseAndResolve(buf: Uint8Array, env: Env, host: string, requestPath: string): Promise<HeaderInfo | null> {
+  if (buf.length === 0) return null;
+
+  if (isShadowsocksPath(requestPath)) {
+    if (buf.length < SHADOWSOCKS_KEY_LENGTH + 2 + 16) return null;
+    const ss = await shadowsocksHeader(env, host, requestPath);
+    if (!ss.user) return ss;
+    if (await hasValidShadowsocksPrefix(buf, ss.user.uuid)) return ss;
+    throw new GzError('invalid Shadowsocks AEAD prefix', 'bad_request');
+  }
 
   const b0 = buf[0];
   if (b0 === 0) {
-    if (buf.length < 26) return null;
-    let req;
+    if (buf.length < 24) return null;
     try {
-      req = parseVless(buf);
-    } catch (e) {
-      if (isShortError(e)) return null;
-      throw e;
+      const req = parseVless(buf);
+      const user = await resolveVlessUser(env, host, req.uuid);
+      return { proto: 'vless', headerLen: req.headerLen, version: req.version, host: req.host, port: req.port, isUDP: req.isUDP, user };
+    } catch (error) {
+      if (isShortError(error)) return null;
+      throw error;
     }
-    const user = await resolveVlessUser(env, host, req.uuid);
-    return { proto: 'vless', headerLen: req.headerLen, version: req.version, host: req.host, port: req.port, isUDP: req.isUDP, user };
   }
 
-  if (isHexByte(b0)) {
-    if (buf.length < 68) return null;
-    let req;
+  if (isTrojanPrefix(buf)) {
+    if (buf.length < 58) return null;
     try {
-      req = parseTrojan(buf);
-    } catch (e) {
-      if (isShortError(e)) return null;
-      throw e;
+      const req = parseTrojan(buf);
+      const user = await resolveTrojanUser(env, host, utf8Decode(buf.slice(0, 56)));
+      return { proto: 'trojan', headerLen: req.headerLen, version: 0, host: req.host, port: req.port, isUDP: req.isUDP, user };
+    } catch (error) {
+      if (isShortError(error)) return null;
+      throw error;
     }
-    const user = await resolveTrojanUser(env, host, utf8Decode(buf.slice(0, 56)));
-    return { proto: 'trojan', headerLen: req.headerLen, version: 0, host: req.host, port: req.port, isUDP: req.isUDP, user };
   }
 
-  throw new GzError('unknown protocol first byte ' + b0, 'bad_request');
+  throw new GzError('unsupported protocol header', 'bad_request');
+}
+
+function isShadowsocksPath(requestPath: string): boolean {
+  const parts = requestPath.split('/').filter(Boolean);
+  return parts.length === 2 && parts[0] === 'ss';
+}
+
+async function shadowsocksHeader(env: Env, host: string, requestPath: string): Promise<HeaderInfo> {
+  const parts = requestPath.split('/').filter(Boolean);
+  const uuid = parts.length === 2 && parts[0] === 'ss' ? parts[1] : '';
+  if (!uuid) return { proto: 'shadowsocks', headerLen: 0, version: 0, host: '', port: 0, isUDP: false, user: null };
+  const user = await resolveVlessUser(env, host, uuid);
+  return { proto: 'shadowsocks', headerLen: 0, version: 0, host: '', port: 0, isUDP: false, user };
+}
+
+function isTrojanPrefix(buf: Uint8Array): boolean {
+  const hashBytes = Math.min(buf.length, 56);
+  for (let i = 0; i < hashBytes; i++) if (!isHexByte(buf[i])) return false;
+  if (buf.length > 56 && buf[56] !== 0x0d) return false;
+  if (buf.length > 57 && buf[57] !== 0x0a) return false;
+  return true;
 }
 
 async function resolveVlessUser(env: Env, host: string, uuid: string): Promise<GzUser | null> {
