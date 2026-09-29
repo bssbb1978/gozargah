@@ -4,6 +4,11 @@
 
 نسخهٔ ۲.۱۰ یک طبقه‌بند محافظه‌کار برای وضعیت مسیرهای پیکربندی‌شده اضافه می‌کند و منبع نمونه‌های سلامت را از هم جدا می‌سازد. این تغییر ادعای «AI ضد DPI» نیست: یادگیری محلی و policy قطعی ۲.۹ حفظ شده‌اند؛ Workers AI همچنان فقط مشاور اختیاریِ خواندنی است.
 
+## نسخه و منبع
+
+- نسخه: **Gozargah 2.10.0**
+- D1 schema: **14**؛ migration لازم نشد.
+
 ## تغییرات واقعی
 
 ### ۱) طبقه‌بندی failure domain و condition
@@ -54,16 +59,17 @@ endpoint جدیدی اضافه نشده است. پاسخ موجود `GET /{panel
 
 ## پروتکل‌ها
 
-- `WORKER_NATIVE`: VLESS/WebSocket، Trojan/WebSocket.
+- `WORKER_NATIVE`: VLESS/WebSocket، Trojan/WebSocket. در Xray یک outbound مستقیمِ Trojan/WebSocket هم به‌صورت اختیاری تولید می‌شود، فقط با origin معتبر از نظر پیکربندی و allowlist؛ این variant زنده تأیید نشده است.
 - `ORIGIN_ENGINE_REQUIRED`: VLESS/XHTTP، gRPC، HTTPUpgrade؛ Trojan/XHTTP؛ VMess/WebSocket، با محدودیت پیکربندی و allowlist.
 - `UNSUPPORTED`: WireGuard/UDP، Hysteria2/UDP، Shadowsocks، HTTP عمومی و pairهای بدون generator.
 - Origin آمادهٔ تولید به معنی origin زندهٔ تأییدشده نیست.
 
 ## نتایج آزمون
 
+- **PASS** `npm install`؛ هیچ وابستگی runtime جدیدی اضافه نشد.
 - **PASS** `npm run typecheck`
 - **PASS** `npm test`: ۳۶ تست engine، چهار suite pure logic به‌علاوهٔ suite جدید network intelligence، و ۱۲ تست Worker/D1
-- **PASS** `npm run build`: Wrangler dry-run؛ استقرار انجام نشد
+- **PASS** `npm run build`: Wrangler dry-run، 408.98 KiB / gzip 109.56 KiB؛ استقرار انجام نشد
 - **PASS** `npm audit`: صفر آسیب‌پذیری گزارش‌شده
 - **PASS** `git diff --check`
 - **NOT RUN** ESLint/formatter: script/config در repo وجود ندارد

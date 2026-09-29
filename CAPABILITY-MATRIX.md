@@ -19,7 +19,7 @@ All current pairs set `liveVerificationAvailable=false`; there is no external Xr
 | Protocol | Transport | Current status | Required layer | Notes |
 |---|---|---|---|---|
 | VLESS | WebSocket + TLS | `WORKER_NATIVE` | Worker | Implemented Worker WebSocket ingress |
-| Trojan | WebSocket + TLS | `WORKER_NATIVE` | Worker | Implemented Worker WebSocket ingress |
+| Trojan | WebSocket + TLS | `WORKER_NATIVE` | Worker | Implemented Worker ingress; Xray also emits an optional direct-origin variant when `ws` is allowlisted and origin config is valid (still unverified) |
 | VLESS | XHTTP | `ORIGIN_ENGINE_REQUIRED` | Origin | Emitted only if origin host + XHTTP allowlist |
 | VLESS | gRPC | `ORIGIN_ENGINE_REQUIRED` | Origin | Emitted only if origin host + gRPC allowlist; ALPN h2 |
 | VLESS | HTTPUpgrade | `ORIGIN_ENGINE_REQUIRED` | Origin | Emitted only if origin host + HTTPUpgrade allowlist |
