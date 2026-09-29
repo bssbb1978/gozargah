@@ -64,10 +64,10 @@ func runScan(args []string) {
 	}
 
 	opts := cfscan.Options{
-		RelayHost:  relayHost,
-		Attempts:   *attempts,
-		Timeout:    *probeTimeout,
-		TopN:       *top,
+		RelayHost:   relayHost,
+		Attempts:    *attempts,
+		Timeout:     *probeTimeout,
+		TopN:        *top,
 		Concurrency: *concurrency,
 	}
 	opts.VerifyColo = verifyColo
@@ -147,9 +147,9 @@ func splitCSV(s string) []string {
 
 // cleanIPsFile is the on-disk clean-IP pool (~/.axr/clean-ips.json).
 type cleanIPsFile struct {
-	Schema        string `json:"schema"`
-	RelayHost     string `json:"relay_host"`
-	GeneratedAtMS int64  `json:"generated_at_ms"`
+	Schema        string   `json:"schema"`
+	RelayHost     string   `json:"relay_host"`
+	GeneratedAtMS int64    `json:"generated_at_ms"`
 	IPs           []string `json:"ips"`
 }
 
@@ -158,10 +158,10 @@ func writeCleanIPsFile(path, relay string, ips []string) error {
 		return err
 	}
 	data, err := json.MarshalIndent(cleanIPsFile{
-		Schema: "gozargah-axr-clean-ips/v1",
-		RelayHost: relay,
+		Schema:        "gozargah-axr-clean-ips/v1",
+		RelayHost:     relay,
 		GeneratedAtMS: time.Now().UnixMilli(),
-		IPs: ips,
+		IPs:           ips,
 	}, "", "  ")
 	if err != nil {
 		return err

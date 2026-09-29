@@ -112,11 +112,11 @@ func TestNormalDrawFinite(t *testing.T) {
 
 func TestForRegime(t *testing.T) {
 	cases := map[string]ProfileID{
-		"stable":             ProfileWeb,
-		"watch":              ProfileChat,
-		"suspected_change":   ProfileVideo,
-		"recovering":         ProfileWeb,
-		"unknown-regime":     ProfileWeb,
+		"stable":           ProfileWeb,
+		"watch":            ProfileChat,
+		"suspected_change": ProfileVideo,
+		"recovering":       ProfileWeb,
+		"unknown-regime":   ProfileWeb,
 	}
 	for regime, want := range cases {
 		if got := ForRegime(regime); got != want {

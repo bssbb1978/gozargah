@@ -114,9 +114,9 @@ func TestHysteresisResetOnCalm(t *testing.T) {
 	// cut samples must need two more CONSECUTIVE hits to re-escalate from
 	// steady — here we verify the reset on the up-path from steady.
 	g2 := NewGovernor()
-	_ = g2.Update(deg)   // upHits 1
+	_ = g2.Update(deg)     // upHits 1
 	_ = g2.Update(clean()) // reset
-	_ = g2.Update(deg)   // upHits 1 again
+	_ = g2.Update(deg)     // upHits 1 again
 	if e := g2.Update(deg); e.Stance != StanceAggressive {
 		t.Fatalf("two consecutive after reset must escalate, got %s", e.Stance)
 	}

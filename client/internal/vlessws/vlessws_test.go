@@ -29,10 +29,10 @@ func TestBuildVLESSHeaderDomain(t *testing.T) {
 	want := make([]byte, 0, 1+16+1+1+2+1+1+len("example.com"))
 	want = append(want, 0x00)
 	want = append(want, testUUID...)
-	want = append(want, 0x00) // optLen
-	want = append(want, 0x01) // cmd TCP
+	want = append(want, 0x00)       // optLen
+	want = append(want, 0x01)       // cmd TCP
 	want = append(want, 0x1F, 0x90) // 8080 BE
-	want = append(want, 0x02) // atyp domain
+	want = append(want, 0x02)       // atyp domain
 	want = append(want, byte(len("example.com")))
 	want = append(want, []byte("example.com")...)
 	if !reflect.DeepEqual(h, want) {
@@ -276,7 +276,7 @@ func decodeClientFrame(f []byte) (opcode byte, fin bool, payload []byte, err err
 	if len(f) < off+4+l {
 		return 0, false, nil, io.ErrShortBuffer
 	}
-	mask := [4]byte{f[off], f[off + 1], f[off + 2], f[off + 3]}
+	mask := [4]byte{f[off], f[off+1], f[off+2], f[off+3]}
 	payload = make([]byte, l)
 	for i := 0; i < l; i++ {
 		payload[i] = f[off+4+i] ^ mask[i%4]
@@ -398,10 +398,10 @@ func (c *frConn) Write(b []byte) (int, error) {
 	c.r.mu.Unlock()
 	return len(b), nil
 }
-func (c *frConn) Close() error                   { return nil }
-func (c *frConn) LocalAddr() net.Addr            { return frAddr("local") }
-func (c *frConn) RemoteAddr() net.Addr           { return frAddr("remote") }
-func (c *frConn) SetDeadline(time.Time) error    { return nil }
+func (c *frConn) Close() error                { return nil }
+func (c *frConn) LocalAddr() net.Addr         { return frAddr("local") }
+func (c *frConn) RemoteAddr() net.Addr        { return frAddr("remote") }
+func (c *frConn) SetDeadline(time.Time) error { return nil }
 func (c *frConn) SetReadDeadline(time.Time) error {
 	return nil
 }
