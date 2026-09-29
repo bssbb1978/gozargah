@@ -39,9 +39,12 @@ func TestSimulatedDPIFailureSignaturesFallBackToConfiguredDomesticEntry(t *testi
 			}, probe)
 			engine.SetQuietPolicy(failover.DefaultQuietPolicy())
 			s := &server{
-				failover: engine, netstate: detector, frontingHost: testFronting,
-				lastRegime: netstate.RegimeStable,
-				configHosts: map[string]bool{"intl.example.com": true}, log: newLogger(false),
+				failover:     engine,
+				netstate:     detector,
+				frontingHost: testFronting,
+				lastRegime:   netstate.RegimeStable,
+				configHosts:  map[string]bool{"intl.example.com": true},
+				log:          newLogger(false),
 			}
 
 			for round := 0; round < 2; round++ {
@@ -86,9 +89,12 @@ func TestLiveCanaryRecoveryReleasesOldBlackoutQuietGates(t *testing.T) {
 		t.Fatalf("setup: expected domestic-only classification, got %s", got)
 	}
 	s := &server{
-		failover: engine, netstate: detector, frontingHost: testFronting,
-		lastRegime: netstate.RegimeStable,
-		configHosts: map[string]bool{"intl.example.com": true}, log: newLogger(false),
+		failover:     engine,
+		netstate:     detector,
+		frontingHost: testFronting,
+		lastRegime:   netstate.RegimeStable,
+		configHosts:  map[string]bool{"intl.example.com": true},
+		log:          newLogger(false),
 	}
 	s.applyPolicy()
 	if got := engine.Quiet(); got.MaxMS != 30*60_000 {
@@ -124,9 +130,12 @@ func TestSimulatedFullInternationalCutRecoversThroughDomesticPath(t *testing.T) 
 	}, probe)
 	engine.SetQuietPolicy(failover.DefaultQuietPolicy())
 	s := &server{
-		failover: engine, netstate: detector, frontingHost: testFronting,
-		lastRegime: netstate.RegimeStable,
-		configHosts: map[string]bool{"intl.example.com": true}, log: newLogger(false),
+		failover:     engine,
+		netstate:     detector,
+		frontingHost: testFronting,
+		lastRegime:   netstate.RegimeStable,
+		configHosts:  map[string]bool{"intl.example.com": true},
+		log:          newLogger(false),
 	}
 
 	start := time.Now()
