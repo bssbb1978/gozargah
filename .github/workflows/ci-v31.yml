@@ -392,11 +392,18 @@ jobs:
           LEG_RESULT: ${{ job.status }}
         run: |
           set -uo pipefail
+          # declared_native and runner_native are compared for EQUALITY by the
+          # summary job, so both must use ONE format. The runner is pinned to
+          # ubuntu-24.04 (x64), so the declaration is "linux-x64"; declaring
+          # "node22/linux-x64" while node reports "linux-x64" is a permanent,
+          # invisible mismatch — the first run that reached the summary died
+          # on exactly that, so the two are now written from one variable.
+          runner_native="$(node -p 'process.platform + "-" + process.arch')"
           cat > worker-attest.json <<JSON
           {
             "leg": "worker (ubuntu-24.04, node 22)",
-            "declared_native": "node22/linux-x64",
-            "runner_native": "$(node -p 'process.platform + "-" + process.arch')",
+            "declared_native": "linux-x64",
+            "runner_native": "$runner_native",
             "job_status": "$LEG_RESULT",
             "coverage": "typecheck, engine suites, vitest integration, wrangler dry-run bundle",
             "gates": {
@@ -408,11 +415,17 @@ jobs:
             "not_applicable": []
           }
           JSON
+          # The declaration is only meaningful if it matches the measurement.
+          if [ "$runner_native" != "linux-x64" ]; then
+            echo "::error title=worker-arch-drift::runner is $runner_native, not the declared linux-x64"
+            exit 1
+          fi
           {
             echo "### Gate coverage — Worker leg"
             echo "| field | value |"
             echo "|-------|-------|"
             echo "| node | $(node --version) |"
+            echo "| runner native | $runner_native |"
             echo "| job status | $LEG_RESULT |"
             echo "| gates | tsc, engine, vitest, wrangler dry-run (all unconditional) |"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -459,7 +472,7 @@ jobs:
         # no artifacts. The completeness check below is the real gate — it
         # fails whenever a leg that SHOULD have attested did not.
         continue-on-error: true
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: gate-attest-*
           merge-multiple: true
