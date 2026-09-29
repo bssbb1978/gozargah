@@ -197,7 +197,7 @@ func TestEncodeDecodeRoundTripLong(t *testing.T) {
 	if frame[1] != 0x80|126 {
 		t.Fatalf("16-bit length marker wrong: %x", frame[1])
 	}
-	if got := int(frame[3])<<8 | int(frame[4]); got != len(payload) {
+	if got := int(frame[2])<<8 | int(frame[3]); got != len(payload) {
 		t.Fatalf("encoded length = %d", got)
 	}
 	got := make([]byte, len(payload))
