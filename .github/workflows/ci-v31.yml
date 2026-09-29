@@ -54,7 +54,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             targets: "linux/amd64 linux/arm64 android/arm64"
             native_race: true
             android: true
@@ -68,10 +68,10 @@ jobs:
             android: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Go (version pinned by client/go.mod)
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: client/go.mod
           cache-dependency-path: client/go.sum
@@ -131,7 +131,7 @@ jobs:
       # ---- Android NDK (official toolchain) — ubuntu leg only ----
       - name: Android NDK (cache)
         if: matrix.android
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         id: ndk-cache
         with:
           path: ${{ runner.temp }}/android-ndk
@@ -179,7 +179,7 @@ jobs:
           exit 0
 
       - name: Upload binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: axr-${{ matrix.os }}
           path: client/dist/
@@ -191,20 +191,20 @@ jobs:
   # ---------------------------------------------------------------------------
   worker:
     name: Worker — Cloudflare edge relay
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # Keep the dry-run hermetic: no telemetry network side channel.
       WRANGLER_TELEMETRY_DISABLED: "1"
       CI: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node 22 with npm cache
         # The pinned wrangler (4.143.0, package-lock) hard-requires
         # Node >= 22 ("Wrangler requires at least Node.js v22.0.0");
         # this matches the v3.1 spec ("Node.js 22+").
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
