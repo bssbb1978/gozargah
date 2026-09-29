@@ -90,6 +90,9 @@ async function main() {
     assert.ok(l.vless.includes('fp=chrome'));
     assert.ok(!l.vless.includes('ech='));
     assert.ok(l.trojan.startsWith('trojan://' + USER.trojanPass + '@'));
+    assert.ok(l.shadowsocks.startsWith('ss://'));
+    assert.ok(decodeURIComponent(l.shadowsocks).includes('v2ray-plugin'));
+    assert.ok(decodeURIComponent(l.shadowsocks).includes('path=/ss/' + USER.uuid));
     assert.ok(l.wsPath.startsWith('/' + USER.uuid));
   });
   await ok('links: operator fingerprint applied + honest remark', () => {
@@ -117,13 +120,26 @@ async function main() {
     const op = buildClashYaml(HOST, USER, { opKey: 'mci' });
     assert.ok(op.includes('client-fingerprint: randomized'));
     assert.ok(op.includes('MCI-'));
+    assert.ok(plain.includes('type: ss'));
+    assert.ok(plain.includes('cipher: aes-256-gcm'));
+    assert.ok(plain.includes('plugin: v2ray-plugin'));
+    assert.ok(plain.includes('path: "/ss/' + USER.uuid + '"'));
+    assert.match(plain, /type: vless[\s\S]*?udp: true/);
+    assert.match(plain, /type: ss[\s\S]*?udp: false/);
   });
-  await ok('singbox: utls + ech opt-in', () => {
+  await ok('singbox: utls + ech opt-in + Shadowsocks plugin', () => {
     const plain = JSON.parse(buildSingBoxJson(HOST, USER, {}));
     assert.equal((plain.outbounds[0].tls as { utls: { fingerprint: string } }).utls.fingerprint, 'chrome');
     assert.equal((plain.outbounds[0].tls as Record<string, unknown>).ech, undefined);
     const ech = JSON.parse(buildSingBoxJson(HOST, USER, { ech: true }));
     assert.deepEqual((ech.outbounds[0].tls as Record<string, unknown>).ech, { enabled: true });
+    const ss = plain.outbounds.find((outbound: { type: string }) => outbound.type === 'shadowsocks');
+    assert.equal(ss.method, 'aes-256-gcm');
+    assert.equal(ss.plugin, 'v2ray-plugin');
+    assert.equal(ss.network, 'tcp');
+    assert.ok(String(ss.plugin_opts).includes('mode=websocket'));
+    assert.ok(String(ss.plugin_opts).includes('path=/ss/' + USER.uuid));
+    assert.ok(plain.outbounds.some((outbound: { type: string }) => outbound.type === 'selector'));
   });
 
   /* ---------------- xray core ---------------- */
@@ -166,7 +182,9 @@ async function main() {
 
   await ok('capability matrix: exact profile generation, origin declaration, and UDP honesty', () => {
     const native = buildProtocolMatrix({}, HOST);
-    assert.equal(native.capabilities.filter((x) => x.boundary === 'WORKER_NATIVE' && x.ready).length, 2);
+    assert.equal(native.capabilities.filter((x) => x.boundary === 'WORKER_NATIVE' && x.ready).length, 3);
+    assert.equal(native.capabilities.find((x) => x.protocol === 'shadowsocks' && x.transport === 'ws')?.ready, true);
+    assert.equal(native.capabilities.find((x) => x.protocol === 'shadowsocks' && x.transport === 'udp')?.ready, false);
     const vlessXhttp = native.capabilities.find((x) => x.protocol === 'vless' && x.transport === 'xhttp');
     assert.equal(vlessXhttp?.boundary, 'ORIGIN_ENGINE_REQUIRED');
     assert.equal(vlessXhttp?.ready, false);
@@ -179,7 +197,9 @@ async function main() {
     const matrix = buildProtocolMatrix(origin, HOST);
     assert.equal(matrix.capabilities.find((x) => x.protocol === 'vless' && x.transport === 'grpc')?.deploymentValidation, 'declared-not-tested');
     assert.equal(matrix.capabilities.find((x) => x.protocol === 'vless' && x.transport === 'xhttp')?.ready, false);
-    const bundle = JSON.parse(buildAdaptiveClientBundle(HOST, USER, {}, origin));
+    const bundle = JSON.parse(buildAdaptiveClientBundle(HOST, USER, {}, origin, 'https://' + HOST + '/sub/token/dns-query'));
+    assert.ok(bundle.native.shadowsocks_ws.startsWith('ss://'));
+    assert.equal(bundle.dns_forwarding.doh_url, 'https://' + HOST + '/sub/token/dns-query');
     const templates = bundle.origin.protocol_templates as Record<string, unknown>;
     assert.deepEqual(Object.keys(templates), ['vless_grpc']);
     assert.equal(bundle.origin.engine_validation, 'declared_not_tested');
@@ -343,11 +363,11 @@ async function main() {
   await ok('renderSub: all four formats produce sane bodies', () => {
     const b64 = renderSub('v2ray', HOST, USER, {});
     const decoded = Buffer.from(b64.body, 'base64').toString('utf8');
-    assert.ok(decoded.includes('vless://') && decoded.includes('trojan://'));
+    assert.ok(decoded.includes('vless://') && decoded.includes('trojan://') && decoded.includes('ss://'));
     const clash = renderSub('clash', HOST, USER, {});
     assert.ok(clash.body.includes('proxies:'));
     const sb = renderSub('singbox', HOST, USER, {});
-    assert.ok(JSON.parse(sb.body).outbounds.length === 3);
+    assert.ok(JSON.parse(sb.body).outbounds.length === 5);
     const xr = renderSub('xray', HOST, USER, { opKey: 'irancell' });
     const cfg = JSON.parse(xr.body);
     assert.ok(cfg.outbounds.length === 12);

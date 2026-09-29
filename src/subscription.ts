@@ -19,11 +19,13 @@ import { EffectiveSettings } from './settings';
 import { DEFAULT_FP, FragPreset, adaptiveProfiles, fpFor, opBranding, resolveOp, SubOpts, AdaptiveProfile } from './sub/operators';
 import { ALPN_PROFILES, protocolCatalog, adaptiveProtocolOrder, parseOriginTransports, type ProtocolCapability } from './protocols/catalog';
 import { buildAdaptiveProtocolPolicy, choosePreferredProfiles, policySummary } from './protocols/policy';
-import { Env } from './config';
+import { Env, VERSION } from './config';
+import { SHADOWSOCKS_METHOD } from './protocols/shadowsocks';
 
 export interface ClientLinks {
   vless: string;
   trojan: string;
+  shadowsocks: string;
   wsPath: string;
 }
 
@@ -52,7 +54,7 @@ export function buildProtocolMatrix(env: Env | undefined, host: string): Protoco
   const all = protocolCatalog(configured, originTransports);
   const adaptiveProfiles = buildAdaptiveProtocolPolicy(all);
   return {
-    version: '2.10.0',
+    version: VERSION,
     edge: { host, nativeProtocols: all.filter((c) => c.mode === 'native-edge').map((c) => ({ protocol: c.protocol, transport: c.transport, ready: c.ready })) },
     origin: configured
       ? { configured: true, host: originHost, port: originPort!, validation: 'declared_not_tested' }
@@ -83,7 +85,7 @@ function originTemplates(capabilities: ProtocolCapability[], transports: readonl
   return templates;
 }
 
-export function buildAdaptiveClientBundle(host: string, user: { uuid: string; trojanPass: string; name: string }, opts: BuildOpts | null | undefined, env?: Env): string {
+export function buildAdaptiveClientBundle(host: string, user: { uuid: string; trojanPass: string; name: string }, opts: BuildOpts | null | undefined, env?: Env, dnsUrl?: string): string {
   const matrix = buildProtocolMatrix(env, host);
   const originTransports = parseOriginTransports(env?.ORIGIN_ENGINE_TRANSPORTS);
   const out: Record<string, unknown> = {
@@ -93,6 +95,13 @@ export function buildAdaptiveClientBundle(host: string, user: { uuid: string; tr
     native: {
       vless_ws: buildLinks(host, user, opts).vless,
       trojan_ws: buildLinks(host, user, opts).trojan,
+      shadowsocks_ws: buildLinks(host, user, opts).shadowsocks,
+    },
+    dns_forwarding: {
+      doh_url: dnsUrl || null,
+      client_udp: 'VLESS UDP DNS only (destination port 53)',
+      upstream: 'HTTPS RFC 8484 with bounded adaptive failover',
+      dns64: 'AAAA synthesis for RFC 6052 NAT64 when enabled; requires a reachable NAT64 translator',
     },
     capability_matrix: matrix.capabilities,
     preferred_order: matrix.preferredOrder,
@@ -118,8 +127,9 @@ export async function buildLiveAdaptiveClientBundle(
   user: { id?: number; uuid: string; trojanPass: string; name: string },
   opts: BuildOpts | null | undefined,
   env?: Env,
+  dnsUrl?: string,
 ): Promise<string> {
-  const base = JSON.parse(buildAdaptiveClientBundle(host, user, opts, env)) as Record<string, unknown>;
+  const base = JSON.parse(buildAdaptiveClientBundle(host, user, opts, env, dnsUrl)) as Record<string, unknown>;
   const now = Date.now();
   const matrix = buildProtocolMatrix(env, host);
   const db = env?.GZ_DB;
@@ -248,7 +258,13 @@ export function buildLinks(
   const trojan =
     'trojan://' + user.trojanPass + '@' + host + ':' + port + '?' + params +
     '#' + tag;
-  return { vless, trojan, wsPath };
+  const ssUserInfo = toBase64(SHADOWSOCKS_METHOD + ':' + user.uuid)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+  const plugin = encodeURIComponent('v2ray-plugin;mode=websocket;tls;host=' + host + ';path=/ss/' + user.uuid);
+  const shadowsocks = 'ss://' + ssUserInfo + '@' + host + ':' + port + '/?plugin=' + plugin + '#' + tag;
+  return { vless, trojan, shadowsocks, wsPath };
 }
 
 export async function subTokenFor(host: string, uuid: string): Promise<string> {
@@ -269,13 +285,14 @@ export async function findUserByToken(db: D1Database, host: string, token: strin
 /* ------------------------------ formatters ------------------------------ */
 
 export function buildBase64(links: ClientLinks[]): string {
-  return toBase64(links.map((l) => l.vless + '\n' + l.trojan).join('\n'));
+  return toBase64(links.map((l) => [l.vless, l.trojan, l.shadowsocks].join('\n')).join('\n'));
 }
 
 export function buildClashYaml(
   host: string,
   user: { uuid: string; trojanPass: string; name: string },
   opts: BuildOpts | null | undefined,
+  dnsUrl?: string,
 ): string {
   const port = opts?.port && opts.port !== 443 ? opts.port : 443;
   const wsPath = '/' + user.uuid + '?ed=2048&gz_profile=standard';
@@ -286,6 +303,7 @@ export function buildClashYaml(
   const ech = opts?.ech
     ? '    ech-opts:\n      enabled: true\n'
     : '';
+  const ssName = 'Gozargah-Shadowsocks-' + (brand ? brand.en.split(' ')[0] + '-' : '') + user.name;
   const proxy = (name: string, kind: 'vless' | 'trojan'): string[] => [
     '  - name: "' + name + '"',
     '    type: ' + kind,
@@ -296,7 +314,7 @@ export function buildClashYaml(
     '    servername: ' + host,
     '    client-fingerprint: ' + fp,
     '    network: ws',
-    '    udp: false',
+    kind === 'vless' ? '    udp: true' : '    udp: false',
     '    ws-opts:',
     '      path: "' + wsPath + '"',
     '      headers:',
@@ -304,28 +322,46 @@ export function buildClashYaml(
     '      max-early-data: 2048',
     '      early-data-header-name: Sec-WebSocket-Protocol',
   ];
+  const shadowsocksProxy = [
+    '  - name: "' + ssName + '"',
+    '    type: ss',
+    '    server: ' + host,
+    '    port: ' + port,
+    '    cipher: ' + SHADOWSOCKS_METHOD,
+    '    password: "' + user.uuid + '"',
+    '    udp: false',
+    '    plugin: v2ray-plugin',
+    '    plugin-opts:',
+    '      mode: websocket',
+    '      tls: true',
+    '      host: ' + host,
+    '      path: "/ss/' + user.uuid + '"',
+  ];
   return [
     '# gozargah clash-meta profile',
     'mixed-port: 7890',
     'allow-lan: false',
     'mode: rule',
     'log-level: info',
+    'ipv6: true',
     'dns:',
     '  enable: true',
+    '  enhanced-mode: fake-ip',
     '  nameserver:',
-    '    - 1.1.1.1',
-    '    - 8.8.8.8',
+    ...(dnsUrl ? ['    - ' + JSON.stringify(dnsUrl)] : ['    - https://cloudflare-dns.com/dns-query', '    - https://dns.google/dns-query']),
     'proxies:',
     ...proxy(vName, 'vless'),
     ech,
     ...proxy(tName, 'trojan'),
     ech,
+    ...shadowsocksProxy,
     'proxy-groups:',
     '  - name: Gozargah',
     '    type: select',
     '    proxies:',
     '      - ' + vName,
     '      - ' + tName,
+    '      - ' + ssName,
     'rules:',
     '  - MATCH,Gozargah',
     '',
@@ -336,6 +372,7 @@ export function buildSingBoxJson(
   host: string,
   user: { uuid: string; trojanPass: string; name: string },
   opts: BuildOpts | null | undefined,
+  dnsUrl?: string,
 ): string {
   const port = opts?.port && opts.port !== 443 ? opts.port : 443;
   const wsPath = '/' + user.uuid + '?ed=2048&gz_profile=standard';
@@ -356,9 +393,10 @@ export function buildSingBoxJson(
   const brand = opBranding(opts);
   const vName = 'Gozargah-VLESS-' + (brand ? brand.en.split(' ')[0] + '-' : '') + user.name;
   const tName = 'Gozargah-Trojan-' + (brand ? brand.en.split(' ')[0] + '-' : '') + user.name;
+  const ssName = 'Gozargah-Shadowsocks-' + (brand ? brand.en.split(' ')[0] + '-' : '') + user.name;
   const cfg = {
     log: { level: 'info' },
-    dns: { servers: ['1.1.1.1', '8.8.8.8'], strategy: 'ipv4_only' },
+    dns: { servers: dnsUrl ? [dnsUrl] : ['1.1.1.1', '8.8.8.8'], strategy: 'prefer_ipv6' },
     inbounds: [{ type: 'mixed', tag: 'mixed-in', listen: '127.0.0.1', listen_port: 2080 }],
     outbounds: [
       {
@@ -379,9 +417,21 @@ export function buildSingBoxJson(
         tls,
         transport,
       },
+      {
+        type: 'shadowsocks',
+        tag: ssName,
+        server: host,
+        server_port: port,
+        method: SHADOWSOCKS_METHOD,
+        password: user.uuid,
+        plugin: 'v2ray-plugin',
+        plugin_opts: 'mode=websocket;tls;host=' + host + ';path=/ss/' + user.uuid,
+        network: 'tcp',
+      },
+      { type: 'selector', tag: 'gozargah-select', outbounds: [vName, tName, ssName], default: vName },
       { type: 'direct', tag: 'direct' },
     ],
-    route: { final: vName },
+    route: { final: 'gozargah-select' },
   };
   return JSON.stringify(cfg, null, 2);
 }
@@ -620,11 +670,11 @@ export function subHeaders(
   return h;
 }
 
-export function renderSub(app: string, host: string, user: GzUser, opts: SubOpts | null | undefined, env?: Env): { body: string; app: string } {
-  if (app === 'clash') return { body: buildClashYaml(host, user, opts), app };
-  if (app === 'singbox') return { body: buildSingBoxJson(host, user, opts), app };
+export function renderSub(app: string, host: string, user: GzUser, opts: SubOpts | null | undefined, env?: Env, dnsUrl?: string): { body: string; app: string } {
+  if (app === 'clash') return { body: buildClashYaml(host, user, opts, dnsUrl), app };
+  if (app === 'singbox') return { body: buildSingBoxJson(host, user, opts, dnsUrl), app };
   if (app === 'xray') return { body: buildXrayJson(host, user, opts, env), app };
-  if (app === 'profiles') return { body: buildAdaptiveClientBundle(host, user, opts, env), app };
+  if (app === 'profiles') return { body: buildAdaptiveClientBundle(host, user, opts, env, dnsUrl), app };
   if (app === 'capabilities') return { body: JSON.stringify(buildProtocolMatrix(env, host), null, 2), app };
   const links = buildLinks(host, user, opts);
   return { body: buildBase64([links]), app: 'v2ray' };

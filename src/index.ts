@@ -2,13 +2,14 @@
  * Gozargah — worker entry point & router.
  *
  * Route map:
- *   ANY  (websocket upgrade)  -> proxy pipeline (VLESS/Trojan over WS)
+ *   ANY  (websocket upgrade)  -> VLESS/Trojan/SS over WS; DNS-only VLESS UDP on port 53
  *   GET  /                    -> stealth landing page
  *   GET  /robots.txt          -> disallow all
  *   GET  /favicon.png         -> embedded logo
  *   GET  /{panelPath}         -> panel UI (SPA)
  *   POST /{panelPath}/api/*   -> panel JSON API
  *   GET  /{subPath}/{token}       -> browser: rich status page · client: sub (UA-sniffed)
+ *   GET|POST /{subPath}/{token}/dns-query -> authenticated DNS-over-HTTPS
  *   GET  /{subPath}/{token}/{app} -> explicit format (clash | singbox | v2ray | xray | profiles | adaptive | capabilities | page)
  *   GET  anything else        -> stealth landing (no info leak, nahan-style)
  */
@@ -26,6 +27,7 @@ import { userPageHtml } from './panel/userpage';
 import { LOGO_FAV_B64 } from './assets/logo';
 import { glog, logRing } from './utils/log';
 import { handleTelegramWebhook } from './telegram';
+import { handleUserDnsRequest } from './handlers/dns';
 import { runScheduledHealth } from './ai/scheduled-health';
 
 export default {
@@ -99,6 +101,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const appOverride = (segs[1] ?? url.searchParams.get('app') ?? '');
     const user = await findUserByToken(env.GZ_DB, url.hostname, token);
     if (user) {
+      if (segs.length === 2 && segs[1] === 'dns-query') return handleUserDnsRequest(request, env, user);
+      const dnsUrl = url.origin + '/' + eff.subPath + '/' + token + '/dns-query';
       const opts = resolveOpts(url.searchParams.get('op'), url.searchParams.get('ech'));
       const lang = url.searchParams.get('lang') === 'en' ? 'en' : 'fa';
       const app = resolveApp(appOverride, request.headers.get('user-agent') ?? '');
@@ -125,10 +129,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       }
 
       if (app === 'adaptive') {
-        const body = await buildLiveAdaptiveClientBundle(url.hostname, user, opts, env);
+        const body = await buildLiveAdaptiveClientBundle(url.hostname, user, opts, env, dnsUrl);
         return new Response(body, { headers: subHeaders(eff, url.hostname, user, app, opts, token) });
       }
-      const { body } = renderSub(app, url.hostname, user, opts, env);
+      const { body } = renderSub(app, url.hostname, user, opts, env, dnsUrl);
       return new Response(body, { headers: subHeaders(eff, url.hostname, user, app, opts, token) });
     }
     // unknown token: fall through to stealth landing (no user enumeration)

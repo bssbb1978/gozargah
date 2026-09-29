@@ -56,7 +56,10 @@ const STR = {
     opAuto: 'خودکار (بی‌برند)',
     altPorts: 'اگر پورت ۴۴۳ فیلتر شده است',
     altPortsHint: 'کلادفلر ورکرز روی این پورت‌های HTTPS هم پاسخ می‌دهد — لینک جایگزین را کپی کنید',
-    rawLinks: 'لینک‌های خام (VLESS / Trojan)',
+    rawLinks: 'لینک‌های خام (VLESS / Trojan / Shadowsocks AEAD)',
+    shadowsocksLabel: 'Shadowsocks AEAD',
+    dnsLabel: 'DNS-over-HTTPS + DNS64',
+    dnsHint: 'برای VLESS UDP فقط DNS روی پورت ۵۳ پشتیبانی می‌شود؛ Shadowsocks به افزونهٔ v2ray-plugin نیاز دارد.',
     echNote: 'ECH فعال شد — فقط اگر کلاینت و شبکهٔ شما ECH را پشتیبانی می‌کند روشنش کنید (DPI ایران با ECH مشکل دارد)',
     poweredBy: 'با گذرگاه ساخته شده — پنل پروکسی یک‌فایلی روی Cloudflare Workers',
     copied: 'کپی شد ✓',
@@ -102,7 +105,10 @@ const STR = {
     opAuto: 'Auto (neutral)',
     altPorts: 'If port 443 is blocked',
     altPortsHint: 'Cloudflare Workers also answers on these HTTPS ports — copy an alternative link',
-    rawLinks: 'Raw links (VLESS / Trojan)',
+    rawLinks: 'Raw links (VLESS / Trojan / Shadowsocks AEAD)',
+    shadowsocksLabel: 'Shadowsocks AEAD',
+    dnsLabel: 'DNS-over-HTTPS + DNS64',
+    dnsHint: 'Only VLESS UDP DNS on port 53 is supported; Shadowsocks requires the v2ray-plugin client plugin.',
     echNote: 'ECH is ON — only enable it if your client AND network support it (Iranian DPI interferes with ECH)',
     poweredBy: 'Built with Gozargah — the one-file proxy panel on Cloudflare Workers',
     copied: 'Copied ✓',
@@ -148,6 +154,7 @@ export async function userPageHtml(p: UserPageParams): Promise<string> {
   const { host, user, token } = p;
   const opts = p.opts;
   const base = 'https://' + host + '/' + p.subPath + '/' + token;
+  const dnsUrl = base + '/dns-query';
 
   const links = buildLinks(host, user, opts);
   const brand = opBranding(opts);
@@ -195,10 +202,11 @@ export async function userPageHtml(p: UserPageParams): Promise<string> {
     expiryText = S.never;
   }
 
-  const [qrSub, qrVless, qrTrojan] = await Promise.all([
+  const [qrSub, qrVless, qrTrojan, qrShadowsocks] = await Promise.all([
     qrSvg(autoSub, 210),
     qrSvg(links.vless, 210),
     qrSvg(links.trojan, 210),
+    qrSvg(links.shadowsocks, 210),
   ]);
 
   const langSwap: Lang = p.lang === 'fa' ? 'en' : 'fa';
@@ -439,6 +447,13 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
       <button class="btn sm" type="button" data-copy="${esc(links.trojan)}">⧉</button>
       <button class="btn sm" type="button" data-qrtoggle="qr-trojan">QR</button></div>
     <div class="qrbox" id="qr-trojan"><span class="qcard">${qrTrojan}</span></div>
+    <div class="crow"><span class="clab">${esc(S.shadowsocksLabel)}</span><span class="cval mono">${esc(links.shadowsocks)}</span>
+      <button class="btn sm" type="button" data-copy="${esc(links.shadowsocks)}">⧉</button>
+      <button class="btn sm" type="button" data-qrtoggle="qr-shadowsocks">QR</button></div>
+    <div class="qrbox" id="qr-shadowsocks"><span class="qcard">${qrShadowsocks}</span></div>
+    <div class="hint">${esc(S.dnsHint)}</div>
+    <div class="crow"><span class="clab">${esc(S.dnsLabel)}</span><span class="cval mono">${esc(dnsUrl)}</span>
+      <button class="btn sm" type="button" data-copy="${esc(dnsUrl)}">⧉</button></div>
   </div>
 </details>
 

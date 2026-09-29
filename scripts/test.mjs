@@ -17,6 +17,10 @@ const entries = [
   'protocol-catalog',
   'protocol-controller',
   'network-intelligence',
+  'shadowsocks',
+  'dns-wire',
+  'dns-resolver',
+  'vless-dns',
 ];
 
 for (const name of entries) {
