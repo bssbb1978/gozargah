@@ -1,0 +1,23 @@
+Gozargah 2.10.0 — Evidence-Scoped Network Intelligence
+Build date: 2026-09-29
+Source commit: b22784f96628a3b0cc1166666b86170936b5acb9 (arena/01a0eb94-gozargah)
+D1 schema: 14; no migration
+
+Changed files
+- Application/config/build: README.md, package.json, package-lock.json, scripts/test.mjs, src/config.ts.
+- Network intelligence/telemetry: src/ai/network-intelligence.ts, src/ai/scheduled-health.ts, src/db/store.ts, src/handlers/proxy.ts, src/handlers/websocket.ts, src/panel/api.ts.
+- Capability/profile generation: src/protocols/catalog.ts, src/protocols/policy.ts, src/subscription.ts.
+- Tests: src/test/engine.ts, src/test/network-intelligence.ts, src/test/protocol-catalog.ts, src/test/worker.integration.test.ts.
+- Engineering docs: ADAPTIVE-ENGINE.md, AI-ENGINE.md, CAPABILITY-MATRIX.md, FAILURE-DOMAINS.md, RECOVERY-MODEL.md, TEST-REPORT-2.10.0.md, UPGRADE-REPORT-FA-2.10.0.md, UPGRADE-REPORT-FA.md.
+- Retained versioned 2.9 docs: RELEASE-MANIFEST-2.9.0.txt, UPGRADE-REPORT-FA-2.9.0.md.
+- Release deliverables: RELEASE-MANIFEST-2.10.0.txt, release.tar.gz, release.sha256.
+
+Changes: conservative condition/failure classification; bounded source-tagged path samples using existing D1 `health_samples.kind`; extended existing authenticated `/api/network/state`; five-state capability descriptors; generator checks; scheduler condition-transition audit events; no new API route or D1 migration. Deterministic policy remains authoritative; Workers AI remains optional decision support.
+
+Verification (all PASS): `npm install`; `npm run typecheck`; `npm test` (36 engine checks, four named pure-logic suites plus engine, 12 Worker/D1 integration tests); `npm run build` (Wrangler dry-run, 408.98 KiB upload / 109.56 KiB gzip); `npm audit` (0 vulnerabilities); `git diff --check`.
+
+Not run: ESLint/formatter (no repo script/config); production deployment; live origin/client/ISP/region validation. Origin templates are declared, not live-verified. Network classification is limited to configured paths measured from Worker egress; it does not prove DPI or physical upstream disconnection. No client telemetry/origin adapter was added; UDP-native WireGuard/Hysteria2 remain unsupported.
+
+Archive: `release.tar.gz` (116 files; this external manifest and checksum sidecar are intentionally not embedded).
+SHA-256 (`release.tar.gz`): 7d3dded2c1d0a911572eab07c8771c3e682b3be0cf54969a973c0a99f05ed138
+Sidecar: `release.sha256`
