@@ -268,6 +268,36 @@ Honest boundary: the governor changes *shape*, never *semantics* — the
 VLESS payload, the destination, and the entry selection (bandit +
 failover) are untouched; every parameter is bounded and auditable.
 
+### 6.3 WS upgrade header shape jitter (2.20)
+
+The WebSocket upgrade HTTP request is a visible fingerprint to any
+MITM and to TLS-inspecting DPI around the handshake: stock VLESS
+clients send a fixed five-header shape in a fixed order. AXR sends
+bounded browser-plausible shapes instead.
+
+**Templates** (picked by the 2.19 governor's stance):
+
+| template | headers |
+|----------|---------|
+| `bare` (contrast baseline) | the classic five |
+| `lite` (steady) | + `Accept-Encoding`, `Accept-Language` |
+| `full` (cautious/aggressive) | + `Sec-Fetch-Site/Mode/Dest`, `Origin`, `User-Agent` — the shape of a cross-site browser page opening a WebSocket |
+
+**Jitter:** `Upgrade`/`Connection` relative order, a rotation of the
+optional block, and a subtle per-header case flip (HTTP names are
+case-insensitive) — all per connection. **Stable identity:** locale,
+user agent and page origin come from small plausible pools indexed by a
+UUID-derived draw, so one user presents one consistent identity across
+connections (a real browser does not change locale per request).
+
+Wired behind the `-surgery` flag; `nil` shape reproduces the classic
+request byte-for-byte (regression-tested). The Worker's
+`Sec-WebSocket-Protocol` early-data consumption is case-insensitive, so
+no Worker change.
+
+Honest boundary: HTTP header shape, not TLS-layer identity forgery —
+the uTLS ClientHello identity remains the source of truth.
+
 ---
 
 ## 7. Verification

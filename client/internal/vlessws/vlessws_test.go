@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -481,5 +482,138 @@ func TestSendBinaryNoFragmenter(t *testing.T) {
 	rec.mu.Unlock()
 	if n != 1 {
 		t.Fatalf("no fragmenter: exactly one frame expected, got %d", n)
+	}
+}
+
+// ---- 2.20 — upgrade request shape jitter ----
+
+// parseUpgrade splits the request text into lower-cased header names
+// (failing on malformed input, duplicates, or a missing blank-line end).
+func parseUpgrade(t *testing.T, req string) map[string]string {
+	t.Helper()
+	lines := strings.Split(req, "\r\n")
+	if len(lines) < 3 || lines[0] != "GET /up HTTP/1.1" {
+		t.Fatalf("bad request line: %q", req[:min(40, len(req))])
+	}
+	if lines[len(lines)-2] != "" {
+		t.Fatalf("must end with a blank line: %q", req)
+	}
+	m := make(map[string]string)
+	for _, ln := range lines[1 : len(lines)-2] {
+		k, v, ok := strings.Cut(ln, ": ")
+		if !ok || k == "" {
+			t.Fatalf("bad header line: %q", ln)
+		}
+		if _, dup := m[strings.ToLower(k)]; dup {
+			t.Fatalf("duplicate header %q", k)
+		}
+		m[strings.ToLower(k)] = v
+	}
+	return m
+}
+
+func TestUpgradeRequestClassicRegression(t *testing.T) {
+	key := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	kb := base64.StdEncoding.EncodeToString(key)
+	got := buildUpgradeRequest("ex.com", "/up", key, "", nil)
+	want := "GET /up HTTP/1.1\r\n" +
+		"Host: ex.com\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: " + kb + "\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"\r\n"
+	if got != want {
+		t.Fatalf("classic request changed:\n got %q\nwant %q", got, want)
+	}
+	// With early data, the protocol header rides in the classic slot.
+	got = buildUpgradeRequest("ex.com", "/up", key, "abc", nil)
+	want = "GET /up HTTP/1.1\r\n" +
+		"Host: ex.com\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: " + kb + "\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Sec-WebSocket-Protocol: abc\r\n" +
+		"\r\n"
+	if got != want {
+		t.Fatalf("classic request with early data changed:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestUpgradeShapeContent(t *testing.T) {
+	key := []byte{9, 9, 9, 9, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	kb := base64.StdEncoding.EncodeToString(key)
+	locale := "en-GB,en;q=0.9"
+	ua := UAPool[0]
+	origin := OriginPool[0]
+
+	for seed := int64(1); seed < 8; seed++ {
+		rng := rand.New(rand.NewSource(seed))
+		// Lite
+		sh := NewUpgradeShape(rng.Float64, UpgradeLite, locale, "", "")
+		m := parseUpgrade(t, buildUpgradeRequest("ex.com", "/up", key, "ed", sh))
+		if m["host"] != "ex.com" || m["upgrade"] != "websocket" ||
+			m["connection"] != "Upgrade" || m["sec-websocket-key"] != kb ||
+			m["sec-websocket-version"] != "13" || m["sec-websocket-protocol"] != "ed" {
+			t.Fatalf("lite seed %d: required headers wrong: %v", seed, m)
+		}
+		if m["accept-encoding"] != "gzip" || m["accept-language"] != locale {
+			t.Fatalf("lite seed %d: optional headers missing: %v", seed, m)
+		}
+		if _, ok := m["user-agent"]; ok {
+			t.Fatalf("lite seed %d: must not carry a user agent", seed)
+		}
+		// Full
+		rng = rand.New(rand.NewSource(seed))
+		sh = NewUpgradeShape(rng.Float64, UpgradeFull, locale, ua, origin)
+		m = parseUpgrade(t, buildUpgradeRequest("ex.com", "/up", key, "", sh))
+		if m["sec-fetch-site"] != "cross-site" || m["sec-fetch-mode"] != "websocket" ||
+			m["sec-fetch-dest"] != "websocket" || m["origin"] != origin || m["user-agent"] != ua {
+			t.Fatalf("full seed %d: browser headers wrong: %v", seed, m)
+		}
+		if _, ok := m["sec-websocket-protocol"]; ok {
+			t.Fatalf("full seed %d: no early data, no protocol header", seed)
+		}
+	}
+}
+
+func TestUpgradeShapeDeterministic(t *testing.T) {
+	key := []byte{1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8}
+	a := NewUpgradeShape(rand.New(rand.NewSource(77)).Float64, UpgradeFull, LocalePool[2], UAPool[1], OriginPool[2])
+	b := NewUpgradeShape(rand.New(rand.NewSource(77)).Float64, UpgradeFull, LocalePool[2], UAPool[1], OriginPool[2])
+	ra := buildUpgradeRequest("h.example", "/p?a=1", key, "x", a)
+	rb := buildUpgradeRequest("h.example", "/p?a=1", key, "x", b)
+	if ra != rb {
+		t.Fatalf("same seed must give the same request:\n%q\nvs\n%q", ra, rb)
+	}
+}
+
+func TestUpgradeShapeOrderInvariants(t *testing.T) {
+	key := []byte{5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5}
+	for seed := int64(0); seed < 20; seed++ {
+		for _, tpl := range []UpgradeTemplate{UpgradeBare, UpgradeLite, UpgradeFull} {
+			sh := NewUpgradeShape(rand.New(rand.NewSource(seed)).Float64, tpl, LocalePool[0], UAPool[0], OriginPool[0])
+			req := buildUpgradeRequest("ex.com", "/up", key, "ed", sh)
+			lines := strings.Split(req, "\r\n")
+			if len(lines) < 3 || !strings.HasPrefix(lines[1], "Host: ") {
+				t.Fatalf("seed %d tpl %d: first header must be Host: %q", seed, tpl, lines[1])
+			}
+			pos := func(name string) int {
+				for i, ln := range lines[1:] {
+					if k, _, ok := strings.Cut(ln, ": "); ok && strings.EqualFold(k, name) {
+						return i
+					}
+				}
+				t.Fatalf("seed %d tpl %d: missing %s in:\n%s", seed, tpl, name, req)
+				return -1
+			}
+			pu, pc := pos("Upgrade"), pos("Connection")
+			pk, pv, pp := pos("Sec-WebSocket-Key"), pos("Sec-WebSocket-Version"), pos("Sec-WebSocket-Protocol")
+			if pu > pc || pc > pk || pk > pv || pv > pp {
+				t.Fatalf("seed %d tpl %d: order Upgrade,Connection < Key < Version < Protocol violated: %d %d %d %d %d",
+					seed, tpl, pu, pc, pk, pv, pp)
+			}
+		}
 	}
 }

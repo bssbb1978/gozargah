@@ -233,6 +233,12 @@ type server struct {
 	// bootstrap (before any goroutine starts), read by the probe loop.
 	probeJitterOffset time.Duration
 
+	// 2.20 — stable per-client upgrade-shape identity (UUID-derived,
+	// like the probe-jitter offset): one locale/UA/origin per user.
+	langIdx   int
+	uaIdx     int
+	originIdx int
+
 	// churnMu guards the last-good dial-address pair (entry-churn feature).
 	churnMu      sync.Mutex
 	prevGoodDial string
@@ -316,10 +322,19 @@ func newServer(cfg Config, l *logger, timeout time.Duration) (*server, error) {
 		l.logf("merged %d local scan clean IP(s) into the entry ladder", n)
 	}
 
+	// 2.20 — stable per-client upgrade-shape identity (one locale/UA/
+	// origin per user, derived from the UUID like the probe offset).
+	uidx := fnv.New32a()
+	_, _ = uidx.Write([]byte(cfg.UUID))
+	uid := uidx.Sum32()
+
 	s := &server{
 		cfg:       cfg,
 		log:       l,
 		timeout:   timeout,
+		langIdx:   int(uid % uint32(len(vlessws.LocalePool))),
+		uaIdx:     int((uid >> 8) % uint32(len(vlessws.UAPool))),
+		originIdx: int((uid >> 16) % uint32(len(vlessws.OriginPool))),
 		bandit:    b,
 		failover:  fo,
 		trackers:  make(map[string]*measure.Tracker),
@@ -522,6 +537,23 @@ func mergeCleanIPsFile(fo *failover.Engine, path string) int {
 		fo.AddEntry(up)
 	}
 	return added
+}
+
+// upgradeShapeFor maps the 2.19 stance to the 2.20 WS upgrade header
+// shape: steady = the light browser shape, cautious/aggressive = the
+// full cross-site browser shape. Identity values (locale, user agent,
+// page origin) are stable per client (UUID-derived); order/case jitter
+// is per connection. nil (surgery off) keeps the classic request.
+func (s *server) upgradeShapeFor(esc evade.Escalation) *vlessws.UpgradeShape {
+	if !s.surgeryOn() {
+		return nil
+	}
+	tpl := vlessws.UpgradeLite
+	if esc.Stance == evade.StanceCautious || esc.Stance == evade.StanceAggressive {
+		tpl = vlessws.UpgradeFull
+	}
+	return vlessws.NewUpgradeShape(s.rngFloat, tpl,
+		vlessws.LocalePool[s.langIdx], vlessws.UAPool[s.uaIdx], vlessws.OriginPool[s.originIdx])
 }
 
 // fragParams returns the per-connection ClientHello surgery parameters:
@@ -1077,12 +1109,17 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 	}
 	surg := s.surgeryOn()
 	var frag *vlessws.Fragmenter
+	var upgrade *vlessws.UpgradeShape
 	if surg {
 		// 2.18/2.19 — WS frame-rhythm fragmentation: each binary message
 		// rides as 2-6 masked continuation frames with randomized sizes
 		// and skewed micro-gaps (Worker reassembles natively); the
 		// governor tunes the rhythm bounds per stance.
 		frag = vlessws.NewFragmenterWith(s.rngFloat, esc.WSMinB, esc.WSMaxB, esc.WSCount, time.Duration(esc.WSGapMS)*time.Millisecond)
+		// 2.20 — the governor's stance also picks the WS upgrade
+		// header shape (steady = light, cautious/aggressive = full
+		// browser shape) with the stable per-client identity.
+		upgrade = s.upgradeShapeFor(esc)
 	}
 	ws, err := vlessws.DialConn(ctx, inner, vlessws.DialOptions{
 		Host:       cand.Endpoint.Host,
@@ -1090,6 +1127,7 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 		FP:         cand.Endpoint.FP,
 		EarlyData:  header, // 0-RTT: VLESS header rides the upgrade
 		Fragmenter: frag,
+		Upgrade:    upgrade,
 		AfterTLS: func(c net.Conn) net.Conn {
 			if surg {
 				// 2.15 — app-class flow morphing (length histogram + IPD).

@@ -323,6 +323,170 @@ func (f *Fragmenter) send(c *Client, payload []byte) error {
 	return nil
 }
 
+// ---- 2.20 — WebSocket upgrade request shape jitter ----
+//
+// The WS upgrade HTTP request is a visible fingerprint to any MITM and to
+// TLS-inspecting DPI around the handshake. Stock VLESS clients send a
+// fixed five-header shape in a fixed order. AXR sends bounded
+// browser-plausible shapes instead: the required headers keep their
+// semantics (header order is HTTP-legal to vary), optional browser
+// headers (Accept-Encoding, Accept-Language, Sec-Fetch-*, Origin,
+// User-Agent) fill the request out to the shape of a real
+// page-initiated WebSocket, and the per-client identity values (locale,
+// user agent, page origin) are STABLE within a session — a real browser
+// does not change locale per request.
+//
+// Honest boundary: this is HTTP header shape, not TLS-layer identity
+// forgery (the uTLS ClientHello identity remains the source of truth);
+// the pools are deliberately small and plausible.
+
+// UpgradeTemplate selects the header-shape family.
+type UpgradeTemplate int
+
+const (
+	// UpgradeBare is the classic five-header shape (the stock VLESS
+	// client look) — kept as a contrast baseline.
+	UpgradeBare UpgradeTemplate = iota
+	// UpgradeLite adds Accept-Encoding + Accept-Language.
+	UpgradeLite
+	// UpgradeFull adds the Sec-Fetch-* trio, Origin and User-Agent —
+	// the shape a cross-site browser page opening a WebSocket produces.
+	UpgradeFull
+)
+
+// LocalePool / UAPool / OriginPool are the per-client identity pools. A
+// client picks a stable index (UUID-derived) so the shape is consistent
+// across connections of the same user.
+var (
+	LocalePool = []string{
+		"en-US,en;q=0.9",
+		"en-GB,en;q=0.9",
+		"en,ar;q=0.9,en-US;q=0.8",
+		"ar,en-US;q=0.9,en;q=0.8",
+		"fa-IR,fa;q=0.9,en;q=0.8",
+	}
+	UAPool = []string{
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
+	}
+	OriginPool = []string{
+		"https://www.google.com",
+		"https://www.bing.com",
+		"https://web.telegram.org",
+		"https://www.whatsapp.com",
+		"https://mail.google.com",
+	}
+)
+
+// UpgradeShape is the per-connection randomizer for the upgrade
+// request's header shape.
+type UpgradeShape struct {
+	template  UpgradeTemplate
+	locale    string
+	userAgent string
+	origin    string
+	rng       Rng
+}
+
+// NewUpgradeShape builds a shape from stable per-client identity values
+// and a per-connection rng. Empty identity values disable the matching
+// optional header.
+func NewUpgradeShape(rng Rng, template UpgradeTemplate, locale, userAgent, origin string) *UpgradeShape {
+	if template < UpgradeBare || template > UpgradeFull {
+		template = UpgradeLite
+	}
+	return &UpgradeShape{template: template, locale: locale, userAgent: userAgent, origin: origin, rng: rng}
+}
+
+// buildUpgradeRequest returns the full upgrade request text. shape ==
+// nil reproduces the classic fixed five-header request byte-for-byte
+// (the pre-2.20 behaviour).
+func buildUpgradeRequest(host, path string, key []byte, earlyData string, shape *UpgradeShape) string {
+	keyB64 := base64.StdEncoding.EncodeToString(key)
+	if shape == nil {
+		var b strings.Builder
+		b.WriteString("GET " + path + " HTTP/1.1\r\n")
+		b.WriteString("Host: " + host + "\r\n")
+		b.WriteString("Upgrade: websocket\r\n")
+		b.WriteString("Connection: Upgrade\r\n")
+		b.WriteString("Sec-WebSocket-Key: " + keyB64 + "\r\n")
+		b.WriteString("Sec-WebSocket-Version: 13\r\n")
+		if earlyData != "" {
+			b.WriteString("Sec-WebSocket-Protocol: " + earlyData + "\r\n")
+		}
+		b.WriteString("\r\n")
+		return b.String()
+	}
+
+	// The jittered browser-plausible order:
+	//   Host | Upgrade,Connection (rng order) | rotated optional block |
+	//   Sec-WebSocket-Key, Sec-WebSocket-Version [, Sec-WebSocket-Protocol]
+	// HTTP header names are case-insensitive; a subtle per-connection
+	// case flip keeps the shape out of fixed-fingerprint databases.
+	var optional [][2]string
+	switch shape.template {
+	case UpgradeLite:
+		optional = append(optional, [2]string{"Accept-Encoding", "gzip"})
+		if shape.locale != "" {
+			optional = append(optional, [2]string{"Accept-Language", shape.locale})
+		}
+	case UpgradeFull:
+		optional = append(optional, [2]string{"Accept-Encoding", "gzip"})
+		if shape.locale != "" {
+			optional = append(optional, [2]string{"Accept-Language", shape.locale})
+		}
+		optional = append(optional,
+			[2]string{"Sec-Fetch-Site", "cross-site"},
+			[2]string{"Sec-Fetch-Mode", "websocket"},
+			[2]string{"Sec-Fetch-Dest", "websocket"})
+		if shape.origin != "" {
+			optional = append(optional, [2]string{"Origin", shape.origin})
+		}
+		if shape.userAgent != "" {
+			optional = append(optional, [2]string{"User-Agent", shape.userAgent})
+		}
+	}
+
+	uc := [2]string{"Upgrade", "Connection"}
+	if shape.rng != nil && shape.rng() < 0.5 {
+		uc = [2]string{"Connection", "Upgrade"}
+	}
+	names = append(names, uc[:]...)
+	if shape.rng != nil && len(optional) > 1 {
+		rot := int(shape.rng() * float64(len(optional)))
+		optional = append(optional[rot:], optional[:rot]...)
+	}
+	var b strings.Builder
+	b.WriteString("GET " + path + " HTTP/1.1\r\n")
+	emit := func(name, value string) {
+		if shape.rng != nil && shape.rng() < 0.15 {
+			name = strings.ToLower(name)
+		}
+		b.WriteString(name + ": " + value + "\r\n")
+	}
+	emit("Host", host)
+	for _, nm := range uc {
+		if nm == "Upgrade" {
+			emit("Upgrade", "websocket")
+		} else {
+			emit("Connection", "Upgrade")
+		}
+	}
+	for _, p := range optional {
+		emit(p[0], p[1])
+	}
+	emit("Sec-WebSocket-Key", keyB64)
+	emit("Sec-WebSocket-Version", "13")
+	if earlyData != "" {
+		emit("Sec-WebSocket-Protocol", earlyData)
+	}
+	b.WriteString("\r\n")
+	return b.String()
+}
+
 // DecodeServerFrame parses one COMPLETE UNMASKED server frame from buf.
 // It returns the bytes consumed (n) and io.ErrShortBuffer when buf holds
 // only a prefix. Server frames must be unmasked (RFC 6455 §5.1).
@@ -376,6 +540,11 @@ type DialOptions struct {
 	// masked continuation frames with randomized sizes and skewed
 	// micro-gaps. nil keeps the classic one-frame-per-write behaviour.
 	Fragmenter *Fragmenter
+	// Upgrade (2.20) optionally shapes the WebSocket upgrade request as
+	// a browser-plausible header set (order/optional headers/case
+	// jitter) instead of the classic fixed five-header look. nil keeps
+	// the classic request byte-for-byte.
+	Upgrade *UpgradeShape
 }
 
 // Client is an open VLESS-WS tunnel.
@@ -444,23 +613,17 @@ func DialConn(ctx context.Context, conn net.Conn, opts DialOptions) (*Client, er
 		tconn.Close()
 		return nil, err
 	}
-	var b strings.Builder
-	b.WriteString("GET " + opts.Path + " HTTP/1.1\r\n")
-	b.WriteString("Host: " + opts.Host + "\r\n")
-	b.WriteString("Upgrade: websocket\r\n")
-	b.WriteString("Connection: Upgrade\r\n")
-	b.WriteString("Sec-WebSocket-Key: " + base64.StdEncoding.EncodeToString(key) + "\r\n")
-	b.WriteString("Sec-WebSocket-Version: 13\r\n")
+	ed := ""
 	if len(opts.EarlyData) > 0 {
-		ed, err := EncodeEarlyData(opts.EarlyData)
+		v, err := EncodeEarlyData(opts.EarlyData)
 		if err != nil {
 			tconn.Close()
 			return nil, err
 		}
-		b.WriteString("Sec-WebSocket-Protocol: " + ed + "\r\n")
+		ed = v
 	}
-	b.WriteString("\r\n")
-	if _, err := tconn.Write([]byte(b.String())); err != nil {
+	req := buildUpgradeRequest(opts.Host, opts.Path, key, ed, opts.Upgrade)
+	if _, err := tconn.Write([]byte(req)); err != nil {
 		tconn.Close()
 		return nil, err
 	}
