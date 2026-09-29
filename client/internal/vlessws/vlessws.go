@@ -454,7 +454,6 @@ func buildUpgradeRequest(host, path string, key []byte, earlyData string, shape 
 	if shape.rng != nil && shape.rng() < 0.5 {
 		uc = [2]string{"Connection", "Upgrade"}
 	}
-	names = append(names, uc[:]...)
 	if shape.rng != nil && len(optional) > 1 {
 		rot := int(shape.rng() * float64(len(optional)))
 		optional = append(optional[rot:], optional[:rot]...)
