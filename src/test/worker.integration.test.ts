@@ -418,4 +418,69 @@ describe('Cloudflare Worker + D1 integration', () => {
     ].join('|');
     expect(m.manifest_sig).toBe(createHmac('sha256', token).update(canonical, 'utf8').digest('hex'));
   });
+
+  it('stores canary liveness reports via harvest kind=canary (2.17)', async () => {
+    const token = await subTokenFor('gozargah.test', axrV2User!.uuid);
+    const endpoint = 'https://gozargah.test/gozargah/api/network/harvest';
+    // Bad canary host is rejected with 400.
+    const bad = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, kind: 'canary', canaryHost: 'not_a_host', canaryOk: true }),
+    });
+    expect(bad.status).toBe(400);
+    // Valid reports are stored newest-first, capped.
+    const ok1 = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, kind: 'canary', canaryHost: 'canary.example.com', canaryOk: true }),
+    });
+    expect(ok1.status).toBe(200);
+    let body = (await ok1.json()) as Record<string, any>;
+    expect(body.ok).toBe(true);
+    expect(body.kind).toBe('canary');
+    expect(body.stored).toBe(1);
+    const ok2 = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, kind: 'canary', canaryHost: 'canary.example.com', canaryOk: false }),
+    });
+    expect(ok2.status).toBe(200);
+    body = (await ok2.json()) as Record<string, any>;
+    expect(body.stored).toBe(2);
+    // Unauthenticated canary reports are rejected like IP harvests.
+    const anon = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'canary', canaryHost: 'canary.example.com', canaryOk: true }),
+    });
+    expect(anon.status).toBe(401);
+  });
+
+  it('fleet canary failures raise manifest pressure to level 3 (2.17)', async () => {
+    const token = await subTokenFor('gozargah.test', axrV2User!.uuid);
+    const endpoint = 'https://gozargah.test/gozargah/api/network/harvest';
+    // The previous test left 2 results (1 ok, 1 fail). Add one more failure
+    // within the 30-min window -> 3 samples, 2/3 failing >= 0.5 floor.
+    const ok3 = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, kind: 'canary', canaryHost: 'canary.example.com', canaryOk: false }),
+    });
+    expect(ok3.status).toBe(200);
+    const m = (await (await mf.dispatchFetch(`https://gozargah.test/sub/${token}/axr-manifest`)).json()) as Record<string, any>;
+    expect(m.pressure).toBeDefined();
+    expect(m.pressure.level).toBe(3);
+    expect(m.pressure.reasons).toContain('canary_fleet_failures');
+    // Dynamic levers: faster probes + highest-entropy outflow profile.
+    expect(m.reconnect.probe_interval_ms).toBe(15_000);
+    expect(m.flow_profile.mode).toBe('video');
+    // The canary host is NOT in the manifest (env not configured here) and
+    // the signature still verifies over the (now higher) pressure dynamics.
+    expect((m.entries as Array<Record<string, string>>).some((e) => e.role === 'canary')).toBe(false);
+    const { createHmac } = await import('node:crypto');
+    const canonical = [
+      String(m.schema), String(m.version), String(m.host), String(m.ws_path_base),
+      String(m.path_rotation_minutes), (m.transports as string[]).join(','),
+      (m.entries as Array<Record<string, string>>).map((e) => e.host + ':' + e.role).sort().join(','),
+      (m.clean_ip_hints as string[]).join(','), m.fronting_hint ?? '',
+      String(m.flow_profile.mode), String(m.reconnect.probe_interval_ms),
+    ].join('|');
+    expect(m.manifest_sig).toBe(createHmac('sha256', token).update(canonical, 'utf8').digest('hex'));
+  });
 });

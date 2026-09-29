@@ -24,6 +24,7 @@ package main
 import (
 	"context"
 	crand "crypto/rand"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -46,6 +47,7 @@ import (
 	"github.com/bssbb1978/gozargah/axr/internal/failover"
 	"github.com/bssbb1978/gozargah/axr/internal/flowprofile"
 	"github.com/bssbb1978/gozargah/axr/internal/measure"
+	"github.com/bssbb1978/gozargah/axr/internal/netstate"
 	"github.com/bssbb1978/gozargah/axr/internal/sockopt"
 	"github.com/bssbb1978/gozargah/axr/internal/surgery"
 	"github.com/bssbb1978/gozargah/axr/internal/vlessws"
@@ -98,6 +100,16 @@ type Config struct {
 	HarvestURL string `json:"harvest_url,omitempty"`
 	// HarvestToken for `axr scan -upload` (default: the manifest URL token).
 	HarvestToken string `json:"harvest_token,omitempty"`
+	// ---- 2.17 — AXR-v3.1 fields ----
+	// FragWrites is the [min,max] range of the FIRST WRITES that get
+	// multi-segment surgery per connection (default [1,3]: the ClientHello
+	// plus the next one or two client-flight writes). 0 0 keeps the 2.16
+	// single-write behaviour.
+	FragWrites [2]int `json:"frag_writes,omitempty"`
+	// CanaryIntervalMS bounds the canary liveness probe cadence (default
+	// 300000; the manifest's canary.interval_ms overrides it when sane,
+	// [60000, 3600000]).
+	CanaryIntervalMS int `json:"canary_interval_ms,omitempty"`
 }
 
 // Entry is one candidate entry path.
@@ -203,6 +215,16 @@ type server struct {
 	startedAt time.Time // session-age feature
 	sigWarned bool      // one-time "manifest unverified" note
 
+	// 2.17 — AXR-v3.1 state.
+	netstate     *netstate.Detector // route-regime hysteresis (net-e-melli)
+	policyMu     sync.Mutex         // guards lastRegime (tunnel + canary goroutines)
+	lastRegime   netstate.Regime    // last regime the policy was applied for
+	frontingHost string             // manifest fronting_hint host (role tag)
+	configHosts  map[string]bool    // operator-configured entry hosts (role tag)
+	canaryHost   string             // manifest canary host ("" = disabled)
+	canaryInt    time.Duration      // canary probe cadence
+	flowFloor    int                // manifest flow-profile floor (Rank units)
+
 	// churnMu guards the last-good dial-address pair (entry-churn feature).
 	churnMu      sync.Mutex
 	prevGoodDial string
@@ -296,6 +318,17 @@ func newServer(cfg Config, l *logger, timeout time.Duration) (*server, error) {
 		probeInt:  [2]time.Duration{90 * time.Second, 30 * time.Second},
 		startedAt: time.Now(),
 		frameHist: make([]int, len(flowprofile.FrameBucketEdges)-1),
+		// 2.17 — net-e-melli regime hysteresis + canary defaults.
+		netstate:    netstate.NewDetector(),
+		lastRegime:  netstate.RegimeStable,
+		canaryInt:   300 * time.Second,
+		configHosts: make(map[string]bool, len(cfg.Entries)),
+	}
+	for _, e := range cfg.Entries {
+		s.configHosts[e.Host] = true
+	}
+	if c := cfg.CanaryIntervalMS; c >= 60_000 && c <= 3_600_000 {
+		s.canaryInt = time.Duration(c) * time.Millisecond
 	}
 	if p := cfg.Probes; p.NormalMS > 0 {
 		s.probeInt[0] = time.Duration(p.NormalMS) * time.Millisecond
@@ -397,7 +430,14 @@ func (s *server) refreshManifest() {
 		}
 		s.log.logf("manifest added fronting entry %s", m.FrontingHint)
 	}
+	// 2.17 — the fronting host is the netstate role tag: the net-e-melli
+	// priority inversion is applied to it (fronting-first under stress).
+	if m.FrontingHint != "" {
+		s.frontingHost = m.FrontingHint
+	}
 	for _, e := range m.Entries {
+		// role "canary" is a PROBE TARGET, never a tunnel arm: it is
+		// consumed by the canary loop below, not the ladder.
 		if e.Role == "backup" && !s.hasEntry(e.Host) {
 			for _, tr := range transportsPerEntry {
 				s.failover.AddEntry(failover.Endpoint{Host: e.Host, Transport: tr, FP: fp, Priority: 100})
@@ -405,6 +445,23 @@ func (s *server) refreshManifest() {
 			}
 			s.log.logf("manifest added backup entry %s", e.Host)
 		}
+	}
+	// 2.17 — fleet-pressure dynamics (the Worker's pressure engine):
+	// faster aggressive probe cadence + an outflow-profile floor. Both are
+	// advisory fleet intelligence; the client keeps its local regime driver
+	// as the other input (Escalate takes the harsher one).
+	if p := m.Reconnect.ProbeIntervalMS; p >= 15_000 && p <= 90_000 {
+		s.probeInt[1] = time.Duration(p) * time.Millisecond
+	}
+	s.flowFloor = flowprofile.Rank(flowprofile.ProfileID(m.FlowProfile.Mode))
+	// 2.17 — canary liveness target (authoritative source: the signed
+	// entries field; this pointer is the convenience mirror).
+	if m.Canary.Host != "" {
+		s.canaryHost = m.Canary.Host
+		if iv := m.Canary.IntervalMS; iv >= 60_000 && iv <= 3_600_000 {
+			s.canaryInt = time.Duration(iv) * time.Millisecond
+		}
+		s.log.logf("manifest canary target: %s (every %v)", s.canaryHost, s.canaryInt)
 	}
 	s.log.logf("manifest loaded (path_base=%s fp=%s sig=%v)", m.WSPathBase, fp, m.ManifestSig != "")
 }
@@ -449,15 +506,25 @@ func mergeCleanIPsFile(fo *failover.Engine, path string) int {
 }
 
 // fragParams returns the per-connection ClientHello surgery parameters:
-// the randomized cut count, cut window (SNI region), and micro-gap bounds.
-func (s *server) fragParams() (cuts int, lo, hi float64, gapMin, gapMax time.Duration) {
-	cuts = 1
+// the randomized cut count, the split-write budget, cut window (SNI
+// region), and micro-gap bounds.
+func (s *server) fragParams() (cuts, writes int, lo, hi float64, gapMin, gapMax time.Duration) {
+	cuts, writes = 1, 1
 	gapMin, gapMax = 20*time.Millisecond, 120*time.Millisecond
 	if g := s.cfg.SplitGapMS; g[0] > 0 && g[1] > g[0] {
 		gapMin, gapMax = time.Duration(g[0])*time.Millisecond, time.Duration(g[1])*time.Millisecond
 	}
 	if f := s.cfg.FragCuts; f[0] > 0 && f[1] >= f[0] {
 		cuts = f[0] + int(randFloat()*float64(f[1]-f[0]+1))
+		// 2.17 — extend the fragmented shape past the ClientHello to the
+		// next one or two client-flight writes (default [1,3] = 1-3 writes).
+		writes = 1
+		if w := s.cfg.FragWrites; w[0] > 0 && w[1] >= w[0] {
+			writes = w[0] + int(randFloat()*float64(w[1]-w[0]+1))
+			if writes > 5 {
+				writes = 5
+			}
+		}
 		gMin, gMax := 1, 8
 		if g := s.cfg.FragMicroGapMS; g[0] > 0 && g[1] > g[0] {
 			gMin, gMax = g[0], g[1]
@@ -468,7 +535,7 @@ func (s *server) fragParams() (cuts int, lo, hi float64, gapMin, gapMax time.Dur
 	if w := s.cfg.FragWindow; w[0] > 0 && w[1] > w[0] {
 		wLo, wHi = w[0], w[1]
 	}
-	return cuts, float64(wLo) / 100, float64(wHi) / 100, gapMin, gapMax
+	return cuts, writes, float64(wLo) / 100, float64(wHi) / 100, gapMin, gapMax
 }
 
 // observeFrameSize records one outflow WS frame size into the shared
@@ -561,7 +628,9 @@ func (s *server) startProbes() {
 	go func() {
 		for {
 			interval := s.probeInt[0]
-			if s.failover.State() == failover.StateAggressive {
+			// 2.17 — netstate stress (degraded/cut) forces the aggressive
+			// cadence too, not just the failover engine's own state.
+			if s.failover.State() == failover.StateAggressive || s.netstate.IsStressed() {
 				interval = s.probeInt[1]
 			}
 			time.Sleep(interval)
@@ -575,6 +644,55 @@ func (s *server) startProbes() {
 			_ = s.failover.SaveCache(s.cfg.CacheDir + "/routing.json")
 		}
 	}()
+	// 2.17 — canary liveness loop. The manifest's canary host is probed as a
+	// PLAIN TLS liveness check (not tunneled, not morphed — it measures the
+	// route, not the tunnel); the outcome feeds the netstate hysteresis and
+	// is reported to the fleet pressure engine via the harvest endpoint.
+	// The host is set during manifest bootstrap (before this starts), so the
+	// read is race-free by construction.
+	if s.canaryHost != "" {
+		go func() {
+			ticker := time.NewTicker(s.canaryInt)
+			defer ticker.Stop()
+			for range ticker.C {
+				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				okC, rtt := canaryProbe(ctx, s.canaryHost)
+				cancel()
+				s.netstate.Record(netstate.Observation{Role: netstate.RoleCanary, OK: okC, At: time.Now()})
+				s.applyPolicy()
+				s.log.logf("canary probe %s: %s (rtt=%.0fms)", s.canaryHost, map[bool]string{true: "ok", false: "FAIL"}[okC], rtt)
+				if err := postCanary(s.cfg, s.canaryHost, okC); err != nil {
+					s.log.logf("canary report failed: %v", err)
+				}
+			}
+		}()
+	}
+}
+
+// canaryProbe is a plain TCP+TLS liveness check of host:443 (SNI = host,
+// real certificate verification, TLS >= 1.2). It measures reachability
+// from THIS network with the OS's own identity — deliberately un-morphed,
+// so the signal is about the route, not about our tunnel shape.
+func canaryProbe(ctx context.Context, host string) (bool, float64) {
+	d := &net.Dialer{Timeout: 5 * time.Second}
+	start := time.Now()
+	conn, err := d.DialContext(ctx, "tcp4", net.JoinHostPort(host, "443"))
+	if err != nil {
+		return false, 0
+	}
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName: host,
+		NextProtos: []string{"h2", "http/1.1"},
+		MinVersion: tls.VersionTLS12,
+	})
+	herr := tlsConn.HandshakeContext(ctx)
+	rtt := time.Since(start).Seconds() * 1000
+	if herr != nil {
+		_ = tlsConn.Close()
+		return false, 0
+	}
+	_ = tlsConn.Close()
+	return true, rtt
 }
 
 func (s *server) shutdown() {
@@ -690,14 +808,16 @@ func socksReply(conn net.Conn, code byte) {
 // banditContext maps the measured state vector to the LinUCB context.
 // The 2.16 v3 extensions (throughput, loss velocity, TLS error rate, entry
 // churn, flow KL, session age) come from the server's local measurements;
-// time-of-day and regime ordinal are derived by features() itself.
+// time-of-day and regime ordinal are derived by features() itself. The
+// regime is the WORSE of the measured delivery regime and the 2.17
+// netstate route regime (net-e-melli hysteresis).
 func (s *server) banditContext(v measure.Vector, now int64, profile flowprofile.ProfileID) bandit.Context {
 	anom := 0.0
 	if v.LastAnomaly != 0 {
 		anom = 1
 	}
 	return bandit.Context{
-		Regime:           v.Regime,
+		Regime:           s.mergedRegime(v.Regime),
 		WeakestTransport: v.WeakestTransport,
 		NowMS:            now,
 		RTTMS:            v.RTTMS,
@@ -732,7 +852,12 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 
 	now := time.Now()
 	vec := s.globalVector()
-	profile := flowprofile.ForRegime(vec.Regime)
+	// 2.17 — merged regime (measured ∪ netstate route regime) drives the
+	// local profile, and the manifest's fleet-pressure floor can only
+	// ESCALATE it (Escalate = harsher wins).
+	regime := s.mergedRegime(vec.Regime)
+	profile := flowprofile.ForRegime(regime)
+	profile = flowprofile.Escalate(profile, flowprofile.ProfileByRank(s.flowFloor))
 	bctx := s.banditContext(vec, now.UnixMilli(), profile)
 
 	// 2.15 — session reuse: adopt the previous tunnel for the SAME
@@ -746,7 +871,7 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 		if pr.clean {
 			client.Close()
 			s.logDecision(decisionRec{
-				Ts: now.UnixMilli(), Regime: vec.Regime, FlowProfile: string(w.profile),
+				Ts: now.UnixMilli(), Regime: regime, FlowProfile: string(w.profile),
 				Ctx: bctx, Arm: w.arm, Warm: true,
 				OK: true, Reason: "warm", DialAddr: "",
 			})
@@ -845,12 +970,26 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 		}
 		s.failover.Observe(last.entry, last.dialAddr, last.ok, last.rttMS, last.reason, time.Now())
 		_ = s.failover.SaveCache(s.cfg.CacheDir + "/routing.json")
+		// 2.17 — feed the route-regime hysteresis (net-e-melli detection)
+		// and apply its priority policy to the failover ladder.
+		s.netstate.Record(netstate.Observation{
+			Role: s.roleOf(last.entry.Host), OK: last.ok, At: time.Now(),
+		})
+		s.applyPolicy()
 	}
 	_ = s.bandit.Save(s.cfg.CacheDir + "/bandit.json")
 
+	// 2.17 — which ensemble member chose the arm (audit trail).
+	model := ""
+	for _, sc := range scores {
+		if sc.Arm.ID() == arm.ID() {
+			model = sc.Model
+			break
+		}
+	}
 	s.logDecision(decisionRec{
-		Ts: now.UnixMilli(), Regime: vec.Regime, FlowProfile: string(profile),
-		Ctx: bctx, Arm: arm, Scores: scores, Tries: tried,
+		Ts: now.UnixMilli(), Regime: regime, FlowProfile: string(profile),
+		Ctx: bctx, Arm: arm, Scores: scores, Tries: tried, Model: model,
 		OK: last.ok, RTTMS: last.rttMS, Through: last.through,
 		Reason: last.reason, DialAddr: last.dialAddr,
 	})
@@ -889,10 +1028,11 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 
 	inner := raw
 	if s.surgeryOn() {
-		// 2.16 — multi-segment ClientHello surgery (fragA/fragB style):
-		// randomized 1-3 cuts in the SNI region, 1-8 ms micro-gaps.
-		cuts, lo, hi, gapMin, gapMax := s.fragParams()
-		inner = surgery.NewMultiSplitConn(raw, cuts, lo, hi, gapMin, gapMax, s.rngFloat)
+		// 2.16/2.17 — multi-segment ClientHello surgery (fragA/fragB style):
+		// randomized 1-3 cuts in the SNI region, 1-8 ms SKEWED micro-gaps,
+		// extended (2.17) across the first 1-3 client-flight writes.
+		cuts, writes, lo, hi, gapMin, gapMax := s.fragParams()
+		inner = surgery.NewMultiSplitConnV2(raw, cuts, writes, lo, hi, gapMin, gapMax, s.rngFloat)
 	}
 	surg := s.surgeryOn()
 	ws, err := vlessws.DialConn(ctx, inner, vlessws.DialOptions{
@@ -1128,9 +1268,74 @@ func (s *server) globalVector() measure.Vector {
 	return agg
 }
 
-func worseRegime(a, b string) bool {
-	rank := map[string]int{"stable": 0, "watch": 1, "recovering": 1, "suspected_change": 2}
-	return rank[a] > rank[b]
+// regimeRank ranks EVERY regime label the context can carry — the measure
+// package's delivery labels and the netstate route labels (2.17); higher =
+// worse. Unknown labels rank 0 (they are not evidence of trouble).
+func regimeRank(label string) int {
+	switch label {
+	case "cut":
+		return 3
+	case "degraded", "suspected_change":
+		return 2
+	case "watch", "recovering":
+		return 1
+	default: // stable, unknown
+		return 0
+	}
+}
+
+func worseRegime(a, b string) bool { return regimeRank(a) > regimeRank(b) }
+
+// mergedRegime returns the worse of the measured delivery regime and the
+// netstate route regime (the net-e-melli hysteresis label).
+func (s *server) mergedRegime(measured string) string {
+	if nr := s.netstate.Regime(); regimeRank(nr.Label()) > regimeRank(measured) {
+		return nr.Label()
+	}
+	return measured
+}
+
+// roleOf tags an entry host with its netstate observation role: the
+// manifest's fronting hint is RoleFronting, everything else (config +
+// manifest backups) is RolePrimary. Canary probes record RoleCanary from
+// the canary loop.
+func (s *server) roleOf(host string) netstate.Role {
+	if host == s.frontingHost {
+		return netstate.RoleFronting
+	}
+	return netstate.RolePrimary
+}
+
+// applyPolicy applies the current netstate regime's priority policy to the
+// failover ladder (lower = preferred) when the regime changed. This is the
+// net-e-melli reflex: under degraded/cut the domestic fronting entry jumps
+// ahead of the international entries instead of waiting for the bandit to
+// quarantine them one by one.
+func (s *server) applyPolicy() {
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	r := s.netstate.Regime()
+	if r == s.lastRegime {
+		return
+	}
+	s.lastRegime = r
+	pol := r.Policy()
+	for _, ep := range s.failover.Entries() {
+		p := pol.Backup
+		switch {
+		case ep.Host == s.frontingHost:
+			p = pol.Fronting
+		case s.configHosts[ep.Host]:
+			p = pol.Primary
+		}
+		if p != ep.Priority {
+			up := ep
+			up.Priority = p
+			s.failover.AddEntry(up)
+		}
+	}
+	s.log.logf("netstate regime -> %s (priority: fronting=%d primary=%d backup=%d, aggressive=%v)",
+		r.Label(), pol.Fronting, pol.Primary, pol.Backup, pol.Aggressive)
 }
 
 func classErr(reason string) string {
@@ -1205,6 +1410,7 @@ type decisionRec struct {
 	Ctx         bandit.Context  `json:"ctx"`
 	Arm         bandit.Arm      `json:"arm"`
 	Warm        bool            `json:"warm,omitempty"`
+	Model       string          `json:"model,omitempty"` // 2.17 — ensemble member that chose the arm
 	Scores      []bandit.Score  `json:"scores,omitempty"`
 	Tries       []string        `json:"tries,omitempty"`
 	OK          bool            `json:"ok"`

@@ -212,3 +212,45 @@ func uploadHarvest(cfg Config, ips []string) error {
 	fmt.Fprintf(os.Stderr, "axr scan: uploaded %d IP(s): %s\n", len(ips), strings.TrimSpace(string(buf[:n])))
 	return nil
 }
+
+// postCanary reports one canary liveness result to the Worker harvest
+// endpoint (kind="canary", 2.17). Same token/URL resolution as the scan
+// upload. Best-effort: a failed report never affects tunnels; the next
+// ticker fires again.
+func postCanary(cfg Config, host string, ok bool) error {
+	token := cfg.HarvestToken
+	if token == "" {
+		token = subTokenFromURL(cfg.ManifestURL)
+	}
+	if token == "" {
+		return fmt.Errorf("no token (set harvest_token or manifest_url)")
+	}
+	urlStr := cfg.HarvestURL
+	if urlStr == "" {
+		urlStr = harvestURLFromManifest(cfg.ManifestURL)
+	}
+	if urlStr == "" {
+		return fmt.Errorf("no harvest URL (set harvest_url or manifest_url)")
+	}
+	body, err := json.Marshal(map[string]any{
+		"token":      token,
+		"kind":       "canary",
+		"canaryHost": host,
+		"canaryOk":   ok,
+	})
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Post(urlStr, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 4096)
+	n, _ := resp.Body.Read(buf)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("canary report HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(buf[:n])))
+	}
+	return nil
+}

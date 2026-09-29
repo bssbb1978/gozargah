@@ -2,6 +2,7 @@ package bandit
 
 import (
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
@@ -446,3 +447,289 @@ func TestSaveAtomicNoPartialFile(t *testing.T) {
 		t.Fatalf("expected exactly the target file, got %v", entries)
 	}
 }
+
+// ---- 2.17 — ensemble (LinUCB + Beta-TS, meta-blended) tests ----
+
+// TestBetaSampleMoments: the gamma/beta sampler must produce the right
+// moments (fixed seed => fully deterministic check).
+func TestBetaSampleMoments(t *testing.T) {
+	rng := newSeededRand()
+	const n = 20000
+	// Beta(2,1): mean 2/3, std sqrt(2*1/(9*4)) = 1/6 ≈ 0.1667
+	mean := 0.0
+	var ss float64
+	for i := 0; i < n; i++ {
+		x := betaSample(2, 1, rng)
+		if x < 0 || x > 1 {
+			t.Fatalf("Beta(2,1) sample %v outside [0,1]", x)
+		}
+		mean += x
+		ss += x * x
+	}
+	mean /= float64(n)
+	variance := ss/float64(n) - mean*mean
+	if math.Abs(mean-2.0/3.0) > 0.02 {
+		t.Fatalf("Beta(2,1) mean = %f, want ~0.667", mean)
+	}
+	if math.Abs(variance-(1.0/36.0)) > 0.01 {
+		t.Fatalf("Beta(2,1) variance = %f, want ~0.0278", variance)
+	}
+	// Beta(5,5): symmetric, mean 0.5
+	mean = 0.0
+	for i := 0; i < n; i++ {
+		mean += betaSample(5, 5, rng)
+	}
+	mean /= float64(n)
+	if math.Abs(mean-0.5) > 0.02 {
+		t.Fatalf("Beta(5,5) mean = %f, want ~0.5", mean)
+	}
+}
+
+// TestEnsembleConvergesToGoodArm: with a persistent good arm and a
+// persistent bad arm, the TS posteriors must separate and the ensemble must
+// settle on the good arm.
+func TestEnsembleConvergesToGoodArm(t *testing.T) {
+	arms := []Arm{
+		{Host: "good.example", Transport: "ws", FP: "chrome"},
+		{Host: "bad.example", Transport: "ws", FP: "chrome"},
+	}
+	b := New(1.0, 7, arms)
+	ctx := cleanCtx(1_700_000_000_000)
+	// The good arm also saturates the throughput bonus (4 MB/s), so its
+	// shaped reward is ~1.0 — the TS posterior converges near 1, not 0.5.
+	for i := 0; i < 80; i++ {
+		arm, _, err := b.Select(ctx)
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		if arm == arms[0] {
+			b.Observe(arm, Outcome{OK: true, RTTMS: 60, Throughput: 4_000_000}, ctx, int64(1_700_000_000_000+i*1000))
+		} else {
+			b.Observe(arm, Outcome{OK: false, Reason: "rst"}, ctx, int64(1_700_000_000_000+i*1000))
+		}
+	}
+	if mg := b.tsMean(arms[0].ID()); mg < 0.7 {
+		t.Fatalf("good arm posterior mean = %f, want >= 0.7", mg)
+	}
+	if mb := b.tsMean(arms[1].ID()); mb > 0.3 {
+		t.Fatalf("bad arm posterior mean = %f, want <= 0.3", mb)
+	}
+	// After enough evidence the ensemble must pick the good arm most of the
+	// time (the TS draw rarely upsets a strongly separated posterior).
+	good := 0
+	for i := 0; i < 40; i++ {
+		arm, _, err := b.Select(ctx)
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		if arm == arms[0] {
+			good++
+		}
+	}
+	if good < 36 {
+		t.Fatalf("ensemble picked good arm %d/40, want >= 36", good)
+	}
+}
+
+// TestEnsembleArbitration: the meta-weight must actually arbitrate between
+// the members. Setup: B has 100 proven successes (TS posterior strongly
+// favors B) while A is untried — LinUCB's untried-boost (1+alpha) still
+// tops B's converged confidence-bound score, so the members DISAGREE.
+func TestEnsembleArbitration(t *testing.T) {
+	arms := []Arm{
+		{Host: "h.example", Transport: "ws", FP: "chrome"},   // A: untried
+		{Host: "h.example", Transport: "ws", FP: "firefox"},  // B: proven
+	}
+	b := New(1.0, 42, arms)
+	A, B := arms[0], arms[1]
+	ctx := cleanCtx(1_700_000_000_000)
+	// 200 proven successes at saturating throughput: shaped reward ~0.994,
+	// so B's posterior mean converges to ~0.99 (draws rarely upset A).
+	for i := 0; i < 200; i++ {
+		b.Observe(B, Outcome{OK: true, RTTMS: 50, Throughput: 4_000_000}, ctx, int64(1_700_000_000_000+i*1000))
+	}
+	if m := b.tsMean(B.ID()); m < 0.9 {
+		t.Fatalf("setup: B posterior mean = %f, want >= 0.9", m)
+	}
+	// metaW >= 0.5 -> the LinUCB pick must carry every round.
+	b.mu.Lock()
+	b.metaW = 0.9
+	b.mu.Unlock()
+	linPicks := 0
+	for i := 0; i < 20; i++ {
+		arm, scores, err := b.Select(ctx)
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		if arm == A {
+			linPicks++
+		}
+		found := false
+		for _, sc := range scores {
+			if sc.Arm == arm && sc.Model != "" {
+				found = sc.Model == "lin"
+			}
+		}
+		if !found {
+			t.Fatalf("round %d: chosen arm's score must be stamped model=lin", i)
+		}
+	}
+	if linPicks != 20 {
+		t.Fatalf("metaW=0.9 must pick the LinUCB argmax 20/20, got %d", linPicks)
+	}
+	// metaW < 0.5 -> the Thompson pick carries: B (posterior ~0.98) wins the
+	// draw except in a vanishing tail; allow at most 2 upsets.
+	b.mu.Lock()
+	b.metaW = 0.2
+	b.mu.Unlock()
+	tsPicks := 0
+	for i := 0; i < 20; i++ {
+		arm, _, err := b.Select(ctx)
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		if arm == B {
+			tsPicks++
+		}
+	}
+	if tsPicks < 18 {
+		t.Fatalf("metaW=0.2 should pick the TS argmax (B) in >=18/20, got %d", tsPicks)
+	}
+}
+
+// TestMetaWeightFormula: the arbitration weight is the tanh-combination of
+// the members' realized-reward EMAs (white-box, deterministic).
+func TestMetaWeightFormula(t *testing.T) {
+	b := New(1.0, 1, testArms())
+	b.mu.Lock()
+	b.emaLin = 0.8
+	b.emaTs = 0.2
+	b.mu.Unlock()
+	// Any Observe re-computes metaW from the EMAs.
+	b.Observe(testArms()[2], Outcome{OK: false}, cleanCtx(1_700_000_000_000), 1_700_000_000_000)
+	// The observed arm is a third arm neither member ranked first, so the
+	// EMAs are untouched by this observation.
+	want := 0.5 + 0.5*math.Tanh(2*(0.8-0.2))
+	b.mu.Lock()
+	got := b.metaW
+	b.mu.Unlock()
+	if math.Abs(got-want) > 1e-9 {
+		t.Fatalf("metaW = %f, want %f", got, want)
+	}
+}
+
+// TestEnsemblePersistence: the ensemble state round-trips through the
+// snapshot, and a 2.16-era snapshot (no Ts/Meta fields) restores to the
+// neutral ensemble (fresh posteriors, metaW 0.5).
+func TestEnsemblePersistence(t *testing.T) {
+	dir := t.TempDir()
+	b := New(1.0, 9, testArms())
+	ctx := cleanCtx(1_700_000_000_000)
+	for i := 0; i < 25; i++ {
+		arm := testArms()[i%2]
+		ok := i%3 != 0
+		b.Observe(arm, Outcome{OK: ok, RTTMS: 40}, ctx, int64(1_700_000_000_000+i*1000))
+	}
+	if err := b.Save(dir + "/bandit.json"); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	snap, err := LoadSnapshot(dir + "/bandit.json")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// 2.17 snapshot carries the ensemble state.
+	if len(snap.Ts) == 0 {
+		t.Fatal("2.17 snapshot must carry Ts state")
+	}
+	b2 := New(1.0, 1, testArms())
+	if err := b2.Restore(snap); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	for id, pair := range snap.Ts {
+		b2.mu.Lock()
+		ts := b2.ts[id]
+		var gotA, gotB float64
+		if ts != nil {
+			gotA, gotB = ts.alpha, ts.beta
+		}
+		b2.mu.Unlock()
+		if ts == nil || gotA != pair[0] || gotB != pair[1] {
+			t.Fatalf("arm %s: restored TS (%v,%v), want (%v,%v)", id, gotA, gotB, pair[0], pair[1])
+		}
+	}
+	b.mu.Lock()
+	w1, e1, e2 := b.metaW, b.emaLin, b.emaTs
+	b.mu.Unlock()
+	b2.mu.Lock()
+	w2, e1b, e2b := b2.metaW, b2.emaLin, b2.emaTs
+	b2.mu.Unlock()
+	if math.Abs(w1-w2) > 1e-12 || math.Abs(e1-e1b) > 1e-12 || math.Abs(e2-e2b) > 1e-12 {
+		t.Fatalf("meta state mismatch: (%v,%v,%v) vs (%v,%v,%v)", w1, e1, e2, w2, e1b, e2b)
+	}
+	// 2.16-era snapshot: strip the ensemble fields -> neutral restore.
+	old := snap
+	old.Ts = nil
+	old.MetaW = 0
+	old.EmaLin = 0
+	old.EmaTs = 0
+	b3 := New(1.0, 1, testArms())
+	if err := b3.Restore(old); err != nil {
+		t.Fatalf("restore 2.16 snapshot: %v", err)
+	}
+	for _, a := range old.Arms {
+		b3.mu.Lock()
+		ts := b3.ts[a.ID()]
+		var gotA, gotB float64
+		if ts != nil {
+			gotA, gotB = ts.alpha, ts.beta
+		}
+		b3.mu.Unlock()
+		if ts == nil || gotA != 1 || gotB != 1 {
+			t.Fatalf("arm %s: 2.16 restore must give fresh (1,1), got (%v,%v)", a.ID(), gotA, gotB)
+		}
+	}
+	b3.mu.Lock()
+	if b3.metaW != 0.5 {
+		b3.mu.Unlock()
+		t.Fatalf("2.16 restore must give neutral metaW 0.5, got %f", b3.metaW)
+	}
+	b3.mu.Unlock()
+}
+
+// TestEnsembleDeterminism: same seed + same call sequence => identical
+// selections (the Thompson draws are seeded, not wall-clock).
+func TestEnsembleDeterminism(t *testing.T) {
+	arms := testArms()
+	ctxs := []Context{
+		cleanCtx(1_700_000_000_000),
+		{Regime: "watch", NowMS: 1_700_000_060_000, RTTMS: 300, RSTRate: 0.2},
+		{Regime: "suspected_change", NowMS: 1_700_000_120_000, TLSDrop: 0.5, LossStep: 2},
+	}
+	run := func() []string {
+		b := New(1.0, 31, arms)
+		out := make([]string, 0, 30)
+		for i := 0; i < 30; i++ {
+			ctx := ctxs[i%len(ctxs)]
+			arm, _, err := b.Select(ctx)
+			if err != nil {
+				t.Fatalf("select: %v", err)
+			}
+			out = append(out, arm.ID())
+			ok := i%4 != 0
+			b.Observe(arm, Outcome{OK: ok, RTTMS: 80}, ctx, int64(1_700_000_000_000+i*1000))
+		}
+		return out
+	}
+	a, bRun := run(), run()
+	if len(a) != len(bRun) {
+		t.Fatalf("sequence length mismatch %d vs %d", len(a), len(bRun))
+	}
+	for i := range a {
+		if a[i] != bRun[i] {
+			t.Fatalf("round %d: %s vs %s — ensemble must be deterministic under a fixed seed", i, a[i], bRun[i])
+		}
+	}
+}
+
+// newSeededRand is a deterministic rand source for sampler moment checks.
+func newSeededRand() *rand.Rand { return rand.New(rand.NewSource(1234)) }

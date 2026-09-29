@@ -28,6 +28,7 @@ const entries = [
   'decision',
   'decoy',
   'manifest-integrity',
+  'pressure',
 ];
 
 for (const name of entries) {

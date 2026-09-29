@@ -8,7 +8,7 @@ import { Env, GzError, VERSION } from '../config';
 import { EffectiveSettings } from '../settings';
 import {
   addEvent, recentEvents, saveSettings, SettingsBlob, loadSettings, invalidateCache,
-  consumeAiDiagnosticQuota, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState, saveHealthSample, loadLatestPathSamples, loadPredictiveStates, loadCleanIPHarvest, saveCleanIPHarvest,
+  consumeAiDiagnosticQuota, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState, saveHealthSample, loadLatestPathSamples, loadPredictiveStates, loadCleanIPHarvest, saveCleanIPHarvest, appendCanaryResult,
 } from '../db/store';
 import {
   createUser, deleteUser, GzUser, invalidateUsers, listUsers, updateUser, flushUsage,
@@ -100,7 +100,10 @@ export async function handlePanelApi(
      * live reachability only the client's own network can measure. */
     if (action === 'network/harvest' && method === 'POST') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
-      const body = (await request.json().catch(() => ({}))) as { token?: unknown; ips?: unknown; source?: unknown };
+      const body = (await request.json().catch(() => ({}))) as {
+        token?: unknown; ips?: unknown; source?: unknown;
+        kind?: unknown; canaryHost?: unknown; canaryOk?: unknown;
+      };
       const host = new URL(request.url).hostname;
       const tokenIn = String(body.token ?? request.headers.get('x-harvest-token') ?? '');
       let authorized = false;
@@ -114,6 +117,18 @@ export async function handlePanelApi(
       if (!authorized) {
         if (db) await addEvent(db, 'harvest_rejected', 'bad token');
         return json({ error: 'unauthorized' }, 401);
+      }
+      // 2.17 — canary liveness reports: a client's periodic probe of the
+      // operator's canary host (ok/fail). Stored newest-first (capped) and
+      // reduced to fleet evidence by the pressure engine. No IP semantics.
+      if (String(body.kind ?? '') === 'canary') {
+        const canaryHost = String(body.canaryHost ?? '').trim().toLowerCase();
+        if (!canaryHost || canaryHost.length > 253 || !/^[a-z0-9][a-z0-9.-]*$/.test(canaryHost)) {
+          return json({ error: 'bad canary host' }, 400);
+        }
+        const row = await appendCanaryResult(db, { host: canaryHost, ok: Boolean(body.canaryOk), at: Date.now() });
+        await addEvent(db, 'harvest_canary', `${canaryHost}: ${row.results[0]?.ok ? 'ok' : 'fail'}`);
+        return json({ ok: true, kind: 'canary', stored: row.results.length });
       }
       const rawIps = Array.isArray(body.ips) ? body.ips : [];
       const seen = new Set<string>();

@@ -37,12 +37,23 @@
 //     (exploitation + width of the confidence interval). A is inverted with a
 //     partial-pivot Gauss-Jordan in pure Go — no external math dependency.
 //
+// 2.17 upgrade: ensemble (LinUCB + Beta-TS, meta-blended). LinUCB is the
+// CONTEXTUAL model (the same entry is good/bad depending on conditions); a
+// per-arm Beta-Bernoulli Thompson sampler is the pure BAYESIAN bandit
+// (robust when context is thin or misleading). One meta-weight arbitrates:
+// after each pull, the realized reward is attributed to whichever member's
+// deterministic ranking picked the arm that actually carried, and the
+// meta-weight follows the members' realized-reward EMAs (tanh-combined).
+// The client thus hedges between "condition-aware" and "outcome-aware"
+// learning, and the hedge itself is learned. Zero external dependencies.
+//
 // Honest boundaries (unchanged):
 //   - Rewards are shaped into [0,1]; hard failures are represented as reward
 //     0 plus a consecutive-failure quarantine, NOT as negative scores. This
 //     keeps the contextual-UCB regret intuition valid (it assumes [0,1]).
 //   - Deterministic under a fixed seed and a fixed (ctx, call) sequence: the
-//     exploration tie-break is the stable arm order, never the wall clock.
+//     Thompson draws come from a seeded per-bandit RNG, the tie-breaks are
+//     the stable arm order, never the wall clock.
 //   - No DPI detection here: the inputs are the client's own connection
 //     outcomes (ok / rtt / throughput / error class) and the context the
 //     measure package derives from exactly those. Nothing else.
@@ -53,6 +64,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
@@ -233,14 +245,21 @@ func timeOfDayCos(nowMS int64) float64 { return math.Cos(timeOfDayPhase(nowMS)) 
 // regimeOrdinal ranks regimes for the context vector. A novel/worse regime
 // is a different condition, and LinUCB widens its interval there until the
 // core accumulates observations under it (deliberate exploration).
+// 2.17 — the netstate route labels join the scale: "degraded" (international
+// entries failing, domestic fronting still live) sits between the measure
+// labels; "cut" (nothing carrying) is the widest condition.
 func regimeOrdinal(regime string) float64 {
 	switch regime {
 	case "stable":
 		return 0
 	case "watch", "recovering":
 		return 0.35
+	case "degraded":
+		return 0.5
 	case "suspected_change":
 		return 0.7
+	case "cut":
+		return 1.0
 	default:
 		return 0.1
 	}
@@ -363,6 +382,19 @@ func newArmLin() *armLin {
 	return l
 }
 
+// armTS is one arm's Beta-Bernoulli posterior (the Thompson-sampling
+// ensemble member, 2.17). alpha/beta start at 1 (uniform prior) and only
+// increase, so gamma shapes stay >= 1 (the sampler's easy case).
+type armTS struct {
+	alpha float64
+	beta  float64
+}
+
+// posteriorMean is the exploitation reference of the TS member.
+func (t *armTS) posteriorMean() float64 {
+	return t.alpha / (t.alpha + t.beta)
+}
+
 // Bandit is the learner. Safe for concurrent use.
 type Bandit struct {
 	mu     sync.Mutex
@@ -374,16 +406,32 @@ type Bandit struct {
 	// lastID is the previously selected arm, used for the diversity bonus
 	// during "suspected_change" (encourages rotating away from the status quo).
 	lastID string
+	// ---- 2.17 — ensemble state (LinUCB + Beta-TS, meta-blended) ----
+	ts     map[string]*armTS // per-arm Beta posteriors
+	tsRng  *rand.Rand        // seeded Thompson-draw RNG (locked by mu)
+	metaW  float64           // weight on LinUCB in (0,1); 0.5 = neutral
+	emaLin float64           // realized-reward EMA when the LinUCB pick carried
+	emaTs  float64           // realized-reward EMA when the TS pick carried
 }
 
 // New creates a bandit over the given arms. c is the exploration constant
-// α (1.0 is a good default). seed is retained for seeded tie-breaks; selection
-// is already deterministic without it.
+// α (1.0 is a good default). seed drives the Thompson-draw RNG (selection
+// is deterministic for a fixed seed + call sequence).
 func New(c float64, seed uint64, arms []Arm) *Bandit {
 	if c <= 0 {
 		c = 1.0
 	}
-	b := &Bandit{C: c, seed: seed, stats: make(map[string]*Stats, len(arms)), lin: make(map[string]*armLin, len(arms))}
+	b := &Bandit{
+		C: c, seed: seed,
+		stats: make(map[string]*Stats, len(arms)),
+		lin:   make(map[string]*armLin, len(arms)),
+		ts:    make(map[string]*armTS, len(arms)),
+		metaW: 0.5, emaLin: 0.5, emaTs: 0.5,
+	}
+	// Mix the seed against a fixed constant so even seed=1 is not the
+	// trivially-predictable default RNG stream (XOR in uint64 space, then
+	// reinterpret; the bijection keeps determinism).
+	b.tsRng = rand.New(rand.NewSource(int64(seed ^ 0x5851F42D4C957F2D)))
 	for _, a := range arms {
 		b.addArmLocked(a)
 	}
@@ -408,6 +456,54 @@ func (b *Bandit) addArmLocked(a Arm) {
 	b.arms = append(b.arms, a)
 	b.stats[id] = &Stats{}
 	b.lin[id] = newArmLin()
+	b.ts[id] = &armTS{alpha: 1, beta: 1}
+}
+
+// gammaSample draws one sample from Gamma(shape, 1) with the
+// Marsaglia-Tsang method (shape > 0). For shape < 1 the standard boost
+// transformation reduces to the shape+1 case.
+func gammaSample(shape float64, rng *rand.Rand) float64 {
+	if shape <= 0 || math.IsNaN(shape) || math.IsInf(shape, 0) {
+		shape = 1
+	}
+	if shape < 1 {
+		u := rng.Float64()
+		for u <= 0 {
+			u = rng.Float64()
+		}
+		return gammaSample(shape+1, rng) * math.Pow(u, 1.0/shape)
+	}
+	d := shape - 1.0/3.0
+	c := 1.0 / math.Sqrt(9.0*d)
+	for {
+		var x, v float64
+		for {
+			x = rng.NormFloat64()
+			v = 1 + c*x
+			if v > 0 {
+				break
+			}
+		}
+		v = v * v * v
+		u := rng.Float64()
+		if u < 1-1.5*x*x*x*x {
+			return d * v
+		}
+		if math.Log(u) < 0.5*x*x + d*(1-v+math.Log(v)) {
+			return d * v
+		}
+	}
+}
+
+// betaSample draws one sample from Beta(a, b) via the two-gamma ratio.
+// Returns the uniform 0.5 for degenerate (non-positive) parameters.
+func betaSample(a, b float64, rng *rand.Rand) float64 {
+	if a <= 0 || b <= 0 {
+		return 0.5
+	}
+	ga := gammaSample(a, rng)
+	gb := gammaSample(b, rng)
+	return ga / (ga + gb)
 }
 
 // ErrNoArm is returned when every arm is quarantined/pruned at selection time.
@@ -424,6 +520,9 @@ type Score struct {
 	Total       float64 `json:"total"`
 	Quarantined bool    `json:"quarantined"`
 	Pruned      bool    `json:"pruned"`
+	// 2.17 — ensemble audit fields.
+	TsScore float64 `json:"ts_score,omitempty"` // TS posterior mean (0..1, draw-free)
+	Model   string  `json:"model,omitempty"`    // which member chose this arm ("lin"|"ts")
 }
 
 // linScore computes the LinUCB (mean, exploration) split for arm id at x.
@@ -484,6 +583,7 @@ func (b *Bandit) scoresLocked(ctx Context) []Score {
 			sc.Diversity = 0.05
 		}
 		sc.Total = sc.Ucb + sc.Diversity + sc.WeakestHit
+		sc.TsScore = b.tsMean(id) // 2.17 — audit (draw-free, idempotent)
 		out = append(out, sc)
 	}
 	return out
@@ -499,6 +599,13 @@ func (b *Bandit) Scores(ctx Context) []Score {
 // Select returns the best arm for ctx (and the full score table). It never
 // selects a pruned arm; a quarantined arm is only selected when no live
 // alternative exists (we must keep trying *something*).
+//
+// 2.17 — ensemble arbitration: both members rank the live candidate set
+// (LinUCB by its confidence-bound total; Beta-TS by one posterior draw).
+// The meta-weight picks which member's choice carries: w >= 0.5 -> LinUCB,
+// else Thompson. The winning member is stamped on the chosen score (audit).
+// Draw-free note: Scores() never consumes a draw, so it stays idempotent;
+// only Select draws.
 func (b *Bandit) Select(ctx Context) (Arm, []Score, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -506,32 +613,113 @@ func (b *Bandit) Select(ctx Context) (Arm, []Score, error) {
 	if len(scores) == 0 {
 		return Arm{}, nil, ErrNoArm
 	}
-	best := -1
-	for i, sc := range scores {
-		if sc.Pruned || sc.Quarantined {
-			continue
-		}
-		if best < 0 || sc.Total > scores[best].Total || (sc.Total == scores[best].Total && sc.Arm.ID() < scores[best].Arm.ID()) {
-			best = i
-		}
-	}
-	if best < 0 {
-		// Every live arm is quarantined: still pick the best non-pruned one —
-		// the client must keep trying *something* rather than idling.
-		for i, sc := range scores {
-			if sc.Pruned {
-				continue
-			}
-			if best < 0 || sc.Total > scores[best].Total || (sc.Total == scores[best].Total && sc.Arm.ID() < scores[best].Arm.ID()) {
-				best = i
-			}
-		}
-	}
-	if best < 0 {
+	best, ok := b.pickLocked(scores)
+	if !ok {
 		return Arm{}, scores, ErrNoArm
 	}
 	b.lastID = scores[best].Arm.ID()
 	return scores[best].Arm, scores, nil
+}
+
+// liveSetLocked returns the candidate indices: live (non-pruned,
+// non-quarantined) arms, or — when every arm is quarantined — the non-pruned
+// set (the client must keep trying *something*).
+func (b *Bandit) liveSetLocked(scores []Score) []int {
+	var live []int
+	for i, sc := range scores {
+		if !sc.Pruned && !sc.Quarantined {
+			live = append(live, i)
+		}
+	}
+	if len(live) == 0 {
+		for i, sc := range scores {
+			if !sc.Pruned {
+				live = append(live, i)
+			}
+		}
+	}
+	return live
+}
+
+// pickLocked is the ensemble picker (caller holds b.mu).
+func (b *Bandit) pickLocked(scores []Score) (int, bool) {
+	live := b.liveSetLocked(scores)
+	if len(live) == 0 {
+		return 0, false
+	}
+	// LinUCB best (stable ID tie-break).
+	linBest := live[0]
+	for _, i := range live[1:] {
+		if scores[i].Total > scores[linBest].Total ||
+			(scores[i].Total == scores[linBest].Total && scores[i].Arm.ID() < scores[linBest].Arm.ID()) {
+			linBest = i
+		}
+	}
+	// Thompson best: one posterior draw per candidate (seeded RNG, consumed
+	// only here). Stable ID tie-break on equal draws.
+	tsBest := live[0]
+	bestDraw := math.Inf(-1)
+	for _, i := range live {
+		d := b.tsDraw(scores[i].Arm.ID())
+		if d > bestDraw || (d == bestDraw && scores[i].Arm.ID() < scores[tsBest].Arm.ID()) {
+			bestDraw = d
+			tsBest = i
+		}
+	}
+	best, model := linBest, "lin"
+	if b.metaW < 0.5 {
+		best, model = tsBest, "ts"
+	}
+	scores[best].Model = model
+	return best, true
+}
+
+// tsDraw draws one posterior sample for the arm (caller holds b.mu).
+func (b *Bandit) tsDraw(id string) float64 {
+	t := b.ts[id]
+	if t == nil {
+		return 0.5
+	}
+	return betaSample(t.alpha, t.beta, b.tsRng)
+}
+
+// tsMean returns the arm's TS posterior mean (0..1), 0.5 for unknown arms.
+func (b *Bandit) tsMean(id string) float64 {
+	t := b.ts[id]
+	if t == nil {
+		return 0.5
+	}
+	return t.posteriorMean()
+}
+
+// modelArmsLocked returns the (LinUCB-best arm ID, TS-mean-best arm ID) over
+// the live candidate set at ctx. Used for meta-credit attribution in
+// Observe: each member is credited with the realized reward exactly when
+// ITS deterministic ranking would have picked the arm that carried.
+func (b *Bandit) modelArmsLocked(ctx Context) (string, string) {
+	scores := b.scoresLocked(ctx)
+	live := b.liveSetLocked(scores)
+	if len(live) == 0 {
+		return "", ""
+	}
+	linBest := live[0]
+	for _, i := range live[1:] {
+		if scores[i].Total > scores[linBest].Total ||
+			(scores[i].Total == scores[linBest].Total && scores[i].Arm.ID() < scores[linBest].Arm.ID()) {
+			linBest = i
+		}
+	}
+	linArm := scores[linBest].Arm
+	tsBest := live[0]
+	tsM := b.tsMean(scores[tsBest].Arm.ID())
+	for _, i := range live[1:] {
+		m := b.tsMean(scores[i].Arm.ID())
+		if m > tsM || (m == tsM && scores[i].Arm.ID() < scores[tsBest].Arm.ID()) {
+			tsM = m
+			tsBest = i
+		}
+	}
+	return linArm.ID(), scores[tsBest].Arm.ID()
 }
 
 // Observe feeds one outcome back for arm a, measured under context ctx at time
@@ -586,6 +774,26 @@ func (b *Bandit) Observe(a Arm, o Outcome, ctx Context, now int64) {
 			s.QuarantinedUntilMS = now + backoff
 		}
 	}
+
+	// 2.17 — ensemble update. The TS posterior sees EVERY outcome for this
+	// arm (Beta-Bernoulli); the meta-weight re-attributes credit by each
+	// member's DETERMINISTIC ranking at ctx (LinUCB total; TS posterior
+	// mean) — the sampled draw only decides the final pick, never the
+	// credit. A member that keeps being right for the arm that carries
+	// earns the arbitration; a member that keeps being wrong yields.
+	if t, ok := b.ts[id]; ok {
+		t.alpha += r
+		t.beta += 1 - r
+	}
+	linArmID, tsArmID := b.modelArmsLocked(ctx)
+	const eta = 0.15
+	if linArmID == id {
+		b.emaLin += eta * (r - b.emaLin)
+	}
+	if tsArmID == id {
+		b.emaTs += eta * (r - b.emaTs)
+	}
+	b.metaW = 0.5 + 0.5*math.Tanh(2*(b.emaLin-b.emaTs))
 }
 
 // Prune permanently disables arms that are persistently terrible, keeping at
@@ -669,6 +877,12 @@ type Snapshot struct {
 	// Dim is the feature width this snapshot's Lin state was learned under
 	// (0 in pre-2.16 snapshots).
 	Dim int `json:"dim,omitempty"`
+	// 2.17 — ensemble state (absent in 2.16 snapshots -> neutral defaults:
+	// fresh (1,1) posteriors, meta-weight 0.5).
+	Ts     map[string][2]float64 `json:"ts,omitempty"`     // arm -> {alpha, beta}
+	MetaW  float64               `json:"meta_w,omitempty"` // weight on LinUCB
+	EmaLin float64               `json:"ema_lin,omitempty"`
+	EmaTs  float64               `json:"ema_ts,omitempty"`
 }
 
 // Snapshot exports state for persistence.
@@ -691,9 +905,16 @@ func (b *Bandit) Snapshot() Snapshot {
 		copy(B, v.b[:])
 		lin[k] = &LinState{A: A, B: B}
 	}
+	ts := make(map[string][2]float64, len(b.ts))
+	for k, v := range b.ts {
+		ts[k] = [2]float64{v.alpha, v.beta}
+	}
 	arms := make([]Arm, len(b.arms))
 	copy(arms, b.arms)
-	return Snapshot{C: b.C, Seed: b.seed, Arms: arms, Stats: stats, Lin: lin, Dim: dim}
+	return Snapshot{
+		C: b.C, Seed: b.seed, Arms: arms, Stats: stats, Lin: lin, Dim: dim,
+		Ts: ts, MetaW: b.metaW, EmaLin: b.emaLin, EmaTs: b.emaTs,
+	}
 }
 
 // validLin reports whether ls is a complete dim×dim Lin state for the
@@ -735,6 +956,7 @@ func (b *Bandit) Restore(s Snapshot) error {
 	b.arms = nil
 	b.stats = make(map[string]*Stats, len(s.Arms))
 	b.lin = make(map[string]*armLin, len(s.Arms))
+	b.ts = make(map[string]*armTS, len(s.Arms))
 	for _, a := range s.Arms {
 		if a.Host == "" || a.Transport == "" {
 			continue
@@ -765,9 +987,31 @@ func (b *Bandit) Restore(s Snapshot) error {
 		} else {
 			b.lin[id] = newArmLin()
 		}
+		// 2.17 — restore the TS posterior if it is well-formed, else fresh
+		// (1,1). A 2.16 snapshot has no Ts at all -> every arm starts fresh.
+		if pair, ok := s.Ts[id]; ok && pair[0] >= 1 && pair[1] >= 1 &&
+			!math.IsNaN(pair[0]) && !math.IsNaN(pair[1]) {
+			b.ts[id] = &armTS{alpha: pair[0], beta: pair[1]}
+		} else {
+			b.ts[id] = &armTS{alpha: 1, beta: 1}
+		}
 	}
 	if len(b.arms) == 0 {
 		return fmt.Errorf("bandit: snapshot has no valid arms")
+	}
+	// 2.17 — ensemble meta state: accept only sane values, else neutral.
+	if s.MetaW > 0 && s.MetaW <= 1 {
+		b.metaW = s.MetaW
+	} else {
+		b.metaW = 0.5
+	}
+	b.emaLin = s.EmaLin
+	if b.emaLin < 0 || b.emaLin > 1 {
+		b.emaLin = 0.5
+	}
+	b.emaTs = s.EmaTs
+	if b.emaTs < 0 || b.emaTs > 1 {
+		b.emaTs = 0.5
 	}
 	return nil
 }

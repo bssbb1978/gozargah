@@ -37,17 +37,54 @@ const (
 //
 //	stable            -> web     (mixed request/response, the boring baseline)
 //	watch             -> chat    (small, bursty, human-paced — hard to flag)
+//	degraded          -> chat    (net-e-melli partial cut: low-profile bursts)
 //	suspected_change  -> video   (sustained large flow — mimics bulk transfer)
+//	cut               -> video   (sparse retry traffic shaped like bulk)
 //	recovering/other  -> web
 func ForRegime(regime string) ProfileID {
 	switch regime {
-	case "watch":
+	case "watch", "degraded":
 		return ProfileChat
-	case "suspected_change":
+	case "suspected_change", "cut":
 		return ProfileVideo
 	default:
 		return ProfileWeb
 	}
+}
+
+// Rank orders profile aggressiveness (web < chat < video) — the morphing
+// intensity ladder.
+func Rank(id ProfileID) int {
+	switch id {
+	case ProfileVideo:
+		return 2
+	case ProfileChat:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// ProfileByRank returns the profile at a given rank (unknown ranks -> web).
+func ProfileByRank(r int) ProfileID {
+	switch r {
+	case 2:
+		return ProfileVideo
+	case 1:
+		return ProfileChat
+	default:
+		return ProfileWeb
+	}
+}
+
+// Escalate returns the profile with the higher rank (the floor semantics
+// used for the manifest's fleet-pressure profile floor: the client never
+// morphs BELOW what the fleet evidence asks for).
+func Escalate(a, b ProfileID) ProfileID {
+	if Rank(a) >= Rank(b) {
+		return a
+	}
+	return b
 }
 
 // bin is one length-histogram component: chunks in [lo, hi) bytes with

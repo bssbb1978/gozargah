@@ -2,8 +2,8 @@
  * Gozargah — global config, types and shared errors.
  */
 
-export const VERSION = '2.16.0';
-export const SCHEMA_VERSION = 16;
+export const VERSION = '2.17.0';
+export const SCHEMA_VERSION = 17;
 
 /** D1 binding name (see wrangler.toml) */
 export const DB_BINDING = 'GZ_DB';
@@ -48,6 +48,14 @@ export interface Env {
    *  script to a domestic CDN domain and point this var at that domain. The
    *  client core merges it into the entry ladder as a high-priority backup. */
   FRONTING_RELAY_HOST?: string;
+  /** 2.17 — canary liveness host for the closed-loop pressure engine. When set
+   *  (and validated) it is published in the AXR manifest (entries role
+   *  "canary" + a `canary` pointer, both inside the HMAC coverage); client
+   *  cores probe it as a plain TLS liveness check and report ok/fail via the
+   *  harvest endpoint (kind="canary"). The fleet's canary evidence then
+   *  drives the dynamic manifest (rotation/probe/flow-profile). A canary is
+   *  a liveness signal, never a DPI detector. */
+  AXR_CANARY_HOST?: string;
   /** Optional Xray/sing-box origin engine for protocols not terminated natively by the Worker. */
   ORIGIN_ENGINE_HOST?: string;
   /** Optional origin engine port; defaults to 443. */

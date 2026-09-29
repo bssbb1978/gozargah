@@ -57,12 +57,27 @@ func PlanHelloSplit(n int, rng Rng) (int, bool) {
 	return off, true
 }
 
-// DefaultGap returns a randomized inter-segment gap within [min, max].
+// DefaultGap returns a randomized inter-segment gap within [min, max]
+// (uniform draw — the legacy behaviour).
 func DefaultGap(rng Rng, min, max time.Duration) time.Duration {
 	if rng == nil || max <= min {
 		return min
 	}
 	return min + time.Duration(rng()*float64(max-min))
+}
+
+// SkewGap returns a randomized inter-segment gap within [min, max] drawn
+// from a quadratic-skewed distribution (u² of a uniform): bounded,
+// NONLINEAR, and heavy toward the small end. Real interactive traffic's
+// inter-packet gap statistics skew low (bursts of small gaps with the
+// occasional longer one); a uniform draw spreads mass evenly and is
+// statistically distinguishable. Deterministic for a given (rng) sequence.
+func SkewGap(rng Rng, min, max time.Duration) time.Duration {
+	if rng == nil || max <= min {
+		return min
+	}
+	u := rng()
+	return min + time.Duration(u*u*float64(max-min))
 }
 
 // SplitConn splits only the first write (the ClientHello) into two segments.
@@ -282,12 +297,17 @@ func PlanCuts(n, cuts int, lo, hi float64, rng Rng) []int {
 	return nil
 }
 
-// MultiSplitConn splits only the first write (the ClientHello) into
-// cuts+1 segments with randomized micro-gaps between them. All subsequent
-// writes pass through untouched. It implements net.Conn.
+// MultiSplitConn splits the first `left` writes (each at PlanCuts offsets
+// in the [lo,hi] window) with SkewGap micro-gaps between segments. The
+// first write is the TLS ClientHello; the next one or two writes are the
+// rest of the client flight (certificate / key-encipherment / CCS /
+// finished) — DPI systems fingerprint the first bytes AFTER the handshake
+// too, so the fragmented shape extends past segment one. Writes shorter
+// than minRecord, or after the split budget is spent, pass through
+// untouched. It implements net.Conn.
 type MultiSplitConn struct {
 	inner  net.Conn
-	done   bool
+	left   int // split budget: how many writes may still be split
 	cuts   int
 	lo     float64
 	hi     float64
@@ -296,11 +316,21 @@ type MultiSplitConn struct {
 	rng    Rng
 }
 
-// NewMultiSplitConn wraps c. cuts is the number of split points (1 => two
-// segments, 2 => three, ...). lo/hi bound the cut window as a fraction of
-// the record (use sniLo/sniHi for the SNI region). gapMin/gapMax bound the
-// randomized micro-gap between segments (typical: 1ms and 8ms).
+// NewMultiSplitConn wraps c and splits only the FIRST write (the
+// ClientHello) — the 2.16 behaviour (split budget = 1). cuts is the number
+// of split points (1 => two segments, 2 => three, ...). lo/hi bound the cut
+// window as a fraction of the record (use sniLo/sniHi for the SNI region).
+// gapMin/gapMax bound the randomized micro-gap between segments (typical:
+// 1ms and 8ms).
 func NewMultiSplitConn(c net.Conn, cuts int, lo, hi float64, gapMin, gapMax time.Duration, rng Rng) *MultiSplitConn {
+	return NewMultiSplitConnV2(c, cuts, 1, lo, hi, gapMin, gapMax, rng)
+}
+
+// NewMultiSplitConnV2 wraps c and splits the first `writes` writes (each
+// into cuts+1 segments). writes is clamped to [1,5]; a write that is too
+// small to split (or whose cuts cannot be planned) does NOT consume budget,
+// so the split is still applied to the next eligible write.
+func NewMultiSplitConnV2(c net.Conn, cuts, writes int, lo, hi float64, gapMin, gapMax time.Duration, rng Rng) *MultiSplitConn {
 	if lo <= 0 {
 		lo, hi = sniLo, sniHi
 	}
@@ -313,19 +343,25 @@ func NewMultiSplitConn(c net.Conn, cuts int, lo, hi float64, gapMin, gapMax time
 	if cuts < 1 {
 		cuts = 1
 	}
-	return &MultiSplitConn{inner: c, cuts: cuts, lo: lo, hi: hi, gapMin: gapMin, gapMax: gapMax, rng: rng}
+	if writes < 1 {
+		writes = 1
+	}
+	if writes > 5 {
+		writes = 5
+	}
+	return &MultiSplitConn{inner: c, left: writes, cuts: cuts, lo: lo, hi: hi, gapMin: gapMin, gapMax: gapMax, rng: rng}
 }
 
 func (m *MultiSplitConn) Read(b []byte) (int, error) { return m.inner.Read(b) }
 
-// Write splits the first write at PlanCuts offsets, honoring one randomized
-// gap before each subsequent segment. The returned count is the full write
-// length (contract of net.Conn); a mid-write error is returned with the
-// bytes already pushed.
+// Write splits an eligible write (split budget remaining, record large
+// enough) at PlanCuts offsets, honoring one SkewGap micro-gap before each
+// subsequent segment. The returned count is the full write length (contract
+// of net.Conn); a mid-write error is returned with the bytes already pushed.
 func (m *MultiSplitConn) Write(b []byte) (int, error) {
-	if !m.done {
-		m.done = true // only the very first write is ever split
+	if m.left > 0 && len(b) >= minRecord {
 		if pts := PlanCuts(len(b), m.cuts, m.lo, m.hi, m.rng); pts != nil {
+			m.left-- // the budget is consumed only by a write that actually split
 			bounds := make([]int, 0, len(pts)+2)
 			bounds = append(bounds, 0)
 			bounds = append(bounds, pts...)
@@ -333,7 +369,7 @@ func (m *MultiSplitConn) Write(b []byte) (int, error) {
 			total := 0
 			for i := 1; i < len(bounds); i++ {
 				if i > 1 {
-					if gap := DefaultGap(m.rng, m.gapMin, m.gapMax); gap > 0 {
+					if gap := SkewGap(m.rng, m.gapMin, m.gapMax); gap > 0 {
 						time.Sleep(gap)
 					}
 				}

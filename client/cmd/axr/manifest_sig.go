@@ -49,6 +49,14 @@ type manifestV3 struct {
 		ProbeIntervalMS float64 `json:"probe_interval_ms"`
 	} `json:"reconnect"`
 	ManifestSig string `json:"manifest_sig"`
+	// 2.17 — canary liveness target (convenience mirror; the authoritative
+	// host is the signed entries field role "canary"). Absent when the
+	// operator configured no AXR_CANARY_HOST.
+	Canary struct {
+		Host       string  `json:"host"`
+		Expect     string  `json:"expect"`
+		IntervalMS float64 `json:"interval_ms"`
+	} `json:"canary,omitempty"`
 }
 
 // canonicalFromManifest builds the EXACT canonical string the Worker's

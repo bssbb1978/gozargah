@@ -241,3 +241,51 @@ func TestKLDivDriftDetection(t *testing.T) {
 		t.Fatalf("shifted histogram must yield KL >= 1, got %v", got)
 	}
 }
+
+// ---- 2.17 — rank ladder + netstate regime labels ----
+
+func TestRankLadderAndEscalate(t *testing.T) {
+	if Rank(ProfileWeb) != 0 || Rank(ProfileChat) != 1 || Rank(ProfileVideo) != 2 {
+		t.Fatal("rank ladder must be web < chat < video")
+	}
+	if Rank("unknown-mode") != 0 {
+		t.Fatal("unknown profiles rank as web (0)")
+	}
+	if ProfileByRank(2) != ProfileVideo || ProfileByRank(1) != ProfileChat ||
+		ProfileByRank(0) != ProfileWeb || ProfileByRank(9) != ProfileWeb || ProfileByRank(-3) != ProfileWeb {
+		t.Fatal("ProfileByRank must map ranks to profiles, unknown ranks to web")
+	}
+	// Floor semantics: escalate never goes down.
+	if Escalate(ProfileVideo, ProfileWeb) != ProfileVideo {
+		t.Fatal("Escalate(video, web) must stay video")
+	}
+	if Escalate(ProfileWeb, ProfileChat) != ProfileChat {
+		t.Fatal("Escalate(web, chat) must be chat")
+	}
+	if Escalate(ProfileChat, ProfileChat) != ProfileChat {
+		t.Fatal("Escalate(chat, chat) must be chat")
+	}
+}
+
+func TestForRegimeNetstateLabels(t *testing.T) {
+	// 2.17 — the netstate route labels join the local regime driver.
+	if got := ForRegime("degraded"); got != ProfileChat {
+		t.Fatalf("ForRegime(degraded) = %s, want chat", got)
+	}
+	if got := ForRegime("cut"); got != ProfileVideo {
+		t.Fatalf("ForRegime(cut) = %s, want video", got)
+	}
+	// pre-2.17 labels unchanged
+	if got := ForRegime("watch"); got != ProfileChat {
+		t.Fatalf("ForRegime(watch) = %s, want chat", got)
+	}
+	if got := ForRegime("suspected_change"); got != ProfileVideo {
+		t.Fatalf("ForRegime(suspected_change) = %s, want video", got)
+	}
+	if got := ForRegime("stable"); got != ProfileWeb {
+		t.Fatalf("ForRegime(stable) = %s, want web", got)
+	}
+	if got := ForRegime(""); got != ProfileWeb {
+		t.Fatalf("ForRegime(\"\") = %s, want web", got)
+	}
+}

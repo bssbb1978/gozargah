@@ -300,3 +300,173 @@ func TestMultiSplitConnSmallWritePassthrough(t *testing.T) {
 		t.Fatalf("tiny write must stay whole, got %d segments", rec.count())
 	}
 }
+
+// ---- 2.17 — SkewGap + multi-write surgery (V2) tests ----
+
+// TestSkewGapBounds: bounded to [min,max], and skewed toward the small end
+// (mean of u² on [0,1] is 1/3, so the mean gap ≈ min + (max-min)/3).
+func TestSkewGapBounds(t *testing.T) {
+	min, max := 1*time.Millisecond, 8*time.Millisecond
+	rng := func() float64 { return rand.New(rand.NewSource(5)).Float64() }
+	// (a fresh source per call is only for bounds; the moment check below
+	// uses one continuous stream)
+	for i := 0; i < 1000; i++ {
+		g := SkewGap(rng, min, max)
+		if g < min || g > max {
+			t.Fatalf("SkewGap %v outside [%v,%v]", g, min, max)
+		}
+	}
+	src := rand.New(rand.NewSource(5))
+	rngC := func() float64 { return src.Float64() }
+	const n = 20000
+	span := float64(max - min)
+	sum := 0.0
+	for i := 0; i < n; i++ {
+		sum += float64(SkewGap(rngC, min, max) - min)
+	}
+	meanFrac := (sum / float64(n)) / span
+	if mathAbs(meanFrac-1.0/3.0) > 0.05 {
+		t.Fatalf("SkewGap mean fraction = %f, want ~1/3 (quadratic skew)", meanFrac)
+	}
+	// Degenerate bounds collapse to min; nil rng is safe.
+	if g := SkewGap(nil, min, max); g != min {
+		t.Fatalf("nil rng must return min, got %v", g)
+	}
+	if g := SkewGap(rngC, max, min); g != min {
+		t.Fatalf("max<=min must return min, got %v", g)
+	}
+}
+
+func mathAbs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// TestMultiSplitV2SplitsFirstNWrites: with split budget 2, the first two
+// handshake-sized writes are split, the third passes through whole.
+func TestMultiSplitV2SplitsFirstNWrites(t *testing.T) {
+	r := &recorder{}
+	c := r.start()
+	defer c.Close()
+	src := rand.New(rand.NewSource(11))
+	m := NewMultiSplitConnV2(c, 2, 2, 0.40, 0.90, 0, 0, func() float64 { return src.Float64() })
+
+	w1 := make([]byte, 1500)
+	w2 := make([]byte, 1200)
+	w3 := make([]byte, 1000)
+	for i := range w1 {
+		w1[i] = byte(i % 251)
+	}
+	for i := range w2 {
+		w2[i] = byte(i % 199)
+	}
+	for i := range w3 {
+		w3[i] = byte(i % 253)
+	}
+	if n, err := m.Write(w1); err != nil || n != 1500 {
+		t.Fatalf("write1: n=%d err=%v", n, err)
+	}
+	afterFirst := r.count()
+	if afterFirst < 3 {
+		t.Fatalf("write1 must split into >=3 segments (2 cuts), got %d writes", afterFirst)
+	}
+	if n, err := m.Write(w2); err != nil || n != 1200 {
+		t.Fatalf("write2: n=%d err=%v", n, err)
+	}
+	afterSecond := r.count()
+	if afterSecond < afterFirst+3 {
+		t.Fatalf("write2 must also split (budget 2), got %d new writes", afterSecond-afterFirst)
+	}
+	if n, err := m.Write(w3); err != nil || n != 1000 {
+		t.Fatalf("write3: n=%d err=%v", n, err)
+	}
+	if r.count() != afterSecond+1 {
+		t.Fatalf("write3 must pass through whole (budget spent), got %d new writes", r.count()-afterSecond)
+	}
+	if got := r.total(); got != 3700 {
+		t.Fatalf("total bytes = %d, want 3700", got)
+	}
+	// Reassemble the third write and check byte integrity.
+	ws := r.writes
+	if len(ws) == 0 {
+		t.Fatal("no writes recorded")
+	}
+	last := ws[len(ws)-1]
+	if len(last) != 1000 {
+		t.Fatalf("third write split despite spent budget: %d bytes", len(last))
+	}
+	for i, b := range last {
+		if b != byte(i%253) {
+			t.Fatalf("write3 byte %d corrupted: %d != %d", i, b, byte(i%253))
+		}
+	}
+}
+
+// TestMultiSplitV2SmallWriteKeepsBudget: a write too small to split must
+// NOT consume budget — the split still lands on the next eligible write.
+func TestMultiSplitV2SmallWriteKeepsBudget(t *testing.T) {
+	r := &recorder{}
+	c := r.start()
+	defer c.Close()
+	src := rand.New(rand.NewSource(13))
+	m := NewMultiSplitConnV2(c, 1, 1, 0.40, 0.90, 0, 0, func() float64 { return src.Float64() })
+
+	small := make([]byte, 50) // < minRecord (96)
+	big := make([]byte, 1500)
+	for i := range big {
+		big[i] = byte(i % 211)
+	}
+	if n, err := m.Write(small); err != nil || n != 50 {
+		t.Fatalf("small write: n=%d err=%v", n, err)
+	}
+	if r.count() != 1 {
+		t.Fatalf("small write must pass through whole, got %d writes", r.count())
+	}
+	if n, err := m.Write(big); err != nil || n != 1500 {
+		t.Fatalf("big write: n=%d err=%v", n, err)
+	}
+	if r.count() != 2 {
+		t.Fatalf("big write must still split (budget kept), got %d total writes", r.count())
+	}
+}
+
+// TestMultiSplitV1BackwardCompat: the v1 constructor (split budget 1)
+// still splits only the first write.
+func TestMultiSplitV1BackwardCompat(t *testing.T) {
+	r := &recorder{}
+	c := r.start()
+	defer c.Close()
+	src := rand.New(rand.NewSource(17))
+	m := NewMultiSplitConn(c, 2, 0.40, 0.90, 0, 0, func() float64 { return src.Float64() })
+
+	w1 := make([]byte, 1500)
+	w2 := make([]byte, 1000)
+	if n, err := m.Write(w1); err != nil || n != 1500 {
+		t.Fatalf("write1: n=%d err=%v", n, err)
+	}
+	afterFirst := r.count()
+	if afterFirst < 3 {
+		t.Fatalf("v1 must split the first write into >=3 segments, got %d", afterFirst)
+	}
+	if n, err := m.Write(w2); err != nil || n != 1000 {
+		t.Fatalf("write2: n=%d err=%v", n, err)
+	}
+	if r.count() != afterFirst+1 {
+		t.Fatalf("v1 must NOT split the second write, got %d new writes", r.count()-afterFirst)
+	}
+}
+
+// TestNewMultiSplitConnV2ClampsWrites: the split budget is clamped to [1,5].
+func TestNewMultiSplitConnV2ClampsWrites(t *testing.T) {
+	src := rand.New(rand.NewSource(19))
+	m := NewMultiSplitConnV2(nil, 1, 0, 0, 0, 0, 0, func() float64 { return src.Float64() })
+	if m.left != 1 {
+		t.Fatalf("writes=0 must clamp to 1, got %d", m.left)
+	}
+	m2 := NewMultiSplitConnV2(nil, 1, 99, 0, 0, 0, 0, func() float64 { return src.Float64() })
+	if m2.left != 5 {
+		t.Fatalf("writes=99 must clamp to 5, got %d", m2.left)
+	}
+}

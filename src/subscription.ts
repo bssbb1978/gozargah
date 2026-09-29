@@ -11,8 +11,9 @@
 
 import { toBase64 } from './utils/crypto';
 import { GzUser, listUsers } from './db/users';
-import { loadAdaptiveGuardState, loadAdaptiveModel, loadCleanIPHarvest, loadNetworkState, loadPathHealth, loadPolicySignalState, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState } from './db/store';
+import { loadAdaptiveGuardState, loadAdaptiveModel, loadCanaryState, loadCleanIPHarvest, loadNetworkState, loadPathHealth, loadPolicySignalState, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState } from './db/store';
 import { decideResilience, type PathObservation } from './ai/resilience';
+import { assessPressure, canaryEvidence } from './ai/pressure';
 import { buildAdaptiveProtocolPlan } from './ai/protocol-controller';
 import { nextAdaptiveGuardState, reconcileAdaptivePlan } from './ai/adaptive-guard';
 import { EffectiveSettings } from './settings';
@@ -106,6 +107,20 @@ function originTemplates(capabilities: ProtocolCapability[], transports: readonl
  *     /api/network/harvest endpoint), capped at 16.
  *   - `fronting_hint`: optional domestic-CDN relay host (FRONTING_RELAY_HOST
  *     env) the client merges into its entry ladder.
+ *
+ * 2.17 — closed-loop pressure (internal AI, fully dynamic):
+ *   - `pressure`: the ai/pressure engine fuses the fleet's canary liveness
+ *     evidence, clean-IP harvest freshness, and the aggregate regime label
+ *     into a 0-3 level. It drives the *dynamic* manifest levers — the client
+ *     probe cadence (reconnect.probe_interval_ms), the outflow profile floor
+ *     (flow_profile.mode), and exposed backup-entry diversity. `path_rotation
+ *     _minutes` stays the real deterministic window (honesty: the manifest
+ *     never advertises a rotation faster than the path actually rotates).
+ *   - `canary`: when AXR_CANARY_HOST is configured, a canary host rides in
+ *     the signed `entries` field (role "canary" — a probe target, never a
+ *     tunnel arm) plus a top-level convenience pointer. Clients probe it as
+ *     a plain TLS liveness check and report ok/fail via harvest kind="canary",
+ *     which feeds the pressure engine. Liveness signal, never a DPI detector.
  */
 export async function buildAxrManifest(host: string, user: { uuid: string }, env?: Env, token?: string): Promise<string> {
   const db = env?.GZ_DB;
@@ -140,35 +155,49 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
       fa: 'فقط آمار تجمیعی سمت Worker است؛ تشخیص DPI نیست، عبور تضمین‌شده نیست و در قطع کامل مسیر، از راه دور قابل‌رفع نیست.',
     },
   };
+  // 2.17 — canary host (env config; validated hostname, '' when absent).
+  const canary = frontingHint(env?.AXR_CANARY_HOST);
   if (db) {
     try {
-      const [ns, regimeRows, signal, settings, pathRows, harvest] = await Promise.all([
+      const [ns, regimeRows, signal, settings, pathRows, harvest, canaryState] = await Promise.all([
         loadNetworkState(db),
         loadPredictiveStates(db, 'regime'),
         loadPolicySignalState(db),
         loadSettings(db),
         loadPathHealth(db),
         loadCleanIPHarvest(db),
+        loadCanaryState(db),
       ]);
       const regimeRow = regimeRows.find((r) => r.subjectId === 'global');
+      let regimeState: string | undefined;
       if (regimeRow) {
         const parsed = JSON.parse(regimeRow.stateJson) as RegimeAssessment;
         out.regime = { state: parsed.state, confidence: parsed.confidence, recent_success: parsed.recentSuccess, baseline_success: parsed.baselineSuccess };
+        regimeState = parsed.state;
       }
       if (ns) {
         out.network_state = { state: ns.state, updated_at: ns.updatedAt };
-        if (ns.state === 'recovery' || ns.state === 'no_healthy_path') {
-          (out.reconnect as Record<string, unknown>).probe_interval_ms = 30_000;
-        }
       }
-      // 2.15 — regime/network-driven flow-profile escalation: under stress
-      // the client should imitate the highest-entropy profile (video),
-      // which is the least distinctive against a censor's behavioral models.
-      const regimeState = (out.regime as { state?: string } | undefined)?.state;
-      if (regimeState === 'suspected_change' || ns?.state === 'recovery' || ns?.state === 'no_healthy_path') {
+      // 2.17 — pressure engine: fleet canary evidence + harvest freshness +
+      // regime label -> 0-3 level -> the dynamic manifest levers (probe
+      // cadence, outflow-profile floor, entry diversity). Fully automatic —
+      // the client's canary probes and scan uploads are the only inputs.
+      const { failFrac, ageMin } = canaryEvidence(canaryState?.results ?? []);
+      const pressure = assessPressure({
+        canaryConfigured: canary !== '',
+        canaryFailFrac: failFrac,
+        canaryAgeMin: ageMin,
+        harvestAgeMin: harvest ? (now - harvest.updatedAt) / 60_000 : null,
+        regimeState: regimeState ?? 'stable',
+      });
+      (out.reconnect as Record<string, unknown>).probe_interval_ms = pressure.probeIntervalMs;
+      (out.flow_profile as Record<string, unknown>).mode = pressure.flowProfile;
+      out.pressure = { level: pressure.level, reasons: pressure.reasons };
+      // The network-state machine still overrides the cadence when it has
+      // DIRECTLY measured a dead/recovering route (stronger than inference).
+      if (ns?.state === 'recovery' || ns?.state === 'no_healthy_path') {
+        (out.reconnect as Record<string, unknown>).probe_interval_ms = Math.min(pressure.probeIntervalMs, 30_000);
         (out.flow_profile as Record<string, unknown>).mode = 'video';
-      } else if (regimeState === 'watch') {
-        (out.flow_profile as Record<string, unknown>).mode = 'chat';
       }
       if (signal) {
         try {
@@ -177,7 +206,9 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
           if (sig.probeMode === 'aggressive') out.probe_mode = 'aggressive';
         } catch { /* optional */ }
       }
-      for (const bh of (settings?.backupEntryHosts ?? []).slice(0, 4)) {
+      // 2.17 — under elevated pressure expose more backup diversity (all
+      // configured backups are our own domains; more options for the ladder).
+      for (const bh of (settings?.backupEntryHosts ?? []).slice(0, pressure.level >= 2 ? 6 : 4)) {
         const row = pathRows.find((r) => r.pathId === 'entry:' + bh);
         out.entries = [
           ...(out.entries as Array<Record<string, unknown>>),
@@ -194,6 +225,16 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
   // 2.16 — domestic-CDN fronting hint (validated hostname only).
   const fronting = frontingHint(env?.FRONTING_RELAY_HOST);
   if (fronting) out.fronting_hint = fronting;
+  // 2.17 — canary: a probe target, never a tunnel arm. The host rides in the
+  // SIGNED entries field (role "canary") so a tampered canary fails the HMAC;
+  // the top-level pointer is a convenience mirror for the client core.
+  if (canary) {
+    out.entries = [
+      ...(out.entries as Array<Record<string, unknown>>),
+      { host: canary, role: 'canary', status: 'probe_target', latency_ms: null },
+    ];
+    out.canary = { host: canary, expect: 'ok', interval_ms: 300_000 };
+  }
   // 2.16 — manifest integrity: HMAC-SHA256 keyed by the subscription token.
   if (token) {
     try {

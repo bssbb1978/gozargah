@@ -1,20 +1,26 @@
 # AXR client core (Go)
 
-Native client half of the gozargah **AXR Protocol Framework** (v2.16,
-AXR-v3 Hyper-Resilience).
-A SOCKS5 TCP inbound that tunnels every stream over a **16-dim LinUCB-selected
-VLESS-over-WebSocket** path (standard + `ws-alt` shape arms), with
-client-side TLS-identity selection, **multi-segment ClientHello surgery**
-(fragA/fragB style: randomized 2–3 cuts in the SNI region, 1–8 ms
-micro-gaps), **app-class flow morphing** (length histogram + lognormal IPD)
-with **KL-divergence self-monitoring**, **TCP socket surgery** (Nagle off +
-randomized `SO_SNDBUF`), a persistent routing cache with **clean-IP
-harvesting** (A-records + local `axr scan` pool + manifest hints), **HMAC
+Native client half of the gozargah **AXR Protocol Framework** (v2.17,
+AXR-v3.1 Deep Evasion).
+A SOCKS5 TCP inbound that tunnels every stream over an **ensemble-AI
+selected VLESS-over-WebSocket** path (16-dim LinUCB + Beta-Bernoulli
+Thompson ensemble with meta-learned arbitration, standard + `ws-alt` shape
+arms), with client-side TLS-identity selection, **multi-segment flight
+surgery** (fragA/fragB style: the first 1–3 client-flight writes cut at
+randomized 2–3 SNI-region cuts with 1–8 ms *skewed* micro-gaps), **app-class
+flow morphing** (length histogram + lognormal IPD) with **KL-divergence
+self-monitoring** and a **fleet-pressure profile floor** from the manifest,
+**TCP socket surgery** (Nagle off + randomized `SO_SNDBUF`), a persistent
+routing cache with **clean-IP harvesting** (A-records + local `axr scan`
+pool + manifest hints), a **route-regime hysteresis machine**
+(`netstate`: stable/degraded/cut/recovering → automatic fronting-first
+priority inversion under net-e-melli), a **canary liveness loop** (plain TLS
+probe of the manifest's canary host → fleet pressure engine), **HMAC
 manifest verification** (reject tampered feeds, keep last-known-good),
 **fronting-entry merge** from the manifest, **measured throughput**
 accounting, **session reuse** (warm WS ≤ 30 s, same destination), a
-**decision audit log** (`~/.axr/decision.jsonl`), and a normal/aggressive
-probe state machine.
+**decision audit log** (`~/.axr/decision.jsonl`, incl. which ensemble member
+chose), and a normal/aggressive probe state machine.
 
 TLS terminates at the Cloudflare edge — therefore **all** fingerprint
 morphing, ClientHello surgery, and path/IP selection happens **here, locally**,
@@ -27,10 +33,11 @@ no deep inspection.
 | --- | --- |
 | `cmd/axr` | The binary: SOCKS5 → 16-dim LinUCB-selected VLESS-WS tunnel (ws + ws-alt arms), HMAC manifest verification, fronting merge, session reuse, decision.jsonl audit — **plus the `axr scan` subcommand** (clean-IP scanner, §Scan) |
 | `internal/cfscan` | **2.16** — CFScanner core: CF API CIDRs (offline snapshot fallback), priority /24s, blocked ranges, deterministic sampling, SNI-anchored TLS×3 (real cert verify), median RTT/loss, `cdn-cgi/trace` colo, top-N, JSON+CSV reports; live probing behind an injectable `Prober` |
-| `internal/bandit` | **LinUCB** contextual bandit over (host, transport, fp) arms — **16-dim context** (2.16: +throughput, loss velocity, TLS error rate, entry churn, flow KL, time-of-day, session age, regime ordinal), 16×16 ridge A/b per arm, pure-Go Gauss-Jordan; quarantine, prune, JSON persistence (2.15's 7-dim snapshots restore stats with the ridge prior rebuilt) |
+| `internal/bandit` | **Ensemble** (2.17): **LinUCB** contextual bandit + per-arm **Beta-Bernoulli Thompson sampler** with meta-learned arbitration (realized-reward EMAs, tanh weight; seeded draws, deterministic; `model: lin|ts` stamped on the decision). LinUCB: **16-dim context** (2.16: +throughput, loss velocity, TLS error rate, entry churn, flow KL, time-of-day, session age, regime ordinal — 2.17: +netstate `degraded`/`cut` labels), 16×16 ridge A/b per arm, pure-Go Gauss-Jordan; quarantine, prune, JSON persistence (2.15's 7-dim and 2.16's ensemble-less snapshots restore with neutral priors) |
+| `internal/netstate` | **2.17** — route-regime hysteresis (net-e-melli reflex): 12-obs sliding window over (primary/fronting/canary) tunnel outcomes → stable/degraded/cut/recovering with a canary-freshness veto on cut; emits the fronting-first priority policy + aggressive cadence |
 | `internal/measure` | Client state vector: RTT/jitter EWMA, RST & timeout rates, CUSUM step-change, anomaly code → regime label; **2.16: +throughput EWMA, signed RTT slope, loss velocity, TLS error rate** (feeds the 16-dim context) |
-| `internal/flowprofile` | App-class flow morphing: length histograms + lognormal IPD for `web`/`video`/`chat`; regime-driven; implements `surgery.Slicer`; **2.16: +`KLDiv` / `TargetBins` / shared frame buckets (self-monitoring)** |
-| `internal/surgery` | **`MultiSplitConn` (2.16: first write = ClientHello → 2–4 TCP segments at randomized SNI-region cuts with 1–8 ms micro-gaps)**, `SplitConn` (legacy 2-segment) and `ChunkConn` (post-handshake chunks; uniform 512–1400 B legacy, or a `Slicer`-driven app-class distribution) |
+| `internal/flowprofile` | App-class flow morphing: length histograms + lognormal IPD for `web`/`video`/`chat`; regime-driven; implements `surgery.Slicer`; **2.16: +`KLDiv` / `TargetBins` / shared frame buckets (self-monitoring)**; **2.17: +`Rank`/`ProfileByRank`/`Escalate` (manifest fleet-pressure profile floor) + netstate labels in `ForRegime`** |
+| `internal/surgery` | **`MultiSplitConn` v2 (2.17: first 1–3 client-flight writes → 2–4 TCP segments each, at randomized SNI-region cuts with 1–8 ms SKEWED micro-gaps via `SkewGap`, u² low-skew distribution)**, `SplitConn` (legacy 2-segment) and `ChunkConn` (post-handshake chunks; uniform 512–1400 B legacy, or a `Slicer`-driven app-class distribution) |
 | `internal/sockopt` | TCP socket surgery: `TCP_NODELAY` (Nagle off) + randomized `SO_SNDBUF` (64–512 KB); linux/darwin/windows, no-op elsewhere |
 | `internal/failover` | Endpoint matrix (host × clean-IP × transport × fp), live IP health cache (atomic JSON), normal/aggressive probe state machine, **clean-IP harvesting** (A-records + local scan pool + manifest hints, dedup/capped) |
 | `internal/vlessws` | VLESS v1 header (byte-compatible with the Worker parser), 0-RTT early data via `Sec-WebSocket-Protocol`, minimal RFC 6455 client codec |
@@ -68,9 +75,11 @@ Without the `axr_utls` tag the handshake uses the OS-native Go TLS identity
   "surgery": true,
   "split_gap_ms": [20, 120],
   "frag_cuts": [2, 3],
+  "frag_writes": [1, 3],
   "frag_window": [40, 90],
   "frag_micro_gap_ms": [1, 8],
   "probes": { "normal_ms": 90000, "aggressive_ms": 30000 },
+  "canary_interval_ms": 300000,
   "harvest_url": "https://entry.example.com/gozargah/api/network/harvest",
   "harvest_token": "…optional; defaults to the manifest URL token…",
   "cache_dir": "~/.axr"
@@ -92,11 +101,38 @@ kept (`~/.axr/manifest-lastgood.json` persists the last verified raw JSON).
 Point any SOCKS5 client (browser, Hiddify, sing-box, v2rayN) at the listen
 address. UDP ASSOCIATE is rejected (the Worker has no UDP relay — by design).
 
-`frag_cuts` `[min,max]` is the per-connection ClientHello cut count
-(2.16 default 2–3 → 3–4 TCP segments, the fragA/fragB shape); absent or
-`[0,0]` keeps the legacy single cut with `split_gap_ms`. `frag_window`
-[40,90] is the cut window as percent-of-record (the SNI extension region).
-`frag_micro_gap_ms` [1,8] bounds the inter-segment micro-gap.
+`frag_cuts` `[min,max]` is the per-connection cut count (2.16 default 2–3 →
+3–4 TCP segments per write, the fragA/fragB shape); absent or `[0,0]` keeps
+the legacy single cut with `split_gap_ms`. `frag_writes` `[min,max]` (2.17,
+default `[1,3]` when `frag_cuts` is active) is how many of the FIRST
+client-flight writes get the multi-segment treatment — the ClientHello
+plus the next one or two flight writes; a write too small to split does not
+consume the budget. `frag_window` [40,90] is the cut window as
+percent-of-record (the SNI extension region). `frag_micro_gap_ms` [1,8]
+bounds the inter-segment micro-gap, drawn from a skewed (u²) distribution
+— heavy toward the small end, like real interactive traffic.
+
+## Canary & fleet-pressure loop (2.17)
+
+When the manifest carries a `canary` (operator env `AXR_CANARY_HOST` on the
+Worker), the core probes it every `canary_interval_ms` (manifest
+`canary.interval_ms` overrides when sane, clamped 60 s–1 h) as a **plain
+TCP+TLS liveness check** of `host:443` — SNI = host, real certificate
+verification, OS identity. It is deliberately NOT tunneled and NOT morphed:
+it measures the route, not the tunnel. Each outcome (a) feeds the
+`netstate` hysteresis (a fresh canary success vetoes any "cut" verdict —
+the canary travels the same international pipe), and (b) is reported to the
+Worker harvest endpoint (`kind: "canary"`, same token as `axr scan
+-upload`), where the fleet pressure engine turns the aggregate into the
+dynamic manifest levers (faster probe cadence, harsher outflow-profile
+floor, more entry diversity). The manifest's probe cadence and
+flow-profile fields are honored as an **escalation floor**: the client
+never probes slower or morphs softer than the fleet evidence asks for.
+`netstate` stress (degraded/cut) also forces the aggressive probe cadence
+and inverts the ladder — the fronting entry jumps ahead of the
+international entries (priority 50 → 10, and to 0 under a full cut) — so
+during a net-e-melli window the core spends its budget on the domestic
+route instead of the dead international one, automatically.
 
 ## Scan subcommand (2.16)
 
@@ -142,6 +178,19 @@ manifest URL token; URL: `harvest_url` → derived from the manifest host).
 - **Fronting hint = a second entry domain, not TLS fronting.** It is only as
   strong as that domain's reachability, which the ladder measures
   continuously.
+- **The canary is a liveness signal, never a DPI detector.** Its ok/fail
+  only shapes pressure levels and the client's cut verdicts; a failure has
+  many explanations (incident, upstream, filter change) and a success only
+  vetoes a cut. The netstate regime labels describe delivery quality as
+  seen from this network, not middlebox behavior.
+- **Ensemble = two local estimators, not external intelligence.** LinUCB +
+  Thompson sampling both learn only from the client's own outcomes; the
+  meta-arbitration hedges between them. Stronger adaptation, no oracle, no
+  guarantee.
+- **The pressure floor is advisory fleet statistics.** The manifest's
+  probe cadence / flow-profile mode come from aggregate worker-side
+  statistics (canary evidence, harvest freshness, regime) — bounded,
+  time-stamped, multi-explanation signals, never packet-level evidence.
 - **eBPF / UDP-noise / DoH·ICMP steganography are not in this client** (root
   + Linux + raw-socket deployment cost; the socket-level segmentation
   already produces the same on-wire TCP effect). See

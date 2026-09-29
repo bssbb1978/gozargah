@@ -562,6 +562,56 @@ function isIPv4ish(s: string): boolean {
   return s.split('.').every((o) => Number(o) <= 255);
 }
 
+/**
+ * 2.17 — canary liveness store. Clients periodically probe the operator's
+ * canary host (a plain host expected to stay reachable) and report ok/fail
+ * via the harvest endpoint (kind="canary"). Results are kept here, newest
+ * first, capped at 64, in one row: kind='harvest', subject_id='canary'.
+ * The pressure engine (ai/pressure.ts) reduces this list to fleet evidence.
+ * Honesty: these are liveness flags from client probes — aggregate
+ * statistics, never DPI detection.
+ */
+export interface CanaryResult { host: string; ok: boolean; at: number; }
+export interface CanaryStateRow { results: CanaryResult[]; updatedAt: number; }
+
+const CANARY_MAX_RESULTS = 64;
+const CANARY_MAX_HOST_LEN = 253;
+
+export async function loadCanaryState(db: D1Database): Promise<CanaryStateRow | null> {
+  const rows = await loadPredictiveStates(db, 'harvest');
+  const row = rows.find((r) => r.subjectId === 'canary');
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.stateJson) as CanaryStateRow;
+    if (!Array.isArray(parsed.results)) return null;
+    parsed.results = parsed.results
+      .filter((r) => r && typeof r.host === 'string' && typeof r.ok === 'boolean' && Number.isFinite(r.at))
+      .map((r) => ({ host: r.host.slice(0, CANARY_MAX_HOST_LEN), ok: r.ok, at: r.at }));
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/** Append one canary result (newest first, capped). Returns the stored row. */
+export async function appendCanaryResult(db: D1Database, r: CanaryResult): Promise<CanaryStateRow> {
+  const existing = (await loadCanaryState(db))?.results ?? [];
+  const clean: CanaryResult = {
+    host: String(r.host ?? '').slice(0, CANARY_MAX_HOST_LEN),
+    ok: Boolean(r.ok),
+    at: Number.isFinite(r.at) ? r.at : Date.now(),
+  };
+  const results = [clean, ...existing].slice(0, CANARY_MAX_RESULTS);
+  const row: CanaryStateRow = { results, updatedAt: clean.at };
+  await savePredictiveState(db, {
+    kind: 'harvest',
+    subjectId: 'canary',
+    stateJson: JSON.stringify(row),
+    updatedAt: row.updatedAt,
+  });
+  return row;
+}
+
 export interface NetworkStateRow {
   state: string;
   quorum: number;

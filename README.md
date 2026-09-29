@@ -1,4 +1,30 @@
-# Gozargah 2.16.0 — AXR-v3 Hyper-Resilience: Clean-IP Loop + Manifest Integrity + 16-dim Bandit
+# Gozargah 2.17.0 — AXR-v3.1 Deep Evasion: Closed-Loop Fleet Pressure + Ensemble AI + net-e-melli Reflex
+
+## 2.17.0 — AXR-v3.1 Deep Evasion (advanced increment)
+
+### Highlights
+- **Closed-loop fleet pressure (fully automatic, no human in the loop)** — the client's new **canary** liveness loop (plain TLS probe of the operator's `AXR_CANARY_HOST`, HMAC-signed into the manifest's `entries` field) reports ok/fail to the harvest endpoint (`kind: "canary"`); the new Worker **pressure engine** (`src/ai/pressure.ts`) fuses fleet canary evidence + clean-IP harvest freshness + the aggregate regime label into a 0–3 level that **dynamically** re-tunes every manifest: probe cadence 90 s → 15 s, outflow-profile floor web → video, entry diversity 4 → 6. A filter change degrades the fleet canary → pressure rises → the next (HMAC-verified) manifest makes all clients probe faster, morph harder, and have more options — and it decays automatically on recovery. Absence of evidence is never pressure (fresh installs stay at level 0).
+- **net-e-melli reflex (`netstate`, Go)** — a 12-observation hysteresis state machine (stable ⇄ degraded ⇄ cut ⇄ recovering) over the client's own tunnel outcomes + canary probes. The net-e-melli signature (international primaries failing while the domestic fronting entry still succeeds) is recognized within two failed connections and triggers **automatic priority inversion**: the fronting entry jumps to the front of the ladder (priority 50 → 10, → 0 under full cut) and the probe cadence goes aggressive — instead of waiting for the bandit to quarantine dead entries one by one. A live canary vetoes any "cut" verdict (it travels the same international pipe).
+- **Ensemble internal AI (`bandit`, Go)** — the 16-dim LinUCB is now joined by a per-arm **Beta-Bernoulli Thompson sampler**, with a **meta-learned arbitration weight** (realized-reward EMAs, tanh-combined): after each pull, credit goes to whichever member's deterministic ranking picked the arm that carried, so the hedge between condition-aware and outcome-aware learning is itself learned. Seeded draws keep selection deterministic; 2.16 snapshots restore to the neutral ensemble; the decision audit gains `model: "lin"|"ts"`.
+- **Surgery v2 (`surgery`, Go)** — the multi-segment ClientHello surgery now extends across the **first 1–3 client-flight writes** (`frag_writes`, not just the ClientHello — certificate/key-encipherment/CCS/finished records carry the shape too), and the inter-segment micro-gaps are drawn from a **non-linear skewed distribution** (`SkewGap`, u² — heavy toward the small end, like real interactive traffic; a uniform draw is statistically distinguishable).
+- **Flow-profile floor (`flowprofile`, Go)** — the manifest's (now pressure-driven) `flow_profile.mode` can only **escalate** the client's local regime-driven profile (web < chat < video): the client never morphs below what the fleet evidence asks for.
+- **Version** — Worker `VERSION 2.17.0` / `SCHEMA_VERSION 17`; manifest keeps the pinned 11-field HMAC canonical (the canary rides inside the signed `entries` field — a tampered canary fails the signature); client core updated.
+
+### Honest platform boundary (restated)
+The canary is a liveness signal, never a DPI detector — its outputs are pressure levels and priority policies, not identifications; the Worker still performs no active probing. eBPF/TC/XDP, UDP-noise, DoH/ICMP steganography are **not shipped** (roadmap, as in 2.16 — 0-RTT session-ticket resumption is the documented v3.2 candidate). Nothing here is a guarantee: a fully cut route is reported, not looped.
+
+### Verification status
+Worker side: `npm run typecheck`, `npm run test:engine` (12 suites incl. the new `pressure` suite, 14 checks: engine rules, evidence reduction, canary manifest wiring + HMAC coverage) and `npm run test:integration` (22 tests incl. canary harvest auth/shape and fleet-failure → level 3 → dynamic manifest levers) all pass; bundle 521.09 KiB / 135.92 KiB gzip. Go core: complete source + unit tests (netstate 7, bandit 20 incl. sampler moments + arbitration + determinism + 2.16-compat restore, surgery 14 incl. multi-write + skew gaps), **not compiled in the authoring sandbox** (no Go toolchain) — deploy gate `go vet && go build && go test -race ./...` per [AXR-DEPLOY](docs/AXR-DEPLOY.md).
+
+### Engineering documents
+- [AXR-v3.1 Deep Evasion (2.17) — closed-loop spec, wire contracts, verification matrix](docs/AXR-V31-DEEP-EVASION.md)
+- [AXR-v3 Hyper-Resilience (2.16) — spec mapping, wire contracts, roadmap](docs/AXR-V3-HYPER-RESILIENCE.md)
+- [AXR-v2 Enterprise Core — Advanced Features (2.15)](docs/AXR-V2-ADVANCED.md)
+- [AXR Protocol Specification](docs/AXR-SPEC.md)
+- [AXR Cross-Compile & Deploy Guide](docs/AXR-DEPLOY.md)
+- [Client Core README](client/README.md)
+- [Test Report 2.17.0](TEST-REPORT-2.17.0.md)
+- [Persian Upgrade Report 2.17.0](UPGRADE-REPORT-FA-2.17.0.md)
 
 ## 2.16.0 — AXR-v3 Hyper-Resilience (advanced increment)
 
