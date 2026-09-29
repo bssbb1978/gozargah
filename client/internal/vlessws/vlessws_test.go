@@ -321,7 +321,11 @@ func TestEncodeClientFrameRegression(t *testing.T) {
 func TestFragmenterSplitBounds(t *testing.T) {
 	src := rand.New(rand.NewSource(11))
 	f := NewFragmenter(func() float64 { return src.Float64() })
-	for _, n := range []int{300, 1000, 5000, 10000, 32768, 65536} {
+	// Below the 2*min (512 B) fragmentation floor, a payload stays whole.
+	if s := f.Split(300); len(s) != 1 || s[0] != 300 {
+		t.Fatalf("300 B must stay whole (below the 2*min floor): %v", s)
+	}
+	for _, n := range []int{1000, 5000, 10000, 32768, 65536} {
 		sizes := f.Split(n)
 		if len(sizes) < 2 || len(sizes) > 4 {
 			t.Fatalf("n=%d: fragment count %d out of [2,4]: %v", n, len(sizes), sizes)
