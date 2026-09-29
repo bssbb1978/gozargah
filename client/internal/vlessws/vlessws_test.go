@@ -4,9 +4,15 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/binary"
+	"errors"
 	"io"
+	"math/rand"
+	"net"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 )
 
 var testUUID = []byte{
@@ -234,5 +240,242 @@ func TestExpectedAcceptMatchesRFC(t *testing.T) {
 	h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 	if base64.StdEncoding.EncodeToString(h.Sum(nil)) != accept {
 		t.Fatal("accept derivation mismatch")
+	}
+}
+
+// ---- 2.18 — WebSocket frame-rhythm fragmentation ----
+
+// decodeClientFrame parses one MASKED client frame (test helper): returns
+// opcode, FIN bit, and the unmasked payload.
+func decodeClientFrame(f []byte) (opcode byte, fin bool, payload []byte, err error) {
+	if len(f) < 2 {
+		return 0, false, nil, io.ErrShortBuffer
+	}
+	opcode = f[0] & 0x0f
+	fin = f[0]&0x80 != 0
+	if f[1]&0x80 == 0 {
+		return 0, false, nil, errors.New("client frame must be masked")
+	}
+	l := int(f[1] & 0x7f)
+	off := 2
+	switch l {
+	case 126:
+		if len(f) < 4 {
+			return 0, false, nil, io.ErrShortBuffer
+		}
+		l = int(binary.BigEndian.Uint16(f[2:4]))
+		off = 4
+	case 127:
+		if len(f) < 10 {
+			return 0, false, nil, io.ErrShortBuffer
+		}
+		l = int(binary.BigEndian.Uint64(f[2:10]))
+		off = 10
+	}
+	if len(f) < off+4+l {
+		return 0, false, nil, io.ErrShortBuffer
+	}
+	mask := [4]byte{f[off], f[off + 1], f[off + 2], f[off + 3]}
+	payload = make([]byte, l)
+	for i := 0; i < l; i++ {
+		payload[i] = f[off+4+i] ^ mask[i%4]
+	}
+	return opcode, fin, payload, nil
+}
+
+func TestEncodeClientFragmentFIN(t *testing.T) {
+	mask := [4]byte{9, 8, 7, 6}
+	payload := []byte("abc")
+	frag := EncodeClientFragment(opBinary, false, payload, mask)
+	if frag[0] != 0x02 {
+		t.Fatalf("first fragment must carry opcode 2 with FIN clear: %x", frag[0])
+	}
+	last := EncodeClientFragment(opContinuation, true, payload, mask)
+	if last[0] != 0x80 {
+		t.Fatalf("final continuation must be 0x80 (FIN+cont): %x", last[0])
+	}
+	// Unmask both and reassemble.
+	var got []byte
+	for _, f := range [][]byte{frag, last} {
+		_, _, p, err := decodeClientFrame(f)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		got = append(got, p...)
+	}
+	want := append(append([]byte{}, payload...), payload...)
+	if !bytes.Equal(got, want) {
+		t.Fatal("unmasked reassembly mismatch")
+	}
+}
+
+func TestEncodeClientFrameRegression(t *testing.T) {
+	// The classic one-shot frame must be byte-identical to FIN=true.
+	mask := [4]byte{1, 2, 3, 4}
+	p := []byte("hello")
+	if !bytes.Equal(EncodeClientFrame(opBinary, p, mask), EncodeClientFragment(opBinary, true, p, mask)) {
+		t.Fatal("classic frame layout changed")
+	}
+}
+
+func TestFragmenterSplitBounds(t *testing.T) {
+	src := rand.New(rand.NewSource(11))
+	f := NewFragmenter(func() float64 { return src.Float64() })
+	for _, n := range []int{300, 1000, 5000, 10000, 32768, 65536} {
+		sizes := f.Split(n)
+		if len(sizes) < 2 || len(sizes) > 4 {
+			t.Fatalf("n=%d: fragment count %d out of [2,4]: %v", n, len(sizes), sizes)
+		}
+		sum := 0
+		for i, sz := range sizes {
+			sum += sz
+			if sz < 1 || sz > fragMaxBytes {
+				t.Fatalf("n=%d: fragment %d out of [1,%d]: %d", n, i, fragMaxBytes, sz)
+			}
+			if i < len(sizes)-1 && sz < fragMinBytes {
+				t.Fatalf("n=%d: fragment %d below min: %d", n, i, sz)
+			}
+		}
+		if sum != n {
+			t.Fatalf("n=%d: sizes sum to %d: %v", n, sum, sizes)
+		}
+	}
+	// Small and empty payloads pass through whole.
+	if s := f.Split(100); len(s) != 1 || s[0] != 100 {
+		t.Fatalf("small payload must stay whole: %v", s)
+	}
+	if s := f.Split(0); len(s) != 1 || s[0] != 0 {
+		t.Fatalf("empty payload: %v", s)
+	}
+	// Nil-safety.
+	var nf *Fragmenter
+	if s := nf.Split(1000); len(s) != 1 || s[0] != 1000 {
+		t.Fatalf("nil fragmenter: %v", s)
+	}
+}
+
+func TestFragmenterDeterministic(t *testing.T) {
+	f1 := NewFragmenter(func() float64 { return 0.5 })
+	f2 := NewFragmenter(func() float64 { return 0.5 })
+	for n := 2000; n <= 4000; n += 512 {
+		a, b := f1.Split(n), f2.Split(n)
+		if len(a) != len(b) {
+			t.Fatalf("n=%d: counts differ: %v vs %v", n, a, b)
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				t.Fatalf("n=%d: size %d differs: %v vs %v", n, i, a, b)
+			}
+		}
+	}
+}
+
+// frameRecorder captures each Write on the fake conn (one recorded frame
+// per write call — synchronous, like the surgery recorder).
+type frameRecorder struct {
+	mu     sync.Mutex
+	frames [][]byte
+}
+
+type frConn struct{ r *frameRecorder }
+
+type frAddr string
+
+func (a frAddr) Network() string { return "pipe" }
+func (a frAddr) String() string  { return string(a) }
+
+func (c *frConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *frConn) Write(b []byte) (int, error) {
+	c.r.mu.Lock()
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	c.r.frames = append(c.r.frames, cp)
+	c.r.mu.Unlock()
+	return len(b), nil
+}
+func (c *frConn) Close() error                   { return nil }
+func (c *frConn) LocalAddr() net.Addr            { return frAddr("local") }
+func (c *frConn) RemoteAddr() net.Addr           { return frAddr("remote") }
+func (c *frConn) SetDeadline(time.Time) error    { return nil }
+func (c *frConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (c *frConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestFragmenterSendRhythm(t *testing.T) {
+	rec := &frameRecorder{}
+	src := rand.New(rand.NewSource(23))
+	f := NewFragmenter(func() float64 { return src.Float64() })
+	c := &Client{conn: &frConn{r: rec}, frag: f}
+
+	payload := make([]byte, 32768)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	if err := c.SendBinary(payload); err != nil {
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	frames := make([][]byte, len(rec.frames))
+	copy(frames, rec.frames)
+	rec.mu.Unlock()
+
+	if len(frames) < 2 || len(frames) > 4 {
+		t.Fatalf("32 KB must fragment into 2-4 frames, got %d", len(frames))
+	}
+	var got []byte
+	for i, f := range frames {
+		op, fin, p, err := decodeClientFrame(f)
+		if err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+		wantOp := opBinary
+		if i > 0 {
+			wantOp = opContinuation
+		}
+		if op != wantOp {
+			t.Fatalf("frame %d: opcode %d, want %d", i, op, wantOp)
+		}
+		if wantFin := i == len(frames)-1; fin != wantFin {
+			t.Fatalf("frame %d: fin=%v, want %v", i, fin, wantFin)
+		}
+		got = append(got, p...)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("fragmented reassembly mismatch")
+	}
+}
+
+func TestFragmenterSmallPassthrough(t *testing.T) {
+	rec := &frameRecorder{}
+	c := &Client{conn: &frConn{r: rec}, frag: NewFragmenter(func() float64 { return 0.5 })}
+	if err := c.SendBinary(make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	frames := make([][]byte, len(rec.frames))
+	copy(frames, rec.frames)
+	rec.mu.Unlock()
+	if len(frames) != 1 {
+		t.Fatalf("100 B must stay one frame, got %d", len(frames))
+	}
+	op, fin, p, err := decodeClientFrame(frames[0])
+	if err != nil || op != opBinary || !fin || len(p) != 100 {
+		t.Fatalf("passthrough frame wrong: op=%d fin=%v n=%d err=%v", op, fin, len(p), err)
+	}
+}
+
+func TestSendBinaryNoFragmenter(t *testing.T) {
+	rec := &frameRecorder{}
+	c := &Client{conn: &frConn{r: rec}} // classic behaviour
+	p := make([]byte, 20000)
+	if err := c.SendBinary(p); err != nil {
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	n := len(rec.frames)
+	rec.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("no fragmenter: exactly one frame expected, got %d", n)
 	}
 }

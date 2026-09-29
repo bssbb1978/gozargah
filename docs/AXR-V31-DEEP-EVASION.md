@@ -197,6 +197,36 @@ the manifest's `flow_profile.mode` (now pressure-driven, §3.2) can only
 **escalate** it — the client never morphs below what the fleet evidence
 asks for.
 
+### 6.1 WS frame-rhythm fragmentation (2.18)
+
+Surgery v2 reshapes the traffic at the TCP layer (segment cuts + gaps),
+but a passive engine that terminates/inspects WebSocket sees the *frame*
+layer: stock VLESS clients (xray and friends) emit exactly **one masked
+WS frame per application write** — a fixed, engine-recognizable rhythm.
+
+`vlessws.Fragmenter` breaks that shape. Every binary message ≥ 512 B is
+emitted as **2–4 masked continuation frames**:
+
+- fragment sizes in [256 B, 16 KB], drawn per-connection from the
+  per-session RNG (`Split` is deterministic for a seeded source);
+- a fresh RFC 6455 masking key **per frame**;
+- small **skewed** (u²) inter-frame gaps, 0–3 ms — bursts of tiny gaps
+  with the occasional longer one, the shape real interactive traffic
+  shows (same distribution family as the TCP-level `SkewGap`);
+- first frame carries opcode 0x2 (FIN clear), continuations opcode 0x0,
+  only the last frame sets FIN — RFC 6455 §5.4; control frames
+  (ping/pong/close) are never fragmented (§5.5).
+
+The Worker's WebSocket API reassembles continuation frames natively, so
+the VLESS payload arrives byte-identical — **no Worker change**. Small
+writes (< 512 B) and oversized writes pass through as single frames;
+behaviour is gated by the existing `-surgery` flag along with the rest of
+the evasion bundle.
+
+Honest boundary: this is framing rhythm, not encryption — the fingerprint
+no longer matches a single-frame-per-write VLESS client, but the stream
+is still recognizably WebSocket.
+
 ---
 
 ## 7. Verification

@@ -127,9 +127,15 @@ func MaskKey() [4]byte {
 	return k
 }
 
-// EncodeClientFrame builds a MASKED client frame (FIN set) for one message.
-func EncodeClientFrame(opcode byte, payload []byte, mask [4]byte) []byte {
-	head := []byte{0x80 | (opcode & 0x0f)}
+// EncodeClientFragment builds one MASKED client frame with an explicit FIN
+// bit: fin=false marks an intermediate fragment of a fragmented message
+// (RFC 6455 section 5.4), fin=true the final fragment.
+func EncodeClientFragment(opcode byte, fin bool, payload []byte, mask [4]byte) []byte {
+	b0 := byte(opcode & 0x0f)
+	if fin {
+		b0 |= 0x80
+	}
+	head := []byte{b0}
 	n := len(payload)
 	switch {
 	case n < 126:
@@ -147,6 +153,156 @@ func EncodeClientFrame(opcode byte, payload []byte, mask [4]byte) []byte {
 		out = append(out, b^mask[i%4])
 	}
 	return out
+}
+
+// EncodeClientFrame builds a MASKED client frame (FIN set) for one message.
+func EncodeClientFrame(opcode byte, payload []byte, mask [4]byte) []byte {
+	return EncodeClientFragment(opcode, true, payload, mask)
+}
+
+// ---- 2.18 — WebSocket frame-rhythm fragmentation ----
+//
+// Stock VLESS clients (xray and friends) emit exactly one masked WS frame
+// per application write: a fixed, engine-recognizable frame rhythm. AXR
+// breaks it at the frame layer: each binary message is emitted as 2-4
+// masked continuation frames with per-connection randomized sizes, fresh
+// per-frame masking keys, and small SKEWED inter-frame gaps (bursts of
+// tiny gaps with the occasional longer one — the u^2 shape that real
+// interactive traffic shows). The Worker's WebSocket API reassembles
+// continuation frames natively, so the VLESS payload arrives byte-identical.
+//
+// Honest boundary: this is framing rhythm, not encryption — a passive
+// reader still sees a WebSocket carrying VLESS; the fingerprint just no
+// longer matches a single-frame-per-write VLESS client. Control frames
+// (ping/pong/close) are NEVER fragmented (RFC 6455 section 5.5).
+
+const (
+	// fragMinBytes / fragMaxBytes bound the size of every fragment: small
+	// enough to read as normal app traffic, large enough (up to ~16 KB)
+	// that bulk messages stay fragmentable in 2-4 pieces.
+	fragMinBytes = 256
+	fragMaxBytes = 16384
+	// fragMaxCount caps fragments per message (2..4 keeps the rhythm
+	// organic without pathological fragmentation of large writes).
+	fragMaxCount = 4
+	// fragGapMaxMS bounds the skewed micro-gap between fragments.
+	fragGapMaxMS = 3
+)
+
+// Rng is the random source used for fragment sizes and gaps
+// (math/rand.Float64 style).
+type Rng func() float64
+
+// Fragmenter splits one WS binary message into 2..fragMaxCount masked
+// continuation frames. Deterministic for a given (payload, rng) sequence.
+type Fragmenter struct {
+	rng     Rng
+	min     int
+	max     int
+	maxFrag int
+	gapMin  time.Duration
+	gapMax  time.Duration
+}
+
+// NewFragmenter returns a Fragmenter with the default rhythm: fragments in
+// [256, 16384] bytes, 2-4 per message, skewed 0..3 ms gaps.
+func NewFragmenter(rng Rng) *Fragmenter {
+	return &Fragmenter{
+		rng:     rng,
+		min:     fragMinBytes,
+		max:     fragMaxBytes,
+		maxFrag: fragMaxCount,
+		gapMin:  0,
+		gapMax:  fragGapMaxMS * time.Millisecond,
+	}
+}
+
+// Split returns the per-fragment sizes for a payload of length n: [n]
+// when fragmentation is infeasible (too small, or too large for
+// maxFrag fragments of <= max bytes), otherwise k sizes (kmin <= k <=
+// kmax, k >= 2) that sum to n, each in [min, max]. Deterministic for a
+// given rng sequence.
+func (f *Fragmenter) Split(n int) []int {
+	if f == nil || f.rng == nil || n < f.min*2 {
+		return []int{n}
+	}
+	kmin := (n + f.max - 1) / f.max // fragments needed so each fits <= max
+	if kmin < 2 {
+		kmin = 2
+	}
+	kmax := f.maxFrag
+	if kmax > (n-1)/f.min+1 { // fragments allowed so each can reach min
+		kmax = (n - 1) / f.min + 1
+	}
+	if kmin > kmax {
+		return []int{n}
+	}
+	k := kmin + int(f.rng()*float64(kmax-kmin+1))
+	sizes := make([]int, k)
+	used := 0
+	for i := 0; i < k-1; i++ {
+		remaining := n - used
+		// Later full fragments (>= min) plus a 1-byte tail must still fit.
+		reserve := (k - 2 - i) * f.min + 1
+		hi := f.max
+		if lim := remaining - reserve; lim < hi {
+			hi = lim
+		}
+		// The tail (last fragment) must stay <= max: draw enough now.
+		lo := f.min
+		if need := n - (k-1-i)*f.max - used; need > lo {
+			lo = need
+		}
+		if lo > hi { // defensive: infeasible draw window
+			lo = hi
+		}
+		sz := lo
+		if hi > lo {
+			sz = lo + int(f.rng()*float64(hi-lo+1))
+		}
+		sizes[i] = sz
+		used += sz
+	}
+	sizes[k-1] = n - used
+	return sizes
+}
+
+// gap draws the skewed (u^2) inter-fragment gap in [gapMin, gapMax].
+func (f *Fragmenter) gap() time.Duration {
+	if f.rng == nil || f.gapMax <= f.gapMin {
+		return 0
+	}
+	u := f.rng()
+	return f.gapMin + time.Duration(u*u*float64(f.gapMax-f.gapMin))
+}
+
+// send emits payload as the planned fragment sequence. The first fragment
+// carries the binary opcode with FIN clear; continuations use opcode 0x0;
+// only the last sets FIN. Every frame gets a fresh masking key.
+func (f *Fragmenter) send(c *Client, payload []byte) error {
+	sizes := f.Split(len(payload))
+	if len(sizes) == 1 {
+		return c.SendControl(opBinary, payload)
+	}
+	off := 0
+	last := len(sizes) - 1
+	for i, sz := range sizes {
+		op := opBinary
+		if i > 0 {
+			op = opContinuation
+		}
+		frame := EncodeClientFragment(op, i == last, payload[off:off+sz], MaskKey())
+		if _, err := c.conn.Write(frame); err != nil {
+			return err
+		}
+		off += sz
+		if i < last {
+			if gap := f.gap(); gap > 0 {
+				time.Sleep(gap)
+			}
+		}
+	}
+	return nil
 }
 
 // DecodeServerFrame parses one COMPLETE UNMASKED server frame from buf.
@@ -198,12 +354,17 @@ type DialOptions struct {
 	// WebSocket upgrade (e.g. the surgery package's ChunkConn). The
 	// returned conn must remain a valid net.Conn.
 	AfterTLS func(net.Conn) net.Conn
+	// Fragmenter (2.18) optionally splits each binary message into 2-4
+	// masked continuation frames with randomized sizes and skewed
+	// micro-gaps. nil keeps the classic one-frame-per-write behaviour.
+	Fragmenter *Fragmenter
 }
 
 // Client is an open VLESS-WS tunnel.
 type Client struct {
 	conn net.Conn
 	r    *bufio.Reader
+	frag *Fragmenter // 2.18 — optional frame-rhythm fragmentation
 }
 
 // Dial opens TCP → TLS → WebSocket against the entry and returns the tunnel.
@@ -305,7 +466,7 @@ func DialConn(ctx context.Context, conn net.Conn, opts DialOptions) (*Client, er
 		tconn.Close()
 		return nil, errors.New("vlessws: Sec-WebSocket-Accept mismatch")
 	}
-	return &Client{conn: tconn, r: br}, nil
+	return &Client{conn: tconn, r: br, frag: opts.Fragmenter}, nil
 }
 
 // Close closes the tunnel (best-effort WS close frame first).
@@ -317,8 +478,15 @@ func (c *Client) Close() error {
 // Conn exposes the underlying net.Conn (for surgery wrappers).
 func (c *Client) Conn() net.Conn { return c.conn }
 
-// SendBinary sends one masked binary message.
+// SendBinary sends one masked binary message. With a Fragmenter
+// configured, the message is emitted as 2-4 masked continuation frames
+// (randomized sizes, fresh per-frame masking keys, skewed micro-gaps)
+// instead of a single frame — the VLESS payload the Worker reassembles is
+// byte-identical. Control frames are never fragmented.
 func (c *Client) SendBinary(payload []byte) error {
+	if f := c.frag; f != nil {
+		return f.send(c, payload)
+	}
 	return c.SendControl(opBinary, payload)
 }
 

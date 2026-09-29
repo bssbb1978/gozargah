@@ -1054,11 +1054,19 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 		inner = surgery.NewMultiSplitConnV2(raw, cuts, writes, lo, hi, gapMin, gapMax, s.rngFloat)
 	}
 	surg := s.surgeryOn()
+	var frag *vlessws.Fragmenter
+	if surg {
+		// 2.18 — WS frame-rhythm fragmentation: each binary message rides
+		// as 2-4 masked continuation frames with randomized sizes and
+		// skewed micro-gaps (Worker reassembles natively).
+		frag = vlessws.NewFragmenter(s.rngFloat)
+	}
 	ws, err := vlessws.DialConn(ctx, inner, vlessws.DialOptions{
-		Host:      cand.Endpoint.Host,
-		Path:      s.wsPathFor(cand.Endpoint.Transport),
-		FP:        cand.Endpoint.FP,
-		EarlyData: header, // 0-RTT: VLESS header rides the upgrade
+		Host:       cand.Endpoint.Host,
+		Path:       s.wsPathFor(cand.Endpoint.Transport),
+		FP:         cand.Endpoint.FP,
+		EarlyData:  header, // 0-RTT: VLESS header rides the upgrade
+		Fragmenter: frag,
 		AfterTLS: func(c net.Conn) net.Conn {
 			if surg {
 				// 2.15 — app-class flow morphing (length histogram + IPD).
