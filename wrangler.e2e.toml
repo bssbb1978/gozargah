@@ -1,0 +1,34 @@
+# Local end-to-end test harness (NOT a deployment config).
+#
+# Identical to wrangler.toml except that the [ai] binding is removed: an
+# `AI` binding forces `wrangler dev` into remote mode, which needs a
+# Cloudflare API token and cannot run inside CI or a sandbox. With this file
+# the whole edge runs locally:
+#
+#   npx wrangler dev -c wrangler.e2e.toml --port 8787 --ip 127.0.0.1 --local-protocol https
+#
+# The client side is documented in docs/AXR-V32-BLACKOUT-SURVIVAL.md §4;
+# it needs `port: 8787` and `insecure_skip_verify: true` because the dev
+# server presents a self-signed certificate for localhost.
+#
+name = "gozargah"
+main = "src/index.ts"
+compatibility_date = "2025-01-15"
+
+# ---------------------------------------------------------------
+# D1 database (required for panel persistence: users + settings)
+# Create it once, then paste the returned database_id below:
+#     npx wrangler d1 create gozargah
+# ---------------------------------------------------------------
+[[d1_databases]]
+binding = "GZ_DB"
+database_name = "gozargah"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+
+[observability]
+enabled = true
+
+# Periodic health loop. It probes only endpoints saved in D1 settings.
+[triggers]
+crons = ["*/5 * * * *"]

@@ -1421,8 +1421,11 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 		return res
 	}
 	// The VLESS header travelled as 0-RTT early data in the upgrade, so the
-	// Worker already has it — do NOT resend. Wait for the 2-byte OK.
-	if err := ws.WaitVLESSOK(); err != nil {
+	// Worker already has it — do NOT resend. Wait for the 2-byte OK, but
+	// bounded: DialConn cleared the handshake deadline, so without an
+	// explicit one a silent edge hangs this CONNECT forever instead of
+	// letting the ladder move to the next candidate.
+	if err := ws.WaitVLESSOKUntil(time.Now().Add(s.timeout)); err != nil {
 		ws.Close()
 		res.reason = "vless-ok:" + err.Error()
 		return res

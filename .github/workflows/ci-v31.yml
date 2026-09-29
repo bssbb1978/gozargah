@@ -281,7 +281,7 @@ jobs:
               *) coverage="$coverage $t[build-only]" ;;
             esac
           done
-          cat > dist/gate-attest.json <<JSON
+          cat > "dist/gate-attest-${{ strategy.job-index }}.json" <<JSON
           {
             "leg": "$LEG_OS",
             "declared_native": "$LEG_NATIVE",
@@ -314,7 +314,7 @@ jobs:
             echo ""
             echo "gofmt, go vet, staticcheck, go test -race and the cross-compile all ran unconditionally on this leg."
           } >> "$GITHUB_STEP_SUMMARY"
-          cat dist/gate-attest.json
+          cat "dist/gate-attest-${{ strategy.job-index }}.json"
 
       - name: Upload gate attestation
         # always(): a FAILING leg's coverage declaration is exactly as
@@ -323,7 +323,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: gate-attest-${{ strategy.job-index }}
-          path: client/dist/gate-attest.json
+          path: client/dist/gate-attest-${{ strategy.job-index }}.json
           if-no-files-found: error
           retention-days: 14
 
@@ -499,8 +499,15 @@ jobs:
           cat "$GITHUB_STEP_SUMMARY"
           # 3 Go legs + 1 Worker leg. A green run must account for all of them:
           # a missing attestation means a leg produced no coverage evidence.
+          #
+          # NOTE the attestation FILE names are unique per leg: upload/download
+          # artifacts merge into ONE directory, so three legs all shipping
+          # "gate-attest.json" collapse into a single file and this check can
+          # never be satisfied. That is exactly what happened on the first run
+          # (4 artifacts on the API, 2 files on disk).
           if [ "$count" -lt 4 ]; then
             echo "::error title=incomplete-matrix::expected 4 gate attestations (3 Go legs + worker), found $count"
+            echo "Legs seen: $(jq -r '.leg' attest/*.json 2>/dev/null | tr '\n' ' ')"
             exit 1
           fi
           # Any failing or mismatched leg must be visible here too.

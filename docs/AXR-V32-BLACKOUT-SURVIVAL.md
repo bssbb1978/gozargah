@@ -125,6 +125,64 @@ blackout existed on disk and was unreachable.
 
 ---
 
+### 1.6 CRITICAL — every genuine WebSocket handshake was rejected ("the client never connects")
+
+`expectedAccept` hashed the raw 16 key bytes:
+
+```go
+h.Write(key)                                   // raw bytes — wrong
+h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+```
+
+RFC 6455 §4.2.2 requires `base64(SHA1(base64(key) + GUID))` — the key is
+hashed as the **base64 text that was written to the wire**. The client sent
+`Sec-WebSocket-Key: <base64(key)>` and then demanded
+`SHA1(raw key)` back, a value no conforming server can ever produce. Since
+workerd/Cloudflare *always* sends the correct header, the dial was rejected as
+`Sec-WebSocket-Accept mismatch` on every attempt against every entry: the
+client could never bring up a single tunnel.
+
+Ground truth captured from the real runtime (`wrangler dev`, workerd):
+
+```
+request : Sec-WebSocket-Key: x+wUxPeC3EFrrGbyLDuNyQ==
+response: Sec-WebSocket-Accept: tOF+vOsflyPDt5oaQKZhi9QHIZU=
+client  : expectedAccept = p5AHvpkkU8tlYcl/X68kdx3HXmg=   ← rejected a valid 101
+```
+
+The existing unit test passed only because it fed the *base64 text* as if it
+were the raw key bytes — a path production never takes — so the test and the
+bug agreed with each other and disagreed with the protocol.
+
+**Fix.** `expectedAcceptKeyText` implements the RFC formula over the wire text,
+`DialConn` derives the request and the expected value from the same key text
+(the two can no longer drift apart), and the tests now use two independent
+oracles: the RFC §1.3 vector and the workerd capture above, plus a
+cross-check that the accept the client demands is the RFC formula applied to
+the key its own request carries. Reverting the fix fails all three.
+
+This was the answer to "why doesn't it work": not the evasion stack, the
+fingerprinting, the surgery or the bandit — a one-line hashing bug that
+guaranteed rejection by the edge.
+
+### 1.7 HIGH — the VLESS-OK wait had no deadline, so a silent edge hung the CONNECT forever
+
+`DialConn` sets a handshake deadline and then **clears** it
+(`SetDeadline(time.Time{})`), so after a successful upgrade the socket had no
+deadline at all and `WaitVLESSOK` blocked on a read indefinitely. An edge that
+accepts the upgrade and then goes silent — a wedged worker, a blackholed
+(rather than reset) path, a middlebox that swallows the stream — left the
+SOCKS5 CONNECT hanging with no error and no failover, until the process died.
+Observed live: the client sat in `WaitVLESSOK` for minutes while the
+application waited; a goroutine dump (`SIGQUIT`) showed the exact frame.
+
+**Fix.** `WaitVLESSOKUntil(deadline)` bounds the wait and restores the
+no-deadline state afterwards (the pump owns the deadline from there);
+`attemptTunnel` passes the tunnel budget. The failure is now reported as
+`vless-ok: i/o timeout` and the ladder moves on.
+`TestWaitVLESSOKUntilIsBounded` pins the bound with a `net.Conn` that never
+answers.
+
 ## 2. New capability — Net-e-Melli blackout survival
 
 ### 2.1 Domestic manifest mirror ladder + last-known-good bootstrap
@@ -149,6 +207,24 @@ the documented unverified mode).
 A mirror can *serve* the manifest but never *forge* one: the canonical string
 is unchanged and the HMAC stays keyed by the subscription token
 (`TestManifestMirrorURLKeepsSchemePathAndToken`).
+
+### 2.1b Configurable entry port + explicit TLS escape hatch
+
+Every dial address was pinned to `:443` end to end — the failover ladder, the
+VLESS-WS handshake and the canary probe. That made non-443 edge deployments
+unreachable, and it made any local end-to-end test impossible without binding
+the privileged port 443.
+
+`failover.Endpoint.Port` (0 → 443) now applies to the host address *and* to
+every explicit clean IP; `Config.Port` is the default for every entry and for
+manifest-injected fronting/backup entries, `Entry.Port` overrides it;
+`vlessws.DialOptions.Port` resolves the same way when `DialAddr` is empty; and
+`canaryProbe` takes the port instead of assuming 443. Arm identity stays
+(host, transport, fingerprint) — the port is a connection detail of an entry,
+not a different path shape. `Config.InsecureSkipVerify` finally plumbs the
+`DialOptions.SkipCert` escape hatch that the library always had but the daemon
+could not reach. `buildArms()` is extracted from `newServer` so the resolution
+order is unit-tested without a network.
 
 ### 2.2 The `netemelli` route regime
 
@@ -257,6 +333,26 @@ job consumes them and:
 All four branches were exercised locally (missing leg → exit 1; failing leg →
 exit 1; arch mismatch → exit 1; cancelled → exit 0).
 
+### 3.3b Two real CI defects found by running it
+
+**Line endings.** Gate 1 passed on ubuntu and macos and failed on
+windows-latest with every file flagged. The Windows runner checks out with
+`core.autocrlf=true`, so every Go source became CRLF, and gofmt rewrites line
+endings — a CRLF tree is unformatted by definition. Reproduced in isolation:
+the same file is clean as LF and flagged as CRLF. Fixed with a repository
+`.gitattributes` (`* text=auto eol=lf` plus explicit binary markers), which
+makes the gate platform-independent instead of runner-config-dependent:
+proved by cloning with `core.autocrlf=true` before and after.
+
+**Attestation filenames.** The first full run had all four legs green and the
+consolidated gate red: `expected 4 gate attestations, found 2`, while the
+artifacts API listed four. Cause: all three Go legs shipped a file named
+`gate-attest.json` and `merge-multiple: true` merges into one directory, so
+three files collapsed into one (last writer wins) — the check could never be
+satisfied by construction. Each leg now writes
+`gate-attest-<job-index>.json`; the summary also prints which legs it saw, so
+a future rename fails with the reason instead of a bare count.
+
 ### 3.3 New unconditional gate: `gofmt -l`
 
 The tree carried formatting drift across 17 files (189 reformatted lines).
@@ -284,6 +380,38 @@ readable.
 
 Tests in the Go tree: **155 test functions**, all passing, with the race
 detector, under both TLS identities.
+
+### End-to-end tunnel probe (live, not simulated)
+
+A real client-to-edge handshake was executed against a live worker runtime
+(`wrangler dev`, workerd) using the local harness recipe:
+
+```
+# origin + edge
+python3 -m http.server 8080 --bind 127.0.0.1
+npx wrangler dev -c wrangler.e2e.toml --port 8787 --ip 127.0.0.1 --local-protocol https
+# client (config: port 8787, insecure_skip_verify for the dev certificate)
+axr -config axr.json -socks 127.0.0.1:1081 -v
+curl --socks5-hostname 127.0.0.1:1081 http://127.0.0.1:8080/
+```
+
+Observed, in order:
+
+| stage | before | after |
+|-------|--------|-------|
+| TCP + uTLS to the entry | ok | ok |
+| WebSocket upgrade | 101 received, then **rejected** (`Accept mismatch`) | **101 accepted** (`GET / 101 Switching Protocols` in the workerd log) |
+| VLESS-OK wait | never reached | reached, bounded, reported as `vless-ok: i/o timeout` |
+| ladder behaviour | one hung CONNECT | fails over and reports the reason |
+
+The tunnel does not complete locally, and the reason is not the client: a
+workerd Worker may not `connect()` to a loopback origin (the worker log shows
+the accepted upgrade followed by `Uncaught Error: Network connection lost` and
+no VLESS answer, because the dial target is 127.0.0.1:8080 and the ProxyIP
+fallback is unreachable from this sandbox). A complete end-to-end byte path
+needs a routable origin; what this harness proves is exactly the part that was
+broken — the client's protocol handling up to and including the upgrade, which
+**no production client build could do before this round**.
 
 ### Gate Suite B — Worker
 

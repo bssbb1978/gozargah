@@ -6,7 +6,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net"
+	"os"
+	"sync"
 	"testing"
+	"time"
 )
 
 // newTestClient builds a Client whose frame reader is a canned byte stream —
@@ -128,5 +132,57 @@ func TestExtLenShortHeaderIsShortBuffer(t *testing.T) {
 		t.Fatal("truncated 64-bit length must error")
 	} else if !errors.Is(err, io.EOF) {
 		t.Fatalf("truncated length: got %v, want EOF", err)
+	}
+}
+
+// silentConn accepts writes and never answers reads — an edge that completes
+// the upgrade and then swallows the stream. Without an explicit deadline the
+// VLESS-OK wait blocks forever and the caller's CONNECT hangs with it.
+type silentConn struct {
+	deadline chan struct{}
+	once     sync.Once
+}
+
+func newSilentConn() *silentConn { return &silentConn{deadline: make(chan struct{})} }
+
+func (s *silentConn) Read(b []byte) (int, error) {
+	<-s.deadline
+	return 0, os.ErrDeadlineExceeded
+}
+func (s *silentConn) Write(b []byte) (int, error) { return len(b), nil }
+func (s *silentConn) Close() error                { return nil }
+func (s *silentConn) LocalAddr() net.Addr         { return dummyAddr{} }
+func (s *silentConn) RemoteAddr() net.Addr        { return dummyAddr{} }
+func (s *silentConn) SetDeadline(t time.Time) error {
+	return s.SetReadDeadline(t)
+}
+func (s *silentConn) SetReadDeadline(t time.Time) error {
+	if !t.IsZero() {
+		time.AfterFunc(time.Until(t), func() { s.once.Do(func() { close(s.deadline) }) })
+	}
+	return nil
+}
+func (s *silentConn) SetWriteDeadline(time.Time) error { return nil }
+
+type dummyAddr struct{}
+
+func (dummyAddr) Network() string { return "test" }
+func (dummyAddr) String() string  { return "silent" }
+
+func TestWaitVLESSOKUntilIsBounded(t *testing.T) {
+	sc := newSilentConn()
+	c := &Client{conn: sc, r: bufio.NewReader(sc)}
+
+	start := time.Now()
+	err := c.WaitVLESSOKUntil(time.Now().Add(150 * time.Millisecond))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("a silent edge must not be reported as VLESS-OK")
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("wait was not bounded: %v (err=%v)", elapsed, err)
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("returned before the deadline (%v): deadline plumbing is wrong", elapsed)
 	}
 }

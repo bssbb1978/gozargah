@@ -638,6 +638,9 @@ func DialConn(ctx context.Context, conn net.Conn, opts DialOptions) (*Client, er
 		}
 		ed = v
 	}
+	// The accept value is derived from the exact key text the request
+	// carries, so the two can never drift apart again.
+	keyText := base64.StdEncoding.EncodeToString(key)
 	req := buildUpgradeRequest(opts.Host, opts.Path, key, ed, opts.Upgrade)
 	if _, err := tconn.Write([]byte(req)); err != nil {
 		tconn.Close()
@@ -653,7 +656,7 @@ func DialConn(ctx context.Context, conn net.Conn, opts DialOptions) (*Client, er
 		tconn.Close()
 		return nil, fmt.Errorf("vlessws: websocket upgrade rejected (HTTP %d)", code)
 	}
-	accept := expectedAccept(key)
+	accept := expectedAcceptKeyText(keyText)
 	if got, err := readUpgradeHeader(br, "Sec-WebSocket-Accept"); err != nil {
 		// Absence of the accept header is tolerated for compatibility;
 		// presence with a wrong value is not.
@@ -725,6 +728,23 @@ func (c *Client) RecvBinary() ([]byte, error) {
 }
 
 // WaitVLESSOK reads the 2-byte VLESS response and verifies success.
+// WaitVLESSOKUntil is WaitVLESSOK bounded by a deadline.
+//
+// DialConn sets a handshake deadline and then CLEARS it
+// (SetDeadline(time.Time{})), so after a successful upgrade the socket has no
+// deadline at all. An edge that accepts the upgrade and then goes silent — a
+// wedged worker, a blackholed (rather than reset) path, a middlebox that
+// swallows the stream — would leave WaitVLESSOK blocked on a read until the
+// process dies, and with it the client's SOCKS5 CONNECT: the application
+// hangs with no error instead of failing over. This bounds that wait and
+// restores the connection to its previous (no-deadline) state afterwards,
+// because the tunnel pump owns the deadline from here on.
+func (c *Client) WaitVLESSOKUntil(deadline time.Time) error {
+	_ = c.conn.SetReadDeadline(deadline)
+	defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
+	return c.WaitVLESSOK()
+}
+
 func (c *Client) WaitVLESSOK() error {
 	frame, err := c.RecvBinary()
 	if err != nil {
@@ -863,9 +883,29 @@ func readUpgradeHeader(r *bufio.Reader, name string) (string, error) {
 	}
 }
 
+// wsAcceptGUID is the RFC 6455 §4.2.2 handshake constant.
+const wsAcceptGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// expectedAccept computes the Sec-WebSocket-Accept value for a client key:
+//
+//	base64( SHA1( base64(key) + GUID ) )
+//
+// The key is hashed as the BASE64 TEXT that was written to the wire, never
+// as its raw 16 bytes. Hashing the raw bytes yields a value that no
+// conforming server ever returns, which is exactly what happened before
+// 2.21: the client sent base64(key) but demanded SHA1(raw key) back, so
+// every genuine 101 from the Cloudflare edge — workerd always emits the
+// header — was rejected as "Sec-WebSocket-Accept mismatch" and no tunnel
+// could ever come up. DialConn now derives both the request line and this
+// expected value from the same base64 text.
 func expectedAccept(key []byte) string {
+	return expectedAcceptKeyText(base64.StdEncoding.EncodeToString(key))
+}
+
+// expectedAcceptKeyText is expectedAccept for an already-encoded key text.
+func expectedAcceptKeyText(keyB64 string) string {
 	h := sha1.New()
-	h.Write(key)
-	h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	h.Write([]byte(keyB64))
+	h.Write([]byte(wsAcceptGUID))
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
