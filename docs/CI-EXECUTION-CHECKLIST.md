@@ -113,3 +113,30 @@ npx tsc --noEmit && npm run test:engine && npm run test:integration && npx wrang
   `go test -race` 0 races, all cross-targets build, tsc 0, all worker
   suites green. A release is tagged only when every gate is green on
   every matrix leg.
+
+## Status — first zero-defect run
+
+2026-09-29 — run `36607264293` (commit `2884e2d`): **all 4 jobs green** —
+ubuntu (linux/amd64 + linux/arm64 + android/arm64), macOS (darwin/arm64 +
+darwin/amd64), Windows (windows/amd64), Worker (Node 22: tsc 0, engine
+15/15, vitest 22/22, wrangler dry-run bundle). Gates 1–4 report zero
+warnings / zero staticcheck findings / zero races on all native legs;
+cross-compiles stripped; Android NDK r26b CGO path verified.
+
+Healing history (protocol: trigger via push → `gh` monitor → classify
+Case A race / B toolchain / C build-tag / D worker → fix → re-push):
+
+| Run | Commit | Defects healed |
+|-----|--------|----------------|
+| 36599802851 | — | baseline (workflow + go.sum reconstruction) |
+| 36602909760 | `0012877` | first compile layer (RawConn.Control signatures, test types) |
+| 36603841759 | `0012877`→ | (superseded by next push) |
+| 36604609636 | `3f8e85f` | second compile layer (Mask.Size, int consts, syscall.Handle, go.mod indirects, bandit expectations) |
+| 36605075166 | `c0a8c86` | cfscan data race (fake prober mutex), SkewGap clamp, surgery recorder determinism, VLESS header indices, ProbeJitterMS literal |
+| 36606232201 | `8839637` | staticcheck U1000 (feedSeq), EncodeClientFrame 16/64-bit header bug, RFC 6455 accept constant, TopN sink assertion |
+| 36606829638 | `2884e2d` | 16-bit length index in round-trip test ([2:4] per RFC) |
+| 36607264293 | `2884e2d` | **GREEN — zero defects** |
+
+Remaining annotations are GitHub-platform notices only (Node 20
+deprecation of actions, ubuntu-26 migration, macOS capacity) — none are
+repo warnings or failures.
