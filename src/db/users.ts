@@ -54,13 +54,15 @@ export function invalidateUsers(): void {
   listCache = null;
 }
 
+export async function listUsersFresh(db: D1Database): Promise<GzUser[]> {
+  await ensureSchema(db);
+  const res = await db.prepare('SELECT * FROM users ORDER BY is_admin DESC, id ASC').all<UserRow>();
+  return (res.results ?? []).map(toUser);
+}
+
 export function listUsers(db: D1Database): Promise<GzUser[]> {
   if (listCache && Date.now() - listCache.at < DEFAULTS.cacheTtlMs) return listCache.promise;
-  const p = (async () => {
-    await ensureSchema(db);
-    const res = await db.prepare('SELECT * FROM users ORDER BY is_admin DESC, id ASC').all<UserRow>();
-    return (res.results ?? []).map(toUser);
-  })();
+  const p = listUsersFresh(db);
   listCache = { at: Date.now(), promise: p };
   p.catch(() => { listCache = null; });
   return p;
@@ -171,14 +173,34 @@ export async function lazyMaintenance(db: D1Database, u: GzUser, cycle: ResetCyc
 
 /* ------------------------------ CRUD ------------------------------ */
 
+export interface UserAuditMutation {
+  actorUserId: number;
+  action: 'user_created' | 'user_updated' | 'user_enabled' | 'user_disabled' | 'user_deleted';
+  details: Record<string, unknown>;
+  at?: number;
+}
+
+function auditDetailsJson(audit: UserAuditMutation): string {
+  const encoded = JSON.stringify(audit.details);
+  if (encoded.length > 4096) throw new Error('user audit details exceed the size limit');
+  return encoded;
+}
+
+function auditForExistingUser(db: D1Database, id: number, audit: UserAuditMutation): D1PreparedStatement {
+  return db.prepare(
+    'INSERT INTO user_control_audit(actor_user_id,target_user_id,action,details_json,created_at) ' +
+    'SELECT ?1,id,?3,?4,?5 FROM users WHERE id=?2 AND is_admin=0',
+  ).bind(audit.actorUserId, id, audit.action, auditDetailsJson(audit), audit.at ?? Date.now());
+}
+
 export interface NewUser { name: string; quotaBytes: number; expiryAt: number; expiryDays?: number; isAdmin?: boolean; uuid?: string; trojanPass?: string; }
 
-export async function createUser(db: D1Database, data: NewUser): Promise<GzUser> {
+export async function createUser(db: D1Database, data: NewUser, audit?: UserAuditMutation): Promise<GzUser> {
   await ensureSchema(db);
   const now = Date.now();
   const uuid = data.uuid ?? crypto.randomUUID();
   const trojanPass = data.trojanPass ?? randomPass();
-  const res = await db
+  const insert = db
     .prepare(
       'INSERT INTO users (name, uuid, trojan_pass, quota_bytes, expiry_at, expiry_days, enabled, is_admin, created_at) ' +
       'VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)',
@@ -192,8 +214,16 @@ export async function createUser(db: D1Database, data: NewUser): Promise<GzUser>
       Math.max(0, Math.floor(data.expiryDays ?? 0)),
       data.isAdmin ? 1 : 0,
       now,
-    )
-    .run();
+    );
+  const res = audit
+    ? (await db.batch([
+        insert,
+        db.prepare(
+          'INSERT INTO user_control_audit(actor_user_id,target_user_id,action,details_json,created_at) ' +
+          'SELECT ?1,id,?3,?4,?5 FROM users WHERE uuid=?2 AND is_admin=0',
+        ).bind(audit.actorUserId, uuid, audit.action, auditDetailsJson(audit), audit.at ?? now),
+      ]))[0]
+    : await insert.run();
   invalidateUsers();
   const id = res.meta.last_row_id as number;
   return {
@@ -210,7 +240,7 @@ export interface UserPatch {
   usedUp?: number; usedDown?: number; uuid?: string; trojanPass?: string; resetUsage?: boolean;
 }
 
-export async function updateUser(db: D1Database, id: number, patch: UserPatch): Promise<void> {
+export async function updateUser(db: D1Database, id: number, patch: UserPatch, audit?: UserAuditMutation): Promise<void> {
   await ensureSchema(db);
   const sets: string[] = [];
   const vals: Array<string | number> = [];
@@ -231,13 +261,21 @@ export async function updateUser(db: D1Database, id: number, patch: UserPatch): 
   if (patch.trojanPass !== undefined) { sets.push('trojan_pass = ?' + (sets.length + 1)); vals.push(patch.trojanPass); }
   if (!sets.length) return;
   vals.push(id);
-  await db.prepare('UPDATE users SET ' + sets.join(', ') + ' WHERE id = ?' + (sets.length + 1)).bind(...vals).run();
+  const update = db.prepare('UPDATE users SET ' + sets.join(', ') + ' WHERE id = ?' + (sets.length + 1) + ' AND is_admin = 0').bind(...vals);
+  if (audit) {
+    const results = await db.batch([auditForExistingUser(db, id, audit), update]);
+    if (results[1].meta.changes === 0) return;
+  } else {
+    await update.run();
+  }
   invalidateUsers();
 }
 
-export async function deleteUser(db: D1Database, id: number): Promise<void> {
+export async function deleteUser(db: D1Database, id: number, audit?: UserAuditMutation): Promise<void> {
   await ensureSchema(db);
-  await db.prepare('DELETE FROM users WHERE id = ?1 AND is_admin = 0').bind(id).run();
+  const deletion = db.prepare('DELETE FROM users WHERE id = ?1 AND is_admin = 0').bind(id);
+  if (audit) await db.batch([auditForExistingUser(db, id, audit), deletion]);
+  else await deletion.run();
   invalidateUsers();
 }
 

@@ -10,7 +10,7 @@
  */
 
 import { toBase64 } from './utils/crypto';
-import { GzUser, listUsers } from './db/users';
+import { GzUser, listUsersFresh } from './db/users';
 import { loadAdaptiveGuardState, loadAdaptiveModel, loadCanaryState, loadCleanIPHarvest, loadNetworkState, loadPathHealth, loadPolicySignalState, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState } from './db/store';
 import { decideResilience, type PathObservation } from './ai/resilience';
 import { assessPressure, canaryEvidence } from './ai/pressure';
@@ -580,7 +580,7 @@ export async function subTokenFor(host: string, uuid: string): Promise<string> {
 
 /** Resolve a subscription token to its user (admin included). */
 export async function findUserByToken(db: D1Database, host: string, token: string): Promise<GzUser | null> {
-  const users = await listUsers(db);
+  const users = await listUsersFresh(db);
   for (const u of users) {
     if ((await subTokenFor(host, u.uuid)) === token) return u;
   }

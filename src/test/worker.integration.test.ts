@@ -3,7 +3,7 @@ import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
 import type { D1Database } from '@cloudflare/workers-types';
 import { VERSION } from '../config';
-import { createUser, getUserByIdFresh, recordUsageDelta } from '../db/users';
+import { createUser, getUserByIdFresh, isUserAllowed, recordUsageDelta, updateUser } from '../db/users';
 import { consumeAiDiagnosticQuota, consumeDnsQueryQuota, loadHealthSamples, loadLatestPathSamples, saveHealthSample } from '../db/store';
 import { subTokenFor } from '../subscription';
 import { createDiagnostics, getAiModelCandidates, rankCatalogModels } from '../ai/diagnostics';
@@ -185,6 +185,75 @@ describe('Cloudflare Worker + D1 integration', () => {
     await post(301, String(admin!.id));
     const unchanged = await db.prepare('SELECT enabled FROM users WHERE id = ?1').bind(admin!.id).first<{ enabled: number }>();
     expect(unchanged?.enabled).toBe(1);
+  });
+
+  it('audits authenticated per-user controls, isolates accounts, and rate limits admin routes', async () => {
+    const base = 'https://gozargah.test/gozargah/api';
+    const userA = await createUser(db, { name: 'Control A', quotaBytes: 0, expiryAt: 0 });
+    const userB = await createUser(db, { name: 'Control B', quotaBytes: 0, expiryAt: 0 });
+    await expect(updateUser(db, userB.id, { enabled: false }, {
+      actorUserId: 0, action: 'user_disabled', details: { enabled: false },
+    })).rejects.toThrow();
+    expect((await getUserByIdFresh(db, userB.id))?.enabled).toBe(true);
+    const unauthenticated = await mf.dispatchFetch(base + '/users/' + userA.id, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: false }),
+    });
+    expect(unauthenticated.status).toBe(401);
+
+    const login = await mf.dispatchFetch(base + '/login', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin' }),
+    });
+    expect(login.status).toBe(200);
+    const cookie = login.headers.get('set-cookie')?.split(';', 1)[0];
+    expect(cookie).toMatch(/^gz_session=/);
+    const adminId = await db.prepare('SELECT id FROM users WHERE is_admin=1 ORDER BY id LIMIT 1').first<{ id: number }>();
+    expect(adminId).not.toBeNull();
+    const adminCall = (path: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) => {
+      const headers = {
+        ...(init.headers ?? {}),
+        cookie: cookie!,
+        'cf-connecting-ip': '198.51.100.77',
+      };
+      return mf.dispatchFetch(base + path, { ...init, headers });
+    };
+
+    const expires = Date.now() + 5 * 86_400_000;
+    const changed = await adminCall('/users/' + userA.id, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: false, quotaGB: 3, expiryAt: expires }),
+    });
+    expect(changed.status).toBe(200);
+    const freshA = await getUserByIdFresh(db, userA.id);
+    const freshB = await getUserByIdFresh(db, userB.id);
+    expect(freshA).toMatchObject({ enabled: false, quotaBytes: 3 * 1024 ** 3, expiryAt: expires });
+    expect(isUserAllowed(freshA!).reason).toBe('disabled');
+    expect(freshB?.enabled).toBe(true);
+    expect(isUserAllowed(freshB!).ok).toBe(true);
+    const disabledToken = await subTokenFor('gozargah.test', userA.uuid);
+    const disabledSubscription = await mf.dispatchFetch('https://gozargah.test/sub/' + disabledToken);
+    const disabledBody = await disabledSubscription.text();
+    expect(disabledBody).not.toContain(userA.uuid);
+    expect(disabledBody).not.toContain(userA.trojanPass);
+
+    const auditResponse = await adminCall('/user-audit?limit=20');
+    expect(auditResponse.status).toBe(200);
+    const auditBody = await auditResponse.json() as { events: Array<Record<string, unknown>> };
+    const entry = auditBody.events.find((event) => event.targetUserId === userA.id);
+    expect(entry).toMatchObject({
+      actorUserId: adminId!.id,
+      targetUserId: userA.id,
+      action: 'user_disabled',
+      details: { enabled: false, quotaBytes: 3 * 1024 ** 3, expiryAt: expires },
+    });
+    expect(JSON.stringify(entry)).not.toContain(userA.uuid);
+    expect(JSON.stringify(entry)).not.toContain(userA.trojanPass);
+
+    // The successful PATCH and audit read used two of the 30 requests/minute.
+    for (let i = 0; i < 28; i++) expect((await adminCall('/user-audit?limit=1')).status).toBe(200);
+    const limited = await adminCall('/user-audit?limit=1');
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get('retry-after')).toBe('60');
   });
 
   it('keeps probe-source telemetry bounded and loads latest samples per source without schema migration', async () => {

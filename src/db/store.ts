@@ -85,6 +85,30 @@ const DDL = [
      count INTEGER NOT NULL,
      window_start INTEGER NOT NULL
    )`,
+  `CREATE TABLE IF NOT EXISTS user_control_throttle (
+     ip_hash TEXT PRIMARY KEY,
+     count INTEGER NOT NULL CHECK (count >= 0),
+     window_start INTEGER NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS user_control_audit (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     actor_user_id INTEGER NOT NULL CHECK (actor_user_id > 0),
+     target_user_id INTEGER NOT NULL CHECK (target_user_id > 0),
+     action TEXT NOT NULL CHECK (action IN ('user_created', 'user_updated', 'user_enabled', 'user_disabled', 'user_deleted')),
+     details_json TEXT NOT NULL CHECK (json_valid(details_json)),
+     created_at INTEGER NOT NULL CHECK (created_at > 0)
+   )`,
+  'CREATE INDEX IF NOT EXISTS idx_user_control_audit_target ON user_control_audit(target_user_id, id DESC)',
+  `CREATE TRIGGER IF NOT EXISTS user_control_audit_no_update
+   BEFORE UPDATE ON user_control_audit
+   BEGIN
+     SELECT RAISE(ABORT, 'user control audit is append-only');
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS user_control_audit_no_delete
+   BEFORE DELETE ON user_control_audit
+   BEGIN
+     SELECT RAISE(ABORT, 'user control audit is append-only');
+   END`,
   `CREATE TABLE IF NOT EXISTS profile_health (
      profile_id TEXT PRIMARY KEY,
      latency_ms INTEGER,
@@ -371,6 +395,56 @@ export async function consumeDnsQueryQuota(
     'WHERE dns_throttle.window_start <= ?3 OR dns_throttle.count < ?4 RETURNING count',
   ).bind(userId, now, now - windowMs, limit).first<{ count: number }>();
   return row !== null;
+}
+
+/** Atomic authenticated-admin request budget (30 user-control calls/minute/IP). */
+export async function consumeUserControlQuota(
+  db: D1Database,
+  ipHash: string,
+  now = Date.now(),
+  limit = 30,
+  windowMs = 60_000,
+): Promise<boolean> {
+  if (!ipHash || !Number.isSafeInteger(now) || !Number.isInteger(limit) || limit < 1 || !Number.isInteger(windowMs) || windowMs < 1) return false;
+  await ensureSchema(db);
+  const row = await db.prepare(
+    'INSERT INTO user_control_throttle (ip_hash, window_start, count) VALUES (?1, ?2, 1) ' +
+    'ON CONFLICT(ip_hash) DO UPDATE SET ' +
+    'count = CASE WHEN user_control_throttle.window_start <= ?3 THEN 1 ELSE user_control_throttle.count + 1 END, ' +
+    'window_start = CASE WHEN user_control_throttle.window_start <= ?3 THEN ?2 ELSE user_control_throttle.window_start END ' +
+    'WHERE user_control_throttle.window_start <= ?3 OR user_control_throttle.count < ?4 RETURNING count',
+  ).bind(ipHash, now, now - windowMs, limit).first<{ count: number }>();
+  return row !== null;
+}
+
+export interface UserControlAuditEntry {
+  id: number;
+  actorUserId: number;
+  targetUserId: number;
+  action: 'user_created' | 'user_updated' | 'user_enabled' | 'user_disabled' | 'user_deleted';
+  details: Record<string, unknown>;
+  createdAt: number;
+}
+
+export async function loadUserControlAudit(db: D1Database, limit = 50, beforeId = 0): Promise<UserControlAuditEntry[]> {
+  await ensureSchema(db);
+  const n = Math.max(1, Math.min(100, Math.floor(limit)));
+  const before = Number.isSafeInteger(beforeId) && beforeId > 0 ? beforeId : Number.MAX_SAFE_INTEGER;
+  const rows = await db.prepare(
+    'SELECT id, actor_user_id, target_user_id, action, details_json, created_at ' +
+    'FROM user_control_audit WHERE id < ?1 ORDER BY id DESC LIMIT ?2',
+  ).bind(before, n).all<{
+    id: number; actor_user_id: number; target_user_id: number;
+    action: UserControlAuditEntry['action']; details_json: string; created_at: number;
+  }>();
+  return (rows.results ?? []).map((row) => ({
+    id: row.id,
+    actorUserId: row.actor_user_id,
+    targetUserId: row.target_user_id,
+    action: row.action,
+    details: JSON.parse(row.details_json) as Record<string, unknown>,
+    createdAt: row.created_at,
+  }));
 }
 
 export async function clearLoginThrottle(db: D1Database, ipHash: string): Promise<void> {

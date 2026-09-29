@@ -1,7 +1,8 @@
 /** Optional, allowlisted Telegram administration with D1-backed conversation state. */
 import type { Env } from './config';
-import { addEvent, ensureSchema } from './db/store';
-import { updateUser } from './db/users';
+import { addEvent, consumeUserControlQuota, ensureSchema } from './db/store';
+import { getAdminUser, updateUser } from './db/users';
+import { sha256Hex } from './utils/crypto';
 
 interface TelegramMessage {
   message_id?: number;
@@ -50,6 +51,12 @@ export async function handleTelegramWebhook(request: Request, env: Env): Promise
     const inserted = await db.prepare('INSERT OR IGNORE INTO telegram_updates (update_id, processed_at) VALUES (?1, ?2)')
       .bind(update.update_id!, Date.now()).run();
     if (inserted.meta.changes !== 1) return json({ ok: true, duplicate: true });
+    const actorKey = await sha256Hex('telegram-admin:' + senderId);
+    if (!(await consumeUserControlQuota(db, actorKey))) {
+      // Keep the dedupe marker: retries of a throttled update must not apply later.
+      await db.prepare('DELETE FROM telegram_updates WHERE processed_at < ?1').bind(Date.now() - 7 * 86_400_000).run();
+      return json({ ok: true, rateLimited: true });
+    }
     await processMessage(db, env, token, chatId!, message?.text ?? '');
     // Telegram retries should not make the update execute a second time.
     await db.prepare('DELETE FROM telegram_updates WHERE processed_at < ?1').bind(Date.now() - 7 * 86_400_000).run();
@@ -84,7 +91,13 @@ async function processMessage(db: D1Database, env: Env, token: string, chatId: n
         return;
       }
       const enabled = state.state === 'awaiting_enable_id';
-      await updateUser(db, id, { enabled });
+      const admin = await getAdminUser(db);
+      if (!admin?.isAdmin) throw new Error('admin account unavailable');
+      await updateUser(db, id, { enabled }, {
+        actorUserId: admin.id,
+        action: enabled ? 'user_enabled' : 'user_disabled',
+        details: { enabled, actorChannel: 'telegram', actorTelegramId: chatId },
+      });
       await db.prepare('DELETE FROM telegram_fsm WHERE chat_id = ?1').bind(String(chatId)).run();
       await addEvent(db, enabled ? 'telegram_user_enabled' : 'telegram_user_disabled', 'id=' + id);
       await sendTelegram(env, token, chatId, `کاربر ${row.name} (#${id}) ${enabled ? 'فعال' : 'غیرفعال'} شد.`);

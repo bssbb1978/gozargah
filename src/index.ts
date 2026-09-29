@@ -19,7 +19,7 @@ import { getEffectiveSettings } from './settings';
 import { acceptWebSocket } from './handlers/websocket';
 import { buildAxrManifest, buildLiveAdaptiveClientBundle, findUserByToken, renderSub, resolveApp, subHeaders } from './subscription';
 import { resolveOpts } from './sub/operators';
-import { lazyMaintenance } from './db/users';
+import { isUserAllowed, lazyMaintenance } from './db/users';
 import { loadNetworkState } from './db/store';
 import { handlePanelApi } from './panel/api';
 import { panelHtml } from './panel/ui';
@@ -102,7 +102,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const token = segs[0] ?? '';
     const appOverride = (segs[1] ?? url.searchParams.get('app') ?? '');
     const user = await findUserByToken(env.GZ_DB, url.hostname, token);
-    if (user) {
+    // Subscription tokens are authorization credentials too: a disable, expiry,
+    // or exhausted quota must stop new config issuance from this fresh D1 read.
+    if (user && isUserAllowed(user).ok) {
       if (segs.length === 2 && segs[1] === 'dns-query') return handleUserDnsRequest(request, env, user);
       const opts = resolveOpts(url.searchParams.get('op'), url.searchParams.get('ech'));
       const lang = url.searchParams.get('lang') === 'en' ? 'en' : 'fa';

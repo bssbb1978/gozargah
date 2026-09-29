@@ -8,10 +8,11 @@ import { Env, GzError, VERSION } from '../config';
 import { EffectiveSettings } from '../settings';
 import {
   addEvent, recentEvents, saveSettings, SettingsBlob, loadSettings, invalidateCache,
-  consumeAiDiagnosticQuota, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState, saveHealthSample, loadLatestPathSamples, loadPredictiveStates, loadCleanIPHarvest, saveCleanIPHarvest, appendCanaryResult,
+  consumeAiDiagnosticQuota, consumeUserControlQuota, loadUserControlAudit, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState, saveHealthSample, loadLatestPathSamples, loadPredictiveStates, loadCleanIPHarvest, saveCleanIPHarvest, appendCanaryResult,
 } from '../db/store';
 import {
-  createUser, deleteUser, GzUser, invalidateUsers, listUsers, updateUser, flushUsage,
+  createUser, deleteUser, getAdminUser, getUserByIdFresh, GzUser, invalidateUsers, listUsersFresh, updateUser, flushUsage,
+  type UserAuditMutation, type UserPatch,
 } from '../db/users';
 import {
   checkLoginGate, clearedCookie, ipHash, isAuthed, makeSessionToken, onLoginResult,
@@ -49,6 +50,14 @@ function publicUser(u: GzUser): Record<string, unknown> {
     enabled: u.enabled, isAdmin: u.isAdmin,
     createdAt: u.createdAt, lastSeen: u.lastSeen,
   };
+}
+
+async function adminActorId(db: D1Database): Promise<number> {
+  // Panel sessions are signed from the single configured panel-admin password;
+  // resolve its stable D1 user id for an attributable audit entry.
+  const admin = await getAdminUser(db);
+  if (!admin?.isAdmin) throw new GzError('admin account unavailable', 'no_db');
+  return admin.id;
 }
 
 export async function handlePanelApi(
@@ -159,6 +168,14 @@ export async function handlePanelApi(
     }
 
     await requireAuth(request, eff);
+
+    const userControlRoute = action === 'users' || action.startsWith('users/') || action === 'user-audit';
+    if (userControlRoute && ['GET', 'POST', 'PATCH', 'DELETE'].includes(method)) {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      if (!(await consumeUserControlQuota(db, await ipHash(request)))) {
+        return json({ error: 'admin_rate_limited' }, 429, new Headers({ 'retry-after': '60' }));
+      }
+    }
 
     if (action === 'me' && method === 'GET') {
       return json({ ok: true, version: VERSION, dbOk: eff.dbOk, isDefaultPassword: eff.isDefaultPassword });
@@ -473,7 +490,7 @@ export async function handlePanelApi(
 
     if (action === 'users' && method === 'GET') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
-      const users = await listUsers(db);
+      const users = await listUsersFresh(db);
       const withTokens = [] as Array<Record<string, unknown>>;
       const host = new URL(request.url).hostname;
       for (const u of users) {
@@ -490,11 +507,17 @@ export async function handlePanelApi(
       const quotaGB = Number(body.quotaGB ?? 0);
       if (!Number.isFinite(quotaGB) || quotaGB < 0 || quotaGB > 1024 * 100) throw new GzError('invalid quotaGB', 'validation');
       const expiryAt = Number(body.expiryAt ?? 0);
-      if (!Number.isFinite(expiryAt) || expiryAt < 0) throw new GzError('invalid expiryAt', 'validation');
+      if (!Number.isSafeInteger(expiryAt) || expiryAt < 0) throw new GzError('invalid expiryAt', 'validation');
       const expiryDays = Number(body.expiryDays ?? 0);
-      if (!Number.isFinite(expiryDays) || expiryDays < 0 || expiryDays > 3650) throw new GzError('invalid expiryDays', 'validation');
-      const u = await createUser(db, { name, quotaBytes: Math.round(quotaGB * 1024 ** 3), expiryAt, expiryDays });
-      await addEvent(db, 'user_created', name);
+      if (!Number.isSafeInteger(expiryDays) || expiryDays < 0 || expiryDays > 3650) throw new GzError('invalid expiryDays', 'validation');
+      const quotaBytes = Math.round(quotaGB * 1024 ** 3);
+      const actorUserId = await adminActorId(db);
+      const audit: UserAuditMutation = {
+        actorUserId,
+        action: 'user_created',
+        details: { name, quotaBytes, expiryAt, expiryDays },
+      };
+      const u = await createUser(db, { name, quotaBytes, expiryAt, expiryDays }, audit);
       return json({ user: publicUser(u) }, 201);
     }
 
@@ -503,45 +526,79 @@ export async function handlePanelApi(
       if (!db) throw new GzError('database_not_bound', 'no_db');
       const id = Number(userMatch[1]);
       if (method === 'PATCH') {
+        const before = await getUserByIdFresh(db, id);
+        if (!before || before.isAdmin) throw new GzError('user not found', 'not_found');
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-        const patch: Record<string, unknown> = {};
-        if (typeof body.name === 'string') {
+        const patch: UserPatch = {};
+        const details: Record<string, unknown> = {};
+        if (body.name !== undefined) {
+          if (typeof body.name !== 'string') throw new GzError('invalid name', 'validation');
           const n = body.name.trim().slice(0, 32);
           if (!/^[\w\u0600-\u06FF .-]{1,32}$/.test(n)) throw new GzError('invalid name', 'validation');
           patch.name = n;
+          details.name = n;
         }
         if (body.quotaGB !== undefined) {
           const q = Number(body.quotaGB);
-          if (!Number.isFinite(q) || q < 0) throw new GzError('invalid quotaGB', 'validation');
+          if (!Number.isFinite(q) || q < 0 || q > 1024 * 100) throw new GzError('invalid quotaGB', 'validation');
           patch.quotaBytes = Math.round(q * 1024 ** 3);
+          details.quotaBytes = patch.quotaBytes;
         }
         if (body.expiryAt !== undefined) {
           const x = Number(body.expiryAt);
-          if (!Number.isFinite(x) || x < 0) throw new GzError('invalid expiryAt', 'validation');
+          if (!Number.isSafeInteger(x) || x < 0) throw new GzError('invalid expiryAt', 'validation');
           patch.expiryAt = x;
+          details.expiryAt = x;
         }
         if (body.expiryDays !== undefined) {
           const d = Number(body.expiryDays);
-          if (!Number.isFinite(d) || d < 0 || d > 3650) throw new GzError('invalid expiryDays', 'validation');
+          if (!Number.isSafeInteger(d) || d < 0 || d > 3650) throw new GzError('invalid expiryDays', 'validation');
           patch.expiryDays = d;
-          if (d > 0) patch.expiryAt = 0; // modes are mutually exclusive
+          details.expiryDays = d;
+          if (d > 0) {
+            patch.expiryAt = 0; // first-use and absolute expiry modes are mutually exclusive
+            details.expiryAt = 0;
+          }
         }
-        if (body.enabled !== undefined) patch.enabled = !!body.enabled;
-        if (body.resetUsage === true) { patch.resetUsage = true; patch.usedUp = 0; patch.usedDown = 0; }
+        if (body.enabled !== undefined) {
+          if (typeof body.enabled !== 'boolean') throw new GzError('enabled must be boolean', 'validation');
+          patch.enabled = body.enabled;
+          details.enabled = body.enabled;
+        }
+        if (body.resetUsage === true) {
+          patch.resetUsage = true;
+          patch.usedUp = 0;
+          patch.usedDown = 0;
+          details.resetUsage = true;
+        }
         if (body.rotateCredentials === true) {
-          const u = (await listUsers(db)).find((x) => x.id === id);
-          if (u?.isAdmin) throw new GzError('cannot rotate admin credentials (reset D1 instead)', 'validation');
           patch.uuid = crypto.randomUUID();
           patch.trojanPass = randomHex(12);
+          // Never write credential values to the audit record.
+          details.credentialsRotated = true;
         }
-        await updateUser(db, id, patch);
+        if (Object.keys(patch).length === 0) return json({ ok: true, unchanged: true });
+        const actionName = patch.enabled === true
+          ? 'user_enabled'
+          : patch.enabled === false ? 'user_disabled' : 'user_updated';
+        const audit: UserAuditMutation = {
+          actorUserId: await adminActorId(db),
+          action: actionName,
+          details,
+        };
+        await updateUser(db, id, patch, audit);
         if (patch.usedUp !== undefined || patch.usedDown !== undefined) await flushUsage(db);
-        await addEvent(db, 'user_updated', 'id=' + id);
+        invalidateUsers();
         return json({ ok: true });
       }
       if (method === 'DELETE') {
-        await deleteUser(db, id); // admin rows protected in SQL
-        await addEvent(db, 'user_deleted', 'id=' + id);
+        const target = await getUserByIdFresh(db, id);
+        if (!target || target.isAdmin) throw new GzError('user not found', 'not_found');
+        await deleteUser(db, id, {
+          actorUserId: await adminActorId(db),
+          action: 'user_deleted',
+          details: { deleted: true },
+        });
         return json({ ok: true });
       }
     }
@@ -550,7 +607,7 @@ export async function handlePanelApi(
     if (linksMatch && method === 'GET') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
       const id = Number(linksMatch[1]);
-      const u = (await listUsers(db)).find((x) => x.id === id);
+      const u = await getUserByIdFresh(db, id);
       if (!u) throw new GzError('user not found', 'not_found');
       const host = new URL(request.url).hostname;
       const links = buildLinks(host, u, null);
@@ -575,6 +632,20 @@ export async function handlePanelApi(
       catch { throw new GzError('invalid qr payload', 'validation'); }
       if (!text || text.length > 512) throw new GzError('invalid qr payload', 'validation');
       return json({ svg: await qrSvg(text, 230) });
+    }
+
+    if (action === 'user-audit' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const query = new URL(request.url).searchParams;
+      const rawLimit = query.get('limit');
+      const rawBefore = query.get('before');
+      const limit = rawLimit === null ? 50 : Number(rawLimit);
+      const before = rawBefore === null ? 0 : Number(rawBefore);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
+          !Number.isSafeInteger(before) || before < 0) {
+        throw new GzError('invalid audit pagination', 'validation');
+      }
+      return json({ events: await loadUserControlAudit(db, limit, before) });
     }
 
     if (action === 'events' && method === 'GET') {
@@ -640,6 +711,9 @@ export async function handlePanelApi(
     }
     if (e instanceof GzError && e.code === 'validation') {
       return json({ error: e.message }, 400);
+    }
+    if (e instanceof GzError && e.code === 'not_found') {
+      return json({ error: e.message }, 404);
     }
     if (e instanceof GzError && e.code === 'no_db') {
       return json({ error: 'database_not_bound' }, 503);
