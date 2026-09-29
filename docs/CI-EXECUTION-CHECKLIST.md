@@ -136,7 +136,22 @@ Case A race / B toolchain / C build-tag / D worker → fix → re-push):
 | 36606232201 | `8839637` | staticcheck U1000 (feedSeq), EncodeClientFrame 16/64-bit header bug, RFC 6455 accept constant, TopN sink assertion |
 | 36606829638 | `2884e2d` | 16-bit length index in round-trip test ([2:4] per RFC) |
 | 36607264293 | `2884e2d` | **GREEN — zero defects** |
+| 36610187960 | `d3eced4` | heal 8: untyped-const byte widening in fragment send |
+| 36614561366 | `031ae8b` | heal 9: TestConcurrentGovernor reader WaitGroup deadlock (10-min test timeout) |
+| 36621675567 | `7859799` | heal 10: Split(300) expectation vs the 2×min (512 B) passthrough floor |
+| 36622295110 / 36622302521 | `7859799` | **GREEN — all 4 jobs** (1 platform notice left: macOS arm64 capacity) |
+| 36624068286 | `7be9c81` | heal 11 (2.20): orphaned `names` reference in the upgrade builder (compile) |
+| 36624484660 | `ff6ebca` | heal 12 (2.20): order invariant must allow the Upgrade/Connection jitter |
+| 36625518344 | `451924b` | heal 13 (2.20): Host-first check case-insensitive under case jitter |
+| 36625885641 | `451924b` | **GREEN — all 4 jobs, ZERO annotations** |
 
-Remaining annotations are GitHub-platform notices only (Node 20
-deprecation of actions, ubuntu-26 migration, macOS capacity) — none are
-repo warnings or failures.
+## Status — zero-defect AND zero-annotation
+
+2026-09-29 — run `36625885641` (commit `451924b`): all 4 jobs green and
+**zero annotations of any kind** — the last platform notice (macOS arm64
+capacity) was removed by pinning the macOS leg to `macos-15-intel`
+(`macos-14` was in its deprecation window, retiring 2026-11-02, so the
+supported x64 standard-runner label was the zero-notice choice). The
+Node-20 deprecation warnings and the ubuntu-26 migration notices were
+already eliminated by the Node-24 action majors and the `ubuntu-24.04`
+pin.
