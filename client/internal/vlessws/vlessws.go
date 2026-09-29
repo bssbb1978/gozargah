@@ -538,7 +538,8 @@ func DecodeServerFrame(buf []byte) (opcode byte, payload []byte, n int, err erro
 // DialOptions configures a VLESS-WS dial.
 type DialOptions struct {
 	Host      string // entry hostname (SNI + Host header + cert validation)
-	DialAddr  string // optional explicit "ip:443" clean-IP override
+	DialAddr  string // optional explicit "ip:port" clean-IP override
+	Port      int    // entry port used when DialAddr is empty (0 → 443)
 	Path      string // websocket path, e.g. "/sub/<base>?ed=2048"
 	EarlyData []byte // optional VLESS header for 0-RTT early data
 	FP        string // uTLS identity (used only in the axr_utls build)
@@ -572,7 +573,11 @@ func Dial(ctx context.Context, opts DialOptions) (*Client, error) {
 		if opts.Host == "" {
 			return nil, errors.New("vlessws: Host is required")
 		}
-		addr = opts.Host + ":443"
+		port := opts.Port
+		if port <= 0 || port > 65535 {
+			port = 443
+		}
+		addr = net.JoinHostPort(opts.Host, strconv.Itoa(port))
 	}
 	timeout := 8 * time.Second
 	if dl, ok := ctx.Deadline(); ok {

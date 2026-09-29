@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -35,11 +36,25 @@ type Endpoint struct {
 	Transport string   `json:"transport"`
 	FP        string   `json:"fp"`
 	Priority  int      `json:"priority"` // lower = preferred
+	// Port is the TCP port dialled on the host and on every explicit IP
+	// (0 → 443). Non-standard ports make non-443 edge endpoints, split
+	// deployments and LOCAL TEST HARNESSES reachable: without it the
+	// ladder could only ever speak to :443, so no end-to-end test could
+	// run against a dev server on a high port.
+	Port int `json:"port,omitempty"`
+}
+
+// dialPort is the effective port (0 means the conventional 443).
+func (e Endpoint) dialPort() int {
+	if e.Port > 0 && e.Port <= 65535 {
+		return e.Port
+	}
+	return 443
 }
 
 // IPHealth is the live health record for one (endpoint, dial-address).
 type IPHealth struct {
-	DialAddr   string  `json:"dial_addr"` // ip:443 or host:443
+	DialAddr   string  `json:"dial_addr"` // ip:port or host:port (port defaults to 443)
 	RTTMS      float64 `json:"rtt_ms"`
 	Score      float64 `json:"score"` // 0..1 composite health
 	ConsecFail int     `json:"consec_fail"`
@@ -404,10 +419,11 @@ func (e *Engine) candidatesForLocked(ep Endpoint) []cand {
 		}
 		out = append(out, cand{addr: addr, score: h.Score})
 	}
+	port := strconv.Itoa(ep.dialPort())
 	for _, ip := range ep.IPs {
-		add(ip + ":443")
+		add(net.JoinHostPort(ip, port))
 	}
-	add(ep.Host + ":443")
+	add(net.JoinHostPort(ep.Host, port))
 	sort.SliceStable(out, func(i, j int) bool { return out[i].score > out[j].score })
 	return out
 }

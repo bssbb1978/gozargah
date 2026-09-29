@@ -40,6 +40,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -109,6 +110,17 @@ type Config struct {
 	// plus the next one or two client-flight writes). 0 0 keeps the 2.16
 	// single-write behaviour.
 	FragWrites [2]int `json:"frag_writes,omitempty"`
+	// Port is the entry TCP port (default 443). Non-standard ports let the
+	// client reach non-443 edge deployments and LOCAL test harnesses
+	// (e.g. `wrangler dev` on 8787) — before 2.21 every dial address was
+	// pinned to :443, which made end-to-end verification impossible
+	// without a privileged bind.
+	Port int `json:"port,omitempty"`
+	// InsecureSkipVerify disables certificate verification on the entry
+	// TLS handshake (default false). Documented escape hatch for local
+	// harnesses and pinned self-signed edge certs; NEVER leave it on
+	// against the public internet.
+	InsecureSkipVerify bool `json:"insecure_skip_verify,omitempty"`
 	// CanaryIntervalMS bounds the canary liveness probe cadence (default
 	// 300000; the manifest's canary.interval_ms overrides it when sane,
 	// [60000, 3600000]).
@@ -121,6 +133,8 @@ type Entry struct {
 	IPs      []string `json:"ips,omitempty"` // explicit clean edge IPs
 	FP       string   `json:"fp,omitempty"`  // chrome|firefox|safari|randomized
 	Priority int      `json:"priority,omitempty"`
+	// Port overrides Config.Port for this entry (0 → Config.Port → 443).
+	Port int `json:"port,omitempty"`
 }
 
 // Options from flags.
@@ -272,6 +286,38 @@ type server struct {
 
 func surgeryEnabled(cfg Config) bool { return cfg.Surgery == nil || *cfg.Surgery }
 
+// buildArms expands the operator entry matrix into bandit arms and failover
+// endpoints. Every entry runs the primary "ws" arm plus the "ws-alt" shape
+// arm (same host over the gz_profile=fragmented path/query shape), so the
+// bandit can learn which shape is healthier under the current conditions —
+// arm identity is (host, transport, fingerprint), NOT port: the port is a
+// connection detail of the entry, not a different path shape.
+//
+// Port resolution is per entry: Entry.Port wins, else Config.Port, else 443
+// (failover treats 0 as 443).
+func buildArms(cfg Config) ([]bandit.Arm, []failover.Endpoint) {
+	arms := make([]bandit.Arm, 0, len(cfg.Entries)*len(transportsPerEntry))
+	foEntries := make([]failover.Endpoint, 0, len(cfg.Entries)*len(transportsPerEntry))
+	for _, e := range cfg.Entries {
+		fp := e.FP
+		if fp == "" {
+			fp = "chrome"
+		}
+		port := e.Port
+		if port == 0 {
+			port = cfg.Port
+		}
+		for _, tr := range transportsPerEntry {
+			arms = append(arms, bandit.Arm{Host: e.Host, Transport: tr, FP: fp})
+			foEntries = append(foEntries, failover.Endpoint{
+				Host: e.Host, IPs: e.IPs, Transport: tr, FP: fp,
+				Priority: e.Priority, Port: port,
+			})
+		}
+	}
+	return arms, foEntries
+}
+
 func newServer(cfg Config, l *logger, timeout time.Duration) (*server, error) {
 	if len(cfg.Entries) == 0 {
 		return nil, fmt.Errorf("no entries configured")
@@ -282,6 +328,9 @@ func newServer(cfg Config, l *logger, timeout time.Duration) (*server, error) {
 	if _, err := vlessws.UUIDFromString(cfg.UUID); err != nil {
 		return nil, fmt.Errorf("uuid: %v", err)
 	}
+	if cfg.Port < 0 || cfg.Port > 65535 {
+		return nil, fmt.Errorf("port %d out of range", cfg.Port)
+	}
 	if cfg.CacheDir == "" {
 		home, _ := os.UserHomeDir()
 		cfg.CacheDir = home + "/.axr"
@@ -290,23 +339,7 @@ func newServer(cfg Config, l *logger, timeout time.Duration) (*server, error) {
 		return nil, fmt.Errorf("cache dir: %v", err)
 	}
 
-	// Bandit arms: one arm per entry per transport shape (ws + ws-alt) with
-	// its fingerprint. ws-alt is the same host over the gz_profile=fragmented
-	// path/query shape, giving the bandit a second shape to compare.
-	var arms []bandit.Arm
-	foEntries := make([]failover.Endpoint, 0, len(cfg.Entries)*len(transportsPerEntry))
-	for _, e := range cfg.Entries {
-		fp := e.FP
-		if fp == "" {
-			fp = "chrome"
-		}
-		for _, tr := range transportsPerEntry {
-			arms = append(arms, bandit.Arm{Host: e.Host, Transport: tr, FP: fp})
-			foEntries = append(foEntries, failover.Endpoint{
-				Host: e.Host, IPs: e.IPs, Transport: tr, FP: fp, Priority: e.Priority,
-			})
-		}
-	}
+	arms, foEntries := buildArms(cfg)
 	b := bandit.New(1.0, 1, arms)
 	if snap, err := bandit.LoadSnapshot(cfg.CacheDir + "/bandit.json"); err == nil {
 		if rerr := b.Restore(snap); rerr != nil {
@@ -594,7 +627,7 @@ func (s *server) applyManifest(m *manifestV3) {
 	// ordinary backups, after the primary config entries).
 	if m.FrontingHint != "" && !s.hasEntry(m.FrontingHint) {
 		for _, tr := range transportsPerEntry {
-			s.failover.AddEntry(failover.Endpoint{Host: m.FrontingHint, Transport: tr, FP: fp, Priority: 50})
+			s.failover.AddEntry(failover.Endpoint{Host: m.FrontingHint, Transport: tr, FP: fp, Priority: 50, Port: s.cfg.Port})
 			s.bandit.AddArm(bandit.Arm{Host: m.FrontingHint, Transport: tr, FP: fp})
 		}
 		s.log.logf("manifest added fronting entry %s", m.FrontingHint)
@@ -617,7 +650,7 @@ func (s *server) applyManifest(m *manifestV3) {
 		// consumed by the canary loop below, not the ladder.
 		if e.Role == "backup" && !s.hasEntry(e.Host) {
 			for _, tr := range transportsPerEntry {
-				s.failover.AddEntry(failover.Endpoint{Host: e.Host, Transport: tr, FP: fp, Priority: 100})
+				s.failover.AddEntry(failover.Endpoint{Host: e.Host, Transport: tr, FP: fp, Priority: 100, Port: s.cfg.Port})
 				s.bandit.AddArm(bandit.Arm{Host: e.Host, Transport: tr, FP: fp})
 			}
 			s.log.logf("manifest added backup entry %s", e.Host)
@@ -927,7 +960,7 @@ func (s *server) startProbes() {
 			defer ticker.Stop()
 			for range ticker.C {
 				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-				okC, rtt := canaryProbe(ctx, s.canaryHost)
+				okC, rtt := canaryProbe(ctx, s.canaryHost, s.cfg.Port)
 				cancel()
 				s.netstate.Record(netstate.Observation{Role: netstate.RoleCanary, OK: okC, At: time.Now()})
 				s.applyPolicy()
@@ -940,14 +973,17 @@ func (s *server) startProbes() {
 	}
 }
 
-// canaryProbe is a plain TCP+TLS liveness check of host:443 (SNI = host,
-// real certificate verification, TLS >= 1.2). It measures reachability
-// from THIS network with the OS's own identity — deliberately un-morphed,
-// so the signal is about the route, not about our tunnel shape.
-func canaryProbe(ctx context.Context, host string) (bool, float64) {
+// canaryProbe is a plain TCP+TLS liveness check of host:port (SNI = host,
+// real certificate verification, TLS >= 1.2; port 0 → 443). It measures
+// reachability from THIS network with the OS's own identity — deliberately
+// un-morphed, so the signal is about the route, not about our tunnel shape.
+func canaryProbe(ctx context.Context, host string, port int) (bool, float64) {
+	if port <= 0 || port > 65535 {
+		port = 443
+	}
 	d := &net.Dialer{Timeout: 5 * time.Second}
 	start := time.Now()
-	conn, err := d.DialContext(ctx, "tcp4", net.JoinHostPort(host, "443"))
+	conn, err := d.DialContext(ctx, "tcp4", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return false, 0
 	}
@@ -1364,8 +1400,10 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 	}
 	ws, err := vlessws.DialConn(ctx, inner, vlessws.DialOptions{
 		Host:       cand.Endpoint.Host,
+		Port:       cand.Endpoint.Port,
 		Path:       s.wsPathFor(cand.Endpoint.Transport),
 		FP:         cand.Endpoint.FP,
+		SkipCert:   s.cfg.InsecureSkipVerify,
 		EarlyData:  header, // 0-RTT: VLESS header rides the upgrade
 		Fragmenter: frag,
 		Upgrade:    upgrade,

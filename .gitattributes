@@ -1,0 +1,26 @@
+# Normalize text to LF in the repository, on every platform.
+#
+# Without this the Windows CI runner checks out with core.autocrlf=true,
+# every Go source lands as CRLF, and `gofmt -l` reports the entire tree as
+# unformatted — a platform-dependent false positive that made the gofmt
+# gate fail on windows-latest while passing on Linux and macOS. Line
+# endings belong to the repository, not to the developer's git config.
+* text=auto eol=lf
+
+# Never touch binary payloads: normalizing these would corrupt them.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.gz binary
+*.zip binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+
+# Patch/report artifacts that must round-trip byte-for-byte.
+*.sha256 text eol=lf
+*.patch text eol=lf
