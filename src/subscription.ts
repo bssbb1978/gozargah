@@ -112,6 +112,10 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
       note: 'Client-side uTLS identity the generated identity window selects; TLS terminates at the edge.',
     },
     traffic_shape: { mode: shapeModeFor(env?.TRAFFIC_SHAPE) },
+    // 2.15 — AXR-v2 fields:
+    transports: ['ws', 'ws-alt'],
+    flow_profile: { mode: 'web', note: 'Target outflow length/IPD profile the client core should match; regime can escalate to "video".' },
+    clean_ip_hints: cleanIpHints(env?.CLEAN_EDGE_IPS),
     reconnect: {
       strategy: 'observe_and_failover',
       probe_interval_ms: 90_000,
@@ -144,6 +148,15 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
           (out.reconnect as Record<string, unknown>).probe_interval_ms = 30_000;
         }
       }
+      // 2.15 — regime/network-driven flow-profile escalation: under stress
+      // the client should imitate the highest-entropy profile (video),
+      // which is the least distinctive against a censor's behavioral models.
+      const regimeState = (out.regime as { state?: string } | undefined)?.state;
+      if (regimeState === 'suspected_change' || ns?.state === 'recovery' || ns?.state === 'no_healthy_path') {
+        (out.flow_profile as Record<string, unknown>).mode = 'video';
+      } else if (regimeState === 'watch') {
+        (out.flow_profile as Record<string, unknown>).mode = 'chat';
+      }
       if (signal) {
         try {
           const sig = JSON.parse(signal.stateJson) as Record<string, unknown>;
@@ -161,6 +174,21 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
     } catch { /* manifest stays minimal when D1 reads fail */ }
   }
   return JSON.stringify(out, null, 2);
+}
+
+/** Parse + validate CLEAN_EDGE_IPS into a bounded list of IPv4 hints. */
+export function cleanIpHints(raw: string | undefined): string[] {
+  if (!raw) return [];
+  const out: string[] = [];
+  for (const part of raw.split(',')) {
+    const ip = part.trim();
+    if (/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) {
+      const octets = ip.split('.').map(Number);
+      if (octets.every((o) => o >= 0 && o <= 255)) out.push(ip);
+    }
+    if (out.length >= 8) break;
+  }
+  return out;
 }
 
 export function buildAdaptiveClientBundle(host: string, user: { uuid: string; trojanPass: string; name: string }, opts: BuildOpts | null | undefined, env?: Env, dnsUrl?: string): string {

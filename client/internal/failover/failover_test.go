@@ -1,6 +1,8 @@
 package failover
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -203,5 +205,121 @@ func TestBestReturnsTopWhenAllDead(t *testing.T) {
 	}
 	if best.Endpoint.Host != "primary.example" {
 		t.Fatalf("expected priority-ordered top candidate, got %s", best.Endpoint.Host)
+	}
+}
+
+// fakeResolver is a deterministic Resolver for tests.
+type fakeResolver struct {
+	records map[string][]string
+	err     error
+}
+
+func (f fakeResolver) LookupA(ctx context.Context, host string) ([]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.records[host], nil
+}
+
+func TestHarvestedIPsMergesDedupesCaps(t *testing.T) {
+	ctx := context.Background()
+	r := fakeResolver{records: map[string][]string{
+		"p.example": {"9.9.9.9", "1.1.1.1", "9.9.9.10", "9.9.9.11", "9.9.9.12"},
+	}}
+	// explicit 1.1.1.1 already present -> deduped; 9.9.9.9 harvested.
+	got := HarvestedIPs(ctx, []string{"1.1.1.1"}, "p.example", r)
+	want := []string{"1.1.1.1", "9.9.9.9", "9.9.9.10", "9.9.9.11", "9.9.9.12"}
+	if len(got) != len(want) {
+		t.Fatalf("harvested %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("harvested %v, want %v", got, want)
+		}
+	}
+}
+
+func TestHarvestedIPsExplicitFirstAndCap(t *testing.T) {
+	ctx := context.Background()
+	r := fakeResolver{records: map[string][]string{
+		"p.example": {"3.3.3.3", "4.4.4.4", "5.5.5.5", "6.6.6.6", "7.7.7.7", "8.8.8.8", "9.9.9.9", "10.10.10.10"},
+	}}
+	// 6 explicit + 8 harvested must cap at MaxHarvestedIPs, explicit first.
+	explicit := []string{"1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4", "5.5.5.5", "6.6.6.6"}
+	got := HarvestedIPs(ctx, explicit, "p.example", r)
+	if len(got) != MaxHarvestedIPs {
+		t.Fatalf("expected cap at %d, got %d (%v)", MaxHarvestedIPs, len(got), got)
+	}
+	for i := 0; i < 6; i++ {
+		if got[i] != explicit[i] {
+			t.Fatalf("explicit IP must stay first at %d: %v", i, got)
+		}
+	}
+	// 3.3.3.3/4.4.4.4/5.5.5.5/6.6.6.6 are explicit dupes; next harvested are 7.7.7.7, 8.8.8.8, 9.9.9.9.
+	if got[6] != "7.7.7.7" || got[7] != "8.8.8.8" {
+		t.Fatalf("harvested tail wrong: %v", got)
+	}
+}
+
+func TestHarvestedIPsDropsInvalidAndCapsAtEight(t *testing.T) {
+	ctx := context.Background()
+	r := fakeResolver{records: map[string][]string{
+		"p.example": {"not-an-ip", "8.8.4.4", "8.8.8.8", "1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4", "5.5.5.5", "6.6.6.6", "7.7.7.7"},
+	}}
+	// no explicit; 10 records (1 invalid) -> cap at 8, invalid dropped.
+	got := HarvestedIPs(ctx, nil, "p.example", r)
+	if len(got) != 8 {
+		t.Fatalf("expected 8 (cap), got %d: %v", len(got), got)
+	}
+	for _, ip := range got {
+		if ip == "not-an-ip" {
+			t.Fatalf("invalid IP must be dropped: %v", got)
+		}
+	}
+}
+
+func TestHarvestedIPSErrorKeepsExisting(t *testing.T) {
+	ctx := context.Background()
+	r := fakeResolver{err: errors.New("dns failure")}
+	got := HarvestedIPs(ctx, []string{"1.1.1.1"}, "p.example", r)
+	if len(got) != 1 || got[0] != "1.1.1.1" {
+		t.Fatalf("resolver error must keep existing list, got %v", got)
+	}
+}
+
+func TestHarvestedIPsNilResolver(t *testing.T) {
+	ctx := context.Background()
+	got := HarvestedIPs(ctx, []string{"1.1.1.1", "1.1.1.1", "2.2.2.2"}, "p.example", nil)
+	if len(got) != 2 || got[0] != "1.1.1.1" || got[1] != "2.2.2.2" {
+		t.Fatalf("nil resolver must dedupe explicit only, got %v", got)
+	}
+}
+
+func TestHarvestEntriesUpdatesMatrix(t *testing.T) {
+	ctx := context.Background()
+	e := New(testEntries(), nil)
+	r := fakeResolver{records: map[string][]string{
+		"primary.example": {"9.9.9.9"},
+		"backup.example":  {"8.8.8.8"},
+	}}
+	added := e.HarvestEntries(ctx, r)
+	if added != 2 {
+		t.Fatalf("expected 2 added (one per entry), got %d", added)
+	}
+	for _, ep := range e.Entries() {
+		switch ep.Host {
+		case "primary.example":
+			if len(ep.IPs) != 3 || ep.IPs[2] != "9.9.9.9" {
+				t.Fatalf("primary IPs wrong: %v", ep.IPs)
+			}
+		case "backup.example":
+			if len(ep.IPs) != 1 || ep.IPs[0] != "8.8.8.8" {
+				t.Fatalf("backup IPs wrong: %v", ep.IPs)
+			}
+		}
+	}
+	// Idempotent: a second harvest adds nothing.
+	if again := e.HarvestEntries(ctx, r); again != 0 {
+		t.Fatalf("second harvest must add 0, got %d", again)
 	}
 }

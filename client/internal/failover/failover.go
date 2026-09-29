@@ -468,6 +468,85 @@ func classifyErr(err error) string {
 // ErrNoHealthy is returned when a probe round found nothing reachable.
 var ErrNoHealthy = errors.New("failover: no healthy candidate")
 
+// Resolver is the injectable DNS A-record source for clean-IP harvesting.
+// Production uses DefaultResolver (system resolver, IPv4 only); tests fake it.
+type Resolver interface {
+	LookupA(ctx context.Context, host string) ([]string, error)
+}
+
+// DefaultResolver resolves the A records of host via the system resolver,
+// keeping IPv4 only (matching the worker's IPv4 clean-IP hints).
+type DefaultResolver struct{}
+
+// LookupA implements Resolver.
+func (DefaultResolver) LookupA(ctx context.Context, host string) ([]string, error) {
+	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, a := range addrs {
+		ip := net.ParseIP(a)
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+		out = append(out, ip.To4().String())
+	}
+	return out, nil
+}
+
+// MaxHarvestedIPs caps the merged per-entry IP list (explicit + harvested).
+const MaxHarvestedIPs = 8
+
+// HarvestedIPs merges the explicit (operator) IPs with the A records of host:
+// explicit IPs first (they are trusted), then deduplicated harvested ones,
+// capped at MaxHarvestedIPs. Resolver errors keep the existing list intact —
+// harvesting is an enhancement, never a regression.
+func HarvestedIPs(ctx context.Context, explicit []string, host string, r Resolver) []string {
+	out := make([]string, 0, len(explicit)+MaxHarvestedIPs)
+	seen := make(map[string]bool, len(explicit)+MaxHarvestedIPs)
+	add := func(ip string) {
+		if ip == "" || seen[ip] || len(out) >= MaxHarvestedIPs {
+			return
+		}
+		if net.ParseIP(ip) == nil {
+			return
+		}
+		seen[ip] = true
+		out = append(out, ip)
+	}
+	for _, ip := range explicit {
+		add(ip)
+	}
+	if r != nil && host != "" {
+		if ips, err := r.LookupA(ctx, host); err == nil {
+			for _, ip := range ips {
+				add(ip)
+			}
+		}
+	}
+	return out
+}
+
+// HarvestEntries resolves every entry's host and merges the A records into
+// entry.IPs (dedup, capped). Returns the number of newly added IPs. Safe for
+// concurrent use; the cache is untouched (health keys are per dial-addr and
+// are filled on first probe/dial).
+func (e *Engine) HarvestEntries(ctx context.Context, r Resolver) int {
+	if r == nil {
+		return 0
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	added := 0
+	for i := range e.entries {
+		before := len(e.entries[i].IPs)
+		e.entries[i].IPs = HarvestedIPs(ctx, e.entries[i].IPs, e.entries[i].Host, r)
+		added += len(e.entries[i].IPs) - before
+	}
+	return added
+}
+
 // Best returns the single best candidate right now (cache-driven), without
 // probing.
 func (e *Engine) Best(orderFn func(Arm) float64) (Candidate, error) {

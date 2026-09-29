@@ -2,7 +2,7 @@
  * Gozargah — global config, types and shared errors.
  */
 
-export const VERSION = '2.14.0';
+export const VERSION = '2.15.0';
 export const SCHEMA_VERSION = 15;
 
 /** D1 binding name (see wrangler.toml) */
@@ -38,6 +38,8 @@ export interface Env {
   HEALTH_PROBE_PORTS?: string;
   /** 2.13 — in-tunnel traffic shaping: 'conservative' (default), 'aggressive' or 'off'. */
   TRAFFIC_SHAPE?: string;
+  /** 2.15 — comma-separated clean Cloudflare edge IPv4 hints re-broadcast in the AXR manifest. */
+  CLEAN_EDGE_IPS?: string;
   /** Optional Xray/sing-box origin engine for protocols not terminated natively by the Worker. */
   ORIGIN_ENGINE_HOST?: string;
   /** Optional origin engine port; defaults to 443. */

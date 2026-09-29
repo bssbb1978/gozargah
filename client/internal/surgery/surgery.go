@@ -107,14 +107,26 @@ func (s *SplitConn) SetDeadline(t time.Time) error                  { return s.i
 func (s *SplitConn) SetReadDeadline(t time.Time) error              { return s.inner.SetReadDeadline(t) }
 func (s *SplitConn) SetWriteDeadline(t time.Time) error             { return s.inner.SetWriteDeadline(t) }
 
+// Slicer decides the size and pre-gap of each chunk (flowprofile implements
+// this interface for app-class morphing). Next must return a size in
+// [1, remaining]. The consumer never sleeps for the gap before the first
+// chunk of a Write.
+type Slicer interface {
+	Next(remaining int) (size int, gap time.Duration)
+}
+
 // ChunkConn fragments post-handshake writes into randomized-sized pieces.
-// It is deliberately named chunking (TCP-level), not padding.
+// It is deliberately named chunking (TCP-level), not padding. With a
+// Slicer (NewChunkConnWith) the size/gap sequence is drawn from an
+// application-class profile; without one it stays the original uniform
+// [min, max] + fixed-gap behaviour.
 type ChunkConn struct {
 	inner net.Conn
 	min   int
 	max   int
 	gap   time.Duration // fixed micro-gap; 0 disables it
 	rng   Rng
+	slice Slicer
 }
 
 // NewChunkConn wraps c with pieces in [min, max] bytes.
@@ -128,29 +140,46 @@ func NewChunkConn(c net.Conn, min, max int, gap time.Duration, rng Rng) *ChunkCo
 	return &ChunkConn{inner: c, min: min, max: max, gap: gap, rng: rng}
 }
 
+// NewChunkConnWith wraps c and delegates all size/gap decisions to sl.
+func NewChunkConnWith(c net.Conn, sl Slicer) *ChunkConn {
+	return &ChunkConn{inner: c, slice: sl}
+}
+
 func (k *ChunkConn) Read(b []byte) (int, error) { return k.inner.Read(b) }
 
 func (k *ChunkConn) Write(b []byte) (int, error) {
-	if len(b) < k.min {
+	if k.slice == nil && len(b) < k.min {
 		return k.inner.Write(b)
 	}
 	total := 0
 	for total < len(b) {
-		span := k.max - k.min
-		size := k.min
-		if span > 0 && k.rng != nil {
-			size = k.min + int(k.rng()*float64(span+1))
+		var size int
+		var gap time.Duration
+		if k.slice != nil {
+			size, gap = k.slice.Next(len(b) - total)
+		} else {
+			span := k.max - k.min
+			size = k.min
+			if span > 0 && k.rng != nil {
+				size = k.min + int(k.rng()*float64(span+1))
+			}
+			if total > 0 {
+				gap = k.gap
+			}
 		}
 		if size > len(b)-total {
 			size = len(b) - total
+		}
+		if size < 1 {
+			size = len(b) - total
+		}
+		if total > 0 && gap > 0 {
+			time.Sleep(gap)
 		}
 		if _, err := k.inner.Write(b[total : total+size]); err != nil {
 			return total, err
 		}
 		total += size
-		if total < len(b) && k.gap > 0 {
-			time.Sleep(k.gap)
-		}
 	}
 	return total, nil
 }

@@ -12,14 +12,20 @@
 //     inspection and not a guarantee against any specific filter
 //   - a total route cut (no path from the local network to any entry) cannot
 //     be created from the client; the binary reports it instead of looping
-//   - VLESS-over-WS is the shipped transport; h2/h3/grpc arms are interface
-//     stubs reserved for later releases
+//   - VLESS-over-WS ("ws") is the shipped transport; "ws-alt" is the same WS
+//     over a different path/query shape (gz_profile=fragmented); h2/h3/grpc
+//     arms are interface stubs reserved for later releases
+//   - 2.15 additions: LinUCB contextual bandit, regime-driven flow profiles
+//     (length-histogram morphing + IPD), TCP socket surgery (Nagle off +
+//     randomized SO_SNDBUF), warm-session reuse (<=30s same-destination),
+//     A-record clean-IP harvesting, and a decision.jsonl audit log
 package main
 
 import (
 	"context"
 	crand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -30,6 +36,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,10 +44,17 @@ import (
 
 	"github.com/bssbb1978/gozargah/axr/internal/bandit"
 	"github.com/bssbb1978/gozargah/axr/internal/failover"
+	"github.com/bssbb1978/gozargah/axr/internal/flowprofile"
 	"github.com/bssbb1978/gozargah/axr/internal/measure"
+	"github.com/bssbb1978/gozargah/axr/internal/sockopt"
 	"github.com/bssbb1978/gozargah/axr/internal/surgery"
 	"github.com/bssbb1978/gozargah/axr/internal/vlessws"
 )
+
+// transportsPerEntry: every entry runs the primary WS arm plus the "ws-alt"
+// shape arm (same host, gz_profile=fragmented) so the bandit can learn which
+// path/query shape is healthier under the current conditions.
+var transportsPerEntry = []string{"ws", "ws-alt"}
 
 // Config is the operator-supplied entry set (axr.json).
 type Config struct {
@@ -132,6 +146,23 @@ func main() {
 
 // ---- server ----
 
+// warmTTL is how long a finished, still-open tunnel stays adoptable for a
+// same-destination CONNECT (session reuse).
+const warmTTL = 30 * time.Second
+
+// warmSession is a finished tunnel whose WS connection is still open and may
+// be adopted by the NEXT CONNECT to the same destination (host:port). The
+// worker's WS session carries exactly one backend stream, so adoption is
+// strictly same-destination — anything else closes it and dials fresh.
+type warmSession struct {
+	ws      *vlessws.Client
+	arm     bandit.Arm
+	profile flowprofile.ProfileID
+	dstHost string
+	dstPort int
+	endedAt int64 // unix ms
+}
+
 type server struct {
 	cfg     Config
 	log     *logger
@@ -144,6 +175,9 @@ type server struct {
 	trackers map[string]*measure.Tracker // per-entry client state vector
 	pathBase string                       // rotated ws path base from the manifest
 	probeInt [2]time.Duration             // [normal, aggressive]
+
+	warmMu sync.Mutex
+	warm   *warmSession
 }
 
 func surgeryEnabled(cfg Config) bool { return cfg.Surgery == nil || *cfg.Surgery }
@@ -166,31 +200,50 @@ func newServer(cfg Config, l *logger, timeout time.Duration) (*server, error) {
 		return nil, fmt.Errorf("cache dir: %v", err)
 	}
 
-	// Bandit arms: one arm per entry on transport "ws" with its fingerprint.
+	// Bandit arms: one arm per entry per transport shape (ws + ws-alt) with
+	// its fingerprint. ws-alt is the same host over the gz_profile=fragmented
+	// path/query shape, giving the bandit a second shape to compare.
 	var arms []bandit.Arm
-	foEntries := make([]failover.Endpoint, 0, len(cfg.Entries))
+	foEntries := make([]failover.Endpoint, 0, len(cfg.Entries)*len(transportsPerEntry))
 	for _, e := range cfg.Entries {
 		fp := e.FP
 		if fp == "" {
 			fp = "chrome"
 		}
-		arms = append(arms, bandit.Arm{Host: e.Host, Transport: "ws", FP: fp})
-		foEntries = append(foEntries, failover.Endpoint{
-			Host: e.Host, IPs: e.IPs, Transport: "ws", FP: fp, Priority: e.Priority,
-		})
+		for _, tr := range transportsPerEntry {
+			arms = append(arms, bandit.Arm{Host: e.Host, Transport: tr, FP: fp})
+			foEntries = append(foEntries, failover.Endpoint{
+				Host: e.Host, IPs: e.IPs, Transport: tr, FP: fp, Priority: e.Priority,
+			})
+		}
 	}
 	b := bandit.New(1.0, 1, arms)
 	if snap, err := bandit.LoadSnapshot(cfg.CacheDir + "/bandit.json"); err == nil {
 		if rerr := b.Restore(snap); rerr != nil {
 			l.logf("bandit restore failed (%v); using fresh", rerr)
 		} else {
-			l.logf("restored bandit state (%d arms)", len(snap.Arms))
+			// Restore replaces the arm set with the snapshot's; re-add the
+			// current config arms (no-op for existing ones) so upgraded
+			// cores keep their learned state AND gain the new shapes
+			// (e.g. ws-alt) with fresh ridge priors.
+			for _, a := range arms {
+				b.AddArm(a)
+			}
+			l.logf("restored bandit state (%d arms, %d after current-config merge)", len(snap.Arms), len(b.Arms()))
 		}
 	}
 	fo := failover.New(foEntries, nil)
 	if cerr := fo.LoadCache(cfg.CacheDir + "/routing.json"); cerr != nil {
 		l.logf("routing cache load failed (%v); using fresh", cerr)
 	}
+	// 2.15 — clean edge-IP harvesting: merge each entry's live A records
+	// into its IP set (dedup, capped). Best-effort: DNS may be filtered, in
+	// which case the operator's explicit IPs remain untouched.
+	hctx, hcancel := context.WithTimeout(context.Background(), 6*time.Second)
+	if n := fo.HarvestEntries(hctx, failover.DefaultResolver{}); n > 0 {
+		l.logf("harvested %d clean edge IP(s) from entry A records", n)
+	}
+	hcancel()
 
 	s := &server{
 		cfg:      cfg,
@@ -251,6 +304,7 @@ func (s *server) refreshManifest() {
 			Host string `json:"host"`
 			Role string `json:"role"`
 		} `json:"entries"`
+		CleanIPHints []string `json:"clean_ip_hints"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&m); err != nil {
 		s.log.logf("manifest decode failed: %v", err)
@@ -263,10 +317,26 @@ func (s *server) refreshManifest() {
 	if fp == "" {
 		fp = "chrome"
 	}
+	// 2.15 — clean IP hints from the operator's env (validated on the
+	// worker): merge into every entry's IP set (dedup + cap, best effort).
+	// AddEntry replaces the same (host, transport) row, so this is a clean
+	// in-place IP-set upgrade.
+	if len(m.CleanIPHints) > 0 {
+		for _, ep := range s.failover.Entries() {
+			merged := failover.HarvestedIPs(context.Background(),
+				append(append([]string{}, ep.IPs...), m.CleanIPHints...), "", nil)
+			up := ep
+			up.IPs = merged
+			s.failover.AddEntry(up)
+		}
+		s.log.logf("manifest applied %d clean IP hint(s)", len(m.CleanIPHints))
+	}
 	for _, e := range m.Entries {
 		if e.Role == "backup" && !s.hasEntry(e.Host) {
-			s.failover.AddEntry(failover.Endpoint{Host: e.Host, Transport: "ws", FP: fp, Priority: 100})
-			s.bandit.AddArm(bandit.Arm{Host: e.Host, Transport: "ws", FP: fp})
+			for _, tr := range transportsPerEntry {
+				s.failover.AddEntry(failover.Endpoint{Host: e.Host, Transport: tr, FP: fp, Priority: 100})
+				s.bandit.AddArm(bandit.Arm{Host: e.Host, Transport: tr, FP: fp})
+			}
 			s.log.logf("manifest added backup entry %s", e.Host)
 		}
 	}
@@ -300,6 +370,21 @@ func (s *server) wsPath() string {
 	return "/"
 }
 
+// wsPathFor returns the WS path for a transport shape. "ws-alt" is the same
+// path over the worker's gz_profile=fragmented shape, giving the bandit a
+// second path/query form to compare against the standard one.
+func (s *server) wsPathFor(transport string) string {
+	p := s.wsPath()
+	if transport == "ws-alt" {
+		sep := "?"
+		if strings.Contains(p, "?") {
+			sep = "&"
+		}
+		p += sep + "gz_profile=fragmented"
+	}
+	return p
+}
+
 func (s *server) startProbes() {
 	go func() {
 		for {
@@ -323,6 +408,12 @@ func (s *server) startProbes() {
 func (s *server) shutdown() {
 	_ = s.bandit.Save(s.cfg.CacheDir + "/bandit.json")
 	_ = s.failover.SaveCache(s.cfg.CacheDir + "/routing.json")
+	s.warmMu.Lock()
+	if s.warm != nil {
+		_ = s.warm.ws.Close()
+		s.warm = nil
+	}
+	s.warmMu.Unlock()
 }
 
 // ---- SOCKS5 (TCP only; UDP rejected by design — no UDP relay) ----
@@ -424,8 +515,28 @@ func socksReply(conn net.Conn, code byte) {
 
 // ---- tunnel ----
 
+// banditContext maps the measured state vector to the LinUCB context.
+func banditContext(v measure.Vector, now int64) bandit.Context {
+	anom := 0.0
+	if v.LastAnomaly != 0 {
+		anom = 1
+	}
+	return bandit.Context{
+		Regime:           v.Regime,
+		WeakestTransport: v.WeakestTransport,
+		NowMS:            now,
+		RTTMS:            v.RTTMS,
+		JitterMS:         v.JitterMS,
+		RSTRate:          v.RSTRate,
+		TLSDrop:          v.TimeoutRate,
+		LossStep:         v.StepDelta,
+		HTTPAnom:         anom,
+	}
+}
+
 // openTunnel picks a bandit arm, walks the failover candidates for it,
-// establishes one VLESS-WS tunnel, pumps traffic, and feeds every learner.
+// establishes one VLESS-WS tunnel (or adopts a warm one), pumps traffic,
+// and feeds every learner.
 func (s *server) openTunnel(client net.Conn, host string, port int) {
 	l := s.log
 	uuidBytes, _ := vlessws.UUIDFromString(s.cfg.UUID)
@@ -438,13 +549,38 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
-	// Ask the bandit for the best arm under the current regime.
+	now := time.Now()
 	vec := s.globalVector()
-	arm, scores, err := s.bandit.Select(bandit.Context{
-		Regime:           vec.Regime,
-		WeakestTransport: vec.WeakestTransport,
-		NowMS:            time.Now().UnixMilli(),
-	})
+	bctx := banditContext(vec, now.UnixMilli())
+	profile := flowprofile.ForRegime(vec.Regime)
+
+	// 2.15 — session reuse: adopt the previous tunnel for the SAME
+	// destination if it is still open and within warmTTL. No new dial/TLS/
+	// handshake — the stream just continues. A stale session is discarded on
+	// the first pump error and we fall through to a fresh dial.
+	if w := s.takeWarm(host, port); w != nil {
+		l.logf("adopting warm session for %s:%d (age %v)", host, port, time.Since(time.UnixMilli(w.endedAt)))
+		meta := warmMeta{arm: w.arm, profile: w.profile, dstHost: host, dstPort: port}
+		pr := s.pumpTunnel(w.ws, client, true, meta)
+		if pr.clean {
+			client.Close()
+			s.logDecision(decisionRec{
+				Ts: now.UnixMilli(), Regime: vec.Regime, FlowProfile: string(w.profile),
+				Ctx: bctx, Arm: w.arm, Warm: true,
+				OK: true, Reason: "warm", DialAddr: "",
+			})
+			if l.verbose {
+				l.logf("tunnel OK %s:%d via warm session", host, port)
+			}
+			return
+		}
+		// Stale warm session: the client is still open (pumpTunnel never
+		// closes it), so a fresh dial below reuses it as-is.
+		l.logf("warm session stale (%s); dialing fresh", pr.reason)
+	}
+
+	// Ask the bandit for the best arm under the current context (LinUCB).
+	arm, scores, err := s.bandit.Select(bctx)
 	if err != nil {
 		l.logf("no selectable arm: %v", err)
 		return
@@ -458,13 +594,14 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 		}
 	}
 
-	// One score table for the failover ordering (quarantined arms sink).
+	// One score table for the failover ordering (quarantined arms sink;
+	// the LinUCB total — not the raw mean — is the learned ranking).
 	scoreMap := make(map[string]float64, len(scores))
 	for _, sc := range scores {
 		if sc.Quarantined {
 			scoreMap[sc.Arm.ID()] = -1
 		} else {
-			scoreMap[sc.Arm.ID()] = sc.Mean
+			scoreMap[sc.Arm.ID()] = sc.Total
 		}
 	}
 	order := s.failover.FailoverOrder(func(a failover.Arm) float64 {
@@ -485,55 +622,74 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 	}
 
 	var last tunnelResult
+	var tried []string
 	for _, cand := range cands {
-		res := s.attemptTunnel(ctx, client, cand, header, arm)
+		tag := cand.Endpoint.Host + "/" + cand.DialAddr + "[" + cand.Endpoint.Transport + "]"
+		tried = append(tried, tag)
+		res := s.attemptTunnel(ctx, client, cand, header, profile, host, port)
 		last = res
 		if res.ok {
 			break
 		}
-		l.logf("attempt %s/%s failed: %s", cand.Endpoint.Host, cand.DialAddr, res.reason)
+		l.logf("attempt %s failed: %s", tag, res.reason)
 	}
 	if last.reason == "" {
 		last = tunnelResult{reason: "no_candidates"}
 	}
 
-	now := time.Now()
-	s.bandit.Observe(arm, bandit.Outcome{
+	// Credit the arm that actually carried (or last tried) the tunnel —
+	// under ws-alt the chosen candidate's transport can differ from the
+	// bandit's top pick after a host-level failover.
+	usedArm := arm
+	if last.entry.Host != "" {
+		usedArm = bandit.Arm{Host: last.entry.Host, Transport: last.entry.Transport, FP: last.entry.FP}
+	}
+	s.bandit.Observe(usedArm, bandit.Outcome{
 		OK:         last.ok,
 		RTTMS:      last.rttMS,
 		Throughput: last.through,
 		Reason:     last.reason,
-	}, now.UnixMilli())
+	}, bctx, time.Now().UnixMilli())
 	if last.entry.Host != "" {
 		s.trackerFor(last.entry.Host).Feed(measure.Sample{
 			OK:        last.ok,
 			RTTMS:     last.rttMS,
 			ErrClass:  classErr(last.reason),
-			Transport: "ws",
-			UnixMS:    now.UnixMilli(),
+			Transport: last.entry.Transport,
+			UnixMS:    time.Now().UnixMilli(),
 		})
-		s.failover.Observe(last.entry, last.dialAddr, last.ok, last.rttMS, last.reason, now)
+		s.failover.Observe(last.entry, last.dialAddr, last.ok, last.rttMS, last.reason, time.Now())
 		_ = s.failover.SaveCache(s.cfg.CacheDir + "/routing.json")
 	}
 	_ = s.bandit.Save(s.cfg.CacheDir + "/bandit.json")
 
+	s.logDecision(decisionRec{
+		Ts: now.UnixMilli(), Regime: vec.Regime, FlowProfile: string(profile),
+		Ctx: bctx, Arm: arm, Scores: scores, Tries: tried,
+		OK: last.ok, RTTMS: last.rttMS, Through: last.through,
+		Reason: last.reason, DialAddr: last.dialAddr,
+	})
+
 	if l.verbose {
-		l.logf("tunnel %s %s:%d via %s (rtt=%.0fms %s)",
-			map[bool]string{true: "OK", false: "FAIL"}[last.ok], host, port, last.dialAddr, last.rttMS, last.reason)
+		l.logf("tunnel %s %s:%d via %s (rtt=%.0fms %s profile=%s)",
+			map[bool]string{true: "OK", false: "FAIL"}[last.ok], host, port, last.dialAddr, last.rttMS, last.reason, profile)
 	}
 }
 
 // tunnelResult carries the outcome of one candidate attempt.
 type tunnelResult struct {
-	ok      bool
-	rttMS   float64
-	through float64
-	reason  string
-	entry   failover.Endpoint
+	ok       bool
+	rttMS    float64
+	through  float64
+	reason   string
+	entry    failover.Endpoint
 	dialAddr string
 }
 
-func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failover.Candidate, header []byte, arm bandit.Arm) tunnelResult {
+// attemptTunnel dials one candidate, performs the full VLESS-WS handshake
+// (with surgery), and hands the open tunnel to pumpTunnel. dstHost/dstPort
+// are the SOCKS destination (label the warm session for reuse).
+func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failover.Candidate, header []byte, profile flowprofile.ProfileID, dstHost string, dstPort int) tunnelResult {
 	res := tunnelResult{entry: cand.Endpoint, dialAddr: cand.DialAddr}
 	start := time.Now()
 
@@ -543,6 +699,9 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 		res.reason = "dial:" + err.Error()
 		return res
 	}
+	// 2.15 — TCP socket surgery: Nagle off + randomized SO_SNDBUF.
+	_ = sockopt.Apply(raw, sockopt.Options{Rng: newSockRand(), NoNagle: true})
+
 	inner := raw
 	if s.surgeryOn() {
 		gapMin, gapMax := 20*time.Millisecond, 120*time.Millisecond
@@ -554,12 +713,13 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 	surg := s.surgeryOn()
 	ws, err := vlessws.DialConn(ctx, inner, vlessws.DialOptions{
 		Host:      cand.Endpoint.Host,
-		Path:      s.wsPath(),
-		FP:        arm.FP,
+		Path:      s.wsPathFor(cand.Endpoint.Transport),
+		FP:        cand.Endpoint.FP,
 		EarlyData: header, // 0-RTT: VLESS header rides the upgrade
 		AfterTLS: func(c net.Conn) net.Conn {
 			if surg {
-				return surgery.NewChunkConn(c, 512, 1400, 0, s.rngFloat)
+				// 2.15 — app-class flow morphing (length histogram + IPD).
+				return surgery.NewChunkConnWith(c, flowprofile.NewSlicer(profile, s.rngFloat))
 			}
 			return c
 		},
@@ -578,9 +738,58 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 	}
 	res.rttMS = time.Since(start).Seconds() * 1000
 
-	// Pump both directions until one side closes.
+	// Pump both directions; a clean local close may keep the session warm.
+	// A fresh tunnel is established (ok) once the handshake succeeded — the
+	// bandit's measurable signal is dial+handshake quality, not stream length.
+	meta := warmMeta{
+		arm:     bandit.Arm{Host: cand.Endpoint.Host, Transport: cand.Endpoint.Transport, FP: cand.Endpoint.FP},
+		profile: profile, dstHost: dstHost, dstPort: dstPort,
+	}
+	_ = s.pumpTunnel(ws, client, true, meta)
+	client.Close()
+	res.ok = true
+	res.reason = "ok"
+	res.through = 0 // per-frame throughput accounting is a v2 item
+	return res
+}
+
+// warmMeta labels a warm session with the tunnel's identity so a later
+// adoption can credit the right arm and re-serve the same destination.
+type warmMeta struct {
+	arm     bandit.Arm
+	profile flowprofile.ProfileID
+	dstHost string
+	dstPort int
+}
+
+// pumpResult is the outcome of a two-direction pump.
+type pumpResult struct {
+	clean  bool   // ended without a transport error (clean local EOF or clean close)
+	reason string // "" when clean, else the error text
+}
+
+// pumpTunnel moves data both directions over an open WS tunnel until one side
+// closes. Contract: the caller owns the local client conn (pumpTunnel never
+// closes it); the WS is closed by the pump unless the ending is a clean local
+// close and allowWarm, in which case the session is kept warm for
+// same-destination reuse. A fresh tunnel is considered established (ok) once
+// the handshake succeeded — however the stream then ends. A warm session is
+// only good when clean; a stale one is reported clean=false so the caller can
+// dial fresh on the (still open) client.
+func (s *server) pumpTunnel(ws *vlessws.Client, client net.Conn, allowWarm bool, meta warmMeta) pumpResult {
 	done := make(chan struct{}, 2)
 	var wg sync.WaitGroup
+	var firstMu sync.Mutex
+	var firstCleanLocal bool
+	var firstErr error
+	announce := func(cleanLocal bool, err error) {
+		firstMu.Lock()
+		defer firstMu.Unlock()
+		if firstErr == nil && !firstCleanLocal {
+			firstCleanLocal = cleanLocal
+			firstErr = err
+		}
+	}
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
@@ -589,10 +798,12 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 			n, rerr := client.Read(buf)
 			if n > 0 {
 				if serr := ws.SendBinary(buf[:n]); serr != nil {
+					announce(false, serr)
 					break
 				}
 			}
 			if rerr != nil {
+				announce(errors.Is(rerr, io.EOF), rerr)
 				break
 			}
 		}
@@ -604,24 +815,97 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 			msg, rerr := ws.RecvBinary()
 			if len(msg) > 0 {
 				if _, werr := client.Write(msg); werr != nil {
+					announce(false, werr)
 					break
 				}
 			}
 			if rerr != nil {
+				announce(false, rerr)
 				break
 			}
 		}
 		done <- struct{}{}
 	}()
 	<-done // first side finished
-	ws.Close() // tears down both
-	wg.Wait()
-	client.Close()
 
-	res.ok = true
-	res.reason = "ok"
-	res.through = 0 // per-frame throughput accounting is a v2 item
-	return res
+	firstMu.Lock()
+	cleanLocal := firstCleanLocal
+	pumpErr := firstErr
+	firstMu.Unlock()
+
+	if cleanLocal && allowWarm {
+		// The local app closed its side; the WS may still be healthy. Nudge
+		// the remote pump out of its blocking read with a short deadline,
+		// clear it, and keep the session warm for same-destination reuse.
+		// The caller closes the (already EOF'd) client conn.
+		_ = ws.Conn().SetReadDeadline(time.Now().Add(2 * time.Second))
+		wg.Wait()
+		_ = ws.Conn().SetReadDeadline(time.Time{})
+		s.keepWarm(ws, meta)
+		return pumpResult{clean: true}
+	}
+
+	// Any other ending: tear the WS down (client is the caller's to close).
+	ws.Close()
+	wg.Wait()
+	if pumpErr != nil {
+		return pumpResult{clean: false, reason: firstReason(pumpErr.Error())}
+	}
+	return pumpResult{clean: true}
+}
+
+func firstReason(r string) string {
+	if i := strings.IndexByte(r, '\n'); i > 0 {
+		return r[:i]
+	}
+	if len(r) > 96 {
+		return r[:96]
+	}
+	return r
+}
+
+// ---- warm session (2.15 session reuse) ----
+
+// keepWarm stores an open, finished tunnel for same-destination adoption.
+// Only one warm session is kept; a previous one is closed.
+func (s *server) keepWarm(ws *vlessws.Client, meta warmMeta) {
+	s.warmMu.Lock()
+	defer s.warmMu.Unlock()
+	old := s.warm
+	s.warm = nil
+	if old != nil {
+		_ = old.ws.Close()
+	}
+	s.warm = &warmSession{
+		ws: ws, arm: meta.arm, profile: meta.profile,
+		dstHost: meta.dstHost, dstPort: meta.dstPort,
+		endedAt: time.Now().UnixMilli(),
+	}
+	go func() {
+		time.Sleep(warmTTL)
+		s.warmMu.Lock()
+		if s.warm != nil && s.warm.ws == ws {
+			_ = ws.Close()
+			s.warm = nil
+		}
+		s.warmMu.Unlock()
+	}()
+}
+
+func (s *server) takeWarm(host string, port int) *warmSession {
+	s.warmMu.Lock()
+	defer s.warmMu.Unlock()
+	w := s.warm
+	s.warm = nil
+	if w == nil {
+		return nil
+	}
+	if w.dstHost != host || w.dstPort != port ||
+		time.Since(time.UnixMilli(w.endedAt)) > warmTTL {
+		_ = w.ws.Close()
+		return nil
+	}
+	return w
 }
 
 func (s *server) rngFloat() float64 {
@@ -671,6 +955,14 @@ var (
 	rng   = newLockedRand()
 )
 
+// newSockRand returns a per-connection rand source for socket-option picks
+// (SO_SNDBUF). Cheap to build; not shared so concurrent tunnels don't fight
+// over one lock for a one-shot draw.
+func newSockRand() *mrand.Rand {
+	n, _ := crand.Int(crand.Reader, big.NewInt(1<<62))
+	return mrand.New(mrand.NewSource(n.Int64()))
+}
+
 type lockedRand struct{ r *mrand.Rand }
 
 func newLockedRand() *lockedRand {
@@ -700,6 +992,48 @@ func loadConfig(path string) (Config, error) {
 		return cfg, fmt.Errorf("entries is empty")
 	}
 	return cfg, nil
+}
+
+// ---- decision audit log (2.15) ----
+
+// decisionRec is one JSON line appended to ~/.axr/decision.jsonl: the full
+// transparent trace of a tunnel decision — the context that was measured,
+// the arm the LinUCB picked, the score table, the candidates tried, and the
+// outcome. Best-effort: logging must never break a tunnel.
+type decisionRec struct {
+	Ts          int64           `json:"ts"`
+	Regime      string          `json:"regime"`
+	FlowProfile string          `json:"flow_profile"`
+	Ctx         bandit.Context  `json:"ctx"`
+	Arm         bandit.Arm      `json:"arm"`
+	Warm        bool            `json:"warm,omitempty"`
+	Scores      []bandit.Score  `json:"scores,omitempty"`
+	Tries       []string        `json:"tries,omitempty"`
+	OK          bool            `json:"ok"`
+	RTTMS       float64         `json:"rtt_ms"`
+	Through     float64         `json:"through"`
+	Reason      string          `json:"reason"`
+	DialAddr    string          `json:"dial_addr,omitempty"`
+}
+
+// logDecision appends rec to the audit log, rotating once the file passes
+// ~4MB (to decision.jsonl.old). All errors are swallowed by design.
+func (s *server) logDecision(rec decisionRec) {
+	path := filepath.Join(s.cfg.CacheDir, "decision.jsonl")
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	data = append(data, '\n')
+	if st, err := os.Stat(path); err == nil && st.Size() > 4<<20 {
+		_ = os.Rename(path, path+".old")
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(data)
 }
 
 // ---- logging ----

@@ -1,10 +1,15 @@
 # AXR client core (Go)
 
-Native client half of the gozargah **AXR Protocol Framework** (v2.14).
-A SOCKS5 TCP inbound that tunnels every stream over a **bandit-selected
-VLESS-over-WebSocket** path, with client-side TLS-identity selection,
-ClientHello TCP segmentation, post-handshake TCP chunking, a persistent
-routing cache, and a normal/aggressive probe state machine.
+Native client half of the gozargah **AXR Protocol Framework** (v2.15,
+AXR-v2 Enterprise Core).
+A SOCKS5 TCP inbound that tunnels every stream over a **LinUCB-selected
+VLESS-over-WebSocket** path (standard + `ws-alt` shape arms), with
+client-side TLS-identity selection, ClientHello TCP segmentation,
+**app-class flow morphing** (length histogram + lognormal IPD), **TCP
+socket surgery** (Nagle off + randomized `SO_SNDBUF`), a persistent
+routing cache with **clean-IP harvesting**, **session reuse** (warm WS
+≤ 30 s, same destination), a **decision audit log**
+(`~/.axr/decision.jsonl`), and a normal/aggressive probe state machine.
 
 TLS terminates at the Cloudflare edge — therefore **all** fingerprint
 morphing, ClientHello surgery, and path/IP selection happens **here, locally**,
@@ -15,11 +20,13 @@ no deep inspection.
 
 | Path | What it is |
 | --- | --- |
-| `cmd/axr` | The binary: SOCKS5 → bandit-selected VLESS-WS tunnel |
-| `internal/bandit` | Contextual UCB1 learner over (host, transport, fp) arms; quarantine, prune, JSON persistence |
-| `internal/measure` | Client state vector: RTT/jitter EWMA, RST & timeout rates, CUSUM step-change, anomaly code → regime label |
-| `internal/surgery` | `SplitConn` (first write = ClientHello → 2 TCP segments, randomized offset + 20–120 ms gap) and `ChunkConn` (post-handshake 512–1400 B TCP chunks) |
-| `internal/failover` | Endpoint matrix (host × clean-IP × transport × fp), live IP health cache (atomic JSON), normal/aggressive probe state machine |
+| `cmd/axr` | The binary: SOCKS5 → LinUCB-selected VLESS-WS tunnel (ws + ws-alt arms), session reuse, decision.jsonl audit |
+| `internal/bandit` | **LinUCB** contextual bandit over (host, transport, fp) arms — 7-dim context, ridge A/b per arm, pure-Go Gauss-Jordan; quarantine, prune, JSON persistence (legacy 2.14 snapshots restore) |
+| `internal/measure` | Client state vector: RTT/jitter EWMA, RST & timeout rates, CUSUM step-change, anomaly code → regime label (feeds the LinUCB context) |
+| `internal/flowprofile` | App-class flow morphing: length histograms + lognormal IPD for `web`/`video`/`chat`; regime-driven; implements `surgery.Slicer` |
+| `internal/surgery` | `SplitConn` (first write = ClientHello → 2 TCP segments, randomized offset + 20–120 ms gap) and `ChunkConn` (post-handshake chunks; uniform 512–1400 B legacy, or a `Slicer`-driven app-class distribution) |
+| `internal/sockopt` | TCP socket surgery: `TCP_NODELAY` (Nagle off) + randomized `SO_SNDBUF` (64–512 KB); linux/darwin/windows, no-op elsewhere |
+| `internal/failover` | Endpoint matrix (host × clean-IP × transport × fp), live IP health cache (atomic JSON), normal/aggressive probe state machine, **A-record clean-IP harvesting** (injectable resolver) |
 | `internal/vlessws` | VLESS v1 header (byte-compatible with the Worker parser), 0-RTT early data via `Sec-WebSocket-Protocol`, minimal RFC 6455 client codec |
 
 ## Build
@@ -81,6 +88,17 @@ address. UDP ASSOCIATE is rejected (the Worker has no UDP relay — by design).
 - **Obfuscation + adaptation, not a guarantee.** Statistical shaping and
   path selection raise the bar against passive/flow heuristics; an actively
   probing filter may still classify the flow.
+- **Flow morphing shapes the client's own writes.** `flowprofile` changes
+  chunk sizes and inter-packet delays of bytes this process sends — no
+  payload inspection, no replayed traffic, no invisibility guarantee.
+- **Session reuse is same-destination only.** A WS session carries exactly
+  one backend stream; a warm session (≤ 30 s) is adopted only for the same
+  host:port. A stale session fails fast and dials fresh — worst case is no
+  reuse, never a broken tunnel.
+- **Shipped data plane: VLESS-over-WS (+ `ws-alt` shape).** gRPC and HTTP/3
+  are arm-set placeholders only; an HTTP-chunked duplex relay was measured
+  untestable in CI and deliberately not shipped (see
+  [`docs/AXR-V2-ADVANCED.md`](../docs/AXR-V2-ADVANCED.md) §7).
 - **Total disconnection is not bypassable remotely.** If no candidate entry
   is reachable from the local network, the binary reports `no healthy
   candidate` instead of pretending.

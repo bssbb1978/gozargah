@@ -23,6 +23,7 @@ import { lazyMaintenance } from './db/users';
 import { loadNetworkState } from './db/store';
 import { handlePanelApi } from './panel/api';
 import { panelHtml } from './panel/ui';
+import { decoyResponse } from './panel/decoy';
 import { landingHtml } from './panel/landing';
 import { userPageHtml } from './panel/userpage';
 import { LOGO_FAV_B64 } from './assets/logo';
@@ -154,7 +155,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     // unknown token: fall through to stealth landing (no user enumeration)
   }
 
-  // 5) landing for everything else (stealth, nahan-style no-leak)
+  // 5) scanner decoy (2.15) → stealth landing for everything else
+  const decoy = decoyResponse(request, url);
+  if (decoy) return decoy;
   return new Response(landingHtml('fa'), {
     headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
   });

@@ -10,6 +10,7 @@ import { createDiagnostics, getAiModelCandidates, rankCatalogModels } from '../a
 
 let mf: Miniflare;
 let db: D1Database;
+let axrV2User: { uuid: string } | null = null;
 const SECRET = 'test-webhook-secret-should-not-be-used-in-production';
 function makeDnsAaaaQuery(): Uint8Array {
   const name = [7, ...new TextEncoder().encode('example'), 3, ...new TextEncoder().encode('com'), 0];
@@ -36,6 +37,7 @@ beforeAll(async () => {
           TELEGRAM_ADMIN_IDS: '42',
           DNS_UPSTREAMS: 'https://doh.test/dns-query',
           DNS64_ENABLED: 'true',
+          CLEAN_EDGE_IPS: '203.0.113.10, 203.0.113.11, 999.1.1.1',
         },
         serviceBindings: { TELEGRAM_API: 'telegram-mock', DNS_UPSTREAM: 'dns-mock' },
       },
@@ -64,6 +66,10 @@ beforeAll(async () => {
     ],
   });
   db = await mf.getD1Database('GZ_DB', 'gozargah-test');
+  // Created up-front (not in the test body) so it is present in the Worker's
+  // first users-list read; the Worker bundles its own module copy with a
+  // short user-list cache, so users created after that read can be stale.
+  axrV2User = await createUser(db, { name: 'AXR v2 manifest', quotaBytes: 0, expiryAt: 0 });
 });
 
 afterAll(async () => { await mf?.dispose(); });
@@ -293,9 +299,52 @@ describe('Cloudflare Worker + D1 integration', () => {
     expect(typeof manifest.reconnect.probe_interval_ms).toBe('number');
   });
 
-  it('returns the stealth landing for an unknown token on the AXR feed path', async () => {
-    const response = await mf.dispatchFetch('https://gozargah.test/sub/unknown-token-abc/axr-manifest');
+  it('returns a benign decoy for unknown-token AXR probes and scanner paths', async () => {
+    // Scanner path shape → benign HTML product page (200, not an error).
+    const scan = await mf.dispatchFetch('https://gozargah.test/.env');
+    expect(scan.status).toBe(200);
+    expect(scan.headers.get('content-type')).toContain('text/html');
+    const scanBody = await scan.text();
+    expect(scanBody).toContain('<title>');
+
+    // JSON-typed API probe → benign JSON API.
+    const api = await mf.dispatchFetch('https://gozargah.test/api/status', {
+      headers: { accept: 'application/json' },
+    });
+    expect(api.status).toBe(200);
+    expect(api.headers.get('content-type')).toContain('application/json');
+    const apiJson = (await api.json()) as Record<string, unknown>;
+    expect(Object.keys(apiJson).length).toBeGreaterThanOrEqual(3);
+
+    // Unknown token + JSON accept on the machine feed → benign JSON (no user enumeration).
+    const feed = await mf.dispatchFetch('https://gozargah.test/sub/unknown-token-abc/axr-manifest', {
+      headers: { accept: 'application/json' },
+    });
+    expect(feed.status).toBe(200);
+    expect(feed.headers.get('content-type')).toContain('application/json');
+
+    // Ordinary unknown paths still get the stealth landing.
+    const landing = await mf.dispatchFetch('https://gozargah.test/some/ordinary/path');
+    expect(landing.status).toBe(200);
+    expect(landing.headers.get('content-type')).toContain('text/html');
+    expect(await landing.text()).toContain('Gozargah');
+  });
+
+  it('exposes AXR-v2 fields in the manifest (transports, flow profile, clean IP hints)', async () => {
+    const token = await subTokenFor('gozargah.test', axrV2User!.uuid);
+    const response = await mf.dispatchFetch(`https://gozargah.test/sub/${token}/axr-manifest`);
     expect(response.status).toBe(200);
-    expect(response.headers.get('content-type')).toContain('text/html');
+    expect(response.headers.get('content-type')).toContain('json');
+    const manifest = (await response.json()) as {
+      version: string;
+      transports: string[];
+      flow_profile: { mode: string };
+      clean_ip_hints: string[];
+    };
+    expect(manifest.version).toBe(VERSION);
+    expect(manifest.transports).toEqual(['ws', 'ws-alt']);
+    expect(manifest.flow_profile.mode).toBe('web');
+    // invalid entry (999.1.1.1) must be filtered out by cleanIpHints
+    expect(manifest.clean_ip_hints).toEqual(['203.0.113.10', '203.0.113.11']);
   });
 });

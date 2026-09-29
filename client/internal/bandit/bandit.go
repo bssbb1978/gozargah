@@ -1,16 +1,33 @@
 // Package bandit is the AXR client-side decision core: a lightweight,
-// zero-dependency contextual UCB1 multi-armed bandit that learns which
-// (entry host, transport, TLS fingerprint) arm is currently carrying
-// traffic best, and prunes arms that keep degrading.
+// zero-dependency LinUCB contextual bandit that learns which
+// (entry host, transport, TLS fingerprint) arm is currently carrying traffic
+// best *under the current network conditions*, and prunes arms that keep
+// degrading.
 //
-// Design notes (honest boundaries):
-//   - Rewards are shaped into [0,1]; hard failures are represented as
-//     reward 0 plus a consecutive-failure quarantine, NOT as negative UCB
-//     values. This keeps the UCB1 regret bound valid (it assumes [0,1]).
-//   - Deterministic under a fixed seed and a fixed call sequence: the
+// 2.15 upgrade: UCB1 -> LinUCB
+//   - UCB1 scores an arm by a single mean reward plus a pull-count bonus.
+//     It cannot express "arm A is good on a clean pipe but terrible when RSTs
+//     spike". LinUCB scores each arm as a linear function of a 7-dim context
+//     vector (see Context / features), so the same entry can be preferred or
+//     avoided as the measured conditions change. That is the whole point for
+//     a network whose behaviour is non-stationary.
+//   - Per arm we keep the ridge-regularised normal-equation state
+//         A_a = λI + Σ x xᵀ      (7×7, symmetric positive definite)
+//         b_a = Σ r x            (7)
+//     with θ_a = A_a⁻¹ b_a, and score an arm at context x by
+//         xᵀθ_a + α · √(x A_a⁻¹ x)
+//     (exploitation + width of the confidence interval). A is inverted with a
+//     partial-pivot Gauss-Jordan in pure Go — no external math dependency.
+//
+// Honest boundaries (unchanged):
+//   - Rewards are shaped into [0,1]; hard failures are represented as reward
+//     0 plus a consecutive-failure quarantine, NOT as negative scores. This
+//     keeps the contextual-UCB regret intuition valid (it assumes [0,1]).
+//   - Deterministic under a fixed seed and a fixed (ctx, call) sequence: the
 //     exploration tie-break is the stable arm order, never the wall clock.
 //   - No DPI detection here: the inputs are the client's own connection
-//     outcomes (ok / rtt / throughput / error class), nothing more.
+//     outcomes (ok / rtt / throughput / error class) and the context the
+//     measure package derives from exactly those. Nothing else.
 package bandit
 
 import (
@@ -32,22 +49,31 @@ const (
 	PruneKeepAlive = 2
 	// PruneMinPulls / PruneMaxRatio: an arm is prunable only after it has
 	// been tried enough and is persistently much worse than its peers.
-	PruneMinPulls   = 12
-	PruneMaxRatio   = 0.10
+	PruneMinPulls  = 12
+	PruneMaxRatio  = 0.10
+	ridge        = 1.0 // λ: ridge regularisation on A (keeps A invertible)
+	featureScale = 1.0 // reserved for future per-feature rescaling
+
 	successThroughputTarget = 2.0 * 1000 * 1000 // 2 MB/s saturates the bonus
 )
+
+// dim is the context-vector width: bias, rtt-level, rtt-variance, rst-rate,
+// tls-drop, loss-step, http-anomaly.
+const dim = 7
 
 // Arm is one selectable path: entry host × transport × TLS fingerprint.
 type Arm struct {
 	Host      string `json:"host"`
-	Transport string `json:"transport"` // "ws" | "h2" | "h3" | "grpc"
+	Transport string `json:"transport"` // "ws" | "ws-alt" | "h2" | "h3" | "grpc"
 	FP        string `json:"fp"`        // uTLS identity, e.g. "chrome"
 }
 
 // ID is the stable key used for persistence and tie-breaks.
 func (a Arm) ID() string { return a.Host + "|" + a.Transport + "|" + a.FP }
 
-// Stats is the per-arm learning state.
+// Stats is the per-arm learning state that drives quarantine and pruning.
+// The LinUCB A/b matrices live separately (see Snapshot.Lin) so this struct
+// stays stable across the 2.15 persistence format change.
 type Stats struct {
 	Pulls              int     `json:"pulls"`
 	TotalReward        float64 `json:"total_reward"`
@@ -58,7 +84,7 @@ type Stats struct {
 	Pruned             bool    `json:"pruned"`
 }
 
-// meanReward is the UCB1 "exploitation" term.
+// meanReward is the empirical reward mean (the "exploitation" reference).
 func (s *Stats) meanReward() float64 {
 	if s.Pulls == 0 {
 		return 0
@@ -67,11 +93,25 @@ func (s *Stats) meanReward() float64 {
 }
 
 // Context carries the environment signal the core has from the measure
-// package (and optionally the worker manifest regime).
+// package (and optionally the worker manifest regime). The float fields are
+// the *raw* measurements; features() normalises them into [0,1].
+//
+//   - RTTMS:      handshake+first-bytes latency EWMA (ms)
+//   - JitterMS:   RTT variance (EWMA of |Δrtt|, ms)
+//   - RSTRate:    fraction of the window that failed with a RST
+//   - TLSDrop:    fraction that failed at the TLS handshake (drop delta)
+//   - LossStep:   CUSUM step-change accumulator (0..~6)
+//   - HTTPAnom:   1 if the last observation carried a protocol anomaly, else 0
 type Context struct {
-	Regime           string `json:"regime"` // "stable"|"watch"|"suspected_change"|"recovering"
-	WeakestTransport string `json:"weakest_transport"`
-	NowMS            int64  `json:"now_ms"`
+	Regime           string  `json:"regime"` // "stable"|"watch"|"suspected_change"|"recovering"
+	WeakestTransport string  `json:"weakest_transport"`
+	NowMS            int64   `json:"now_ms"`
+	RTTMS            float64 `json:"rtt_ms"`
+	JitterMS         float64 `json:"jitter_ms"`
+	RSTRate          float64 `json:"rst_rate"`
+	TLSDrop          float64 `json:"tls_drop"`
+	LossStep         float64 `json:"loss_step"`
+	HTTPAnom         float64 `json:"http_anom"`
 }
 
 // Outcome is one connection result fed back to the bandit.
@@ -109,43 +149,194 @@ func reward(o Outcome) float64 {
 	return r
 }
 
+// clamp01 clamps x into [0,1].
+func clamp01(x float64) float64 {
+	if math.IsNaN(x) || x < 0 {
+		return 0
+	}
+	if x > 1 {
+		return 1
+	}
+	return x
+}
+
+// features maps a Context into the normalised dim-dim vector used by LinUCB.
+// The first component is a constant bias (intercept) so the model can learn
+// a per-arm baseline and the vector is never the zero vector.
+func features(ctx Context) vec {
+	f := vec{}
+	f[0] = 1.0
+	f[1] = clamp01(ctx.RTTMS / 2000)   // RTT level (2s = max)
+	f[2] = clamp01(ctx.JitterMS / 500) // RTT variance (500ms = max)
+	f[3] = clamp01(ctx.RSTRate)        // RST frequency (0..1)
+	f[4] = clamp01(ctx.TLSDrop)        // TLS drop rate (0..1)
+	f[5] = clamp01(ctx.LossStep / 6)   // loss step (CUSUM cap ~6)
+	f[6] = clamp01(ctx.HTTPAnom)       // 0 or 1
+	return f
+}
+
+// mat / vec are the fixed-width linear-algebra types for the dim×dim state.
+type (
+	mat [dim][dim]float64
+	vec [dim]float64
+)
+
+func (m *mat) identityScale(s float64) {
+	for i := 0; i < dim; i++ {
+		for j := 0; j < dim; j++ {
+			if i == j {
+				m[i][j] = s
+			} else {
+				m[i][j] = 0
+			}
+		}
+	}
+}
+
+// outer adds x xᵀ to m in place (m += x xᵀ).
+func (m *mat) addOuter(x *vec) {
+	for i := 0; i < dim; i++ {
+		for j := 0; j < dim; j++ {
+			m[i][j] += x[i] * x[j]
+		}
+	}
+}
+
+// addScaledVec adds r·x to v in place (v += r x).
+func (v *vec) addScaled(x *vec, r float64) {
+	for i := 0; i < dim; i++ {
+		v[i] += r * x[i]
+	}
+}
+
+// matVec returns m·v (a fresh vector).
+func (m *mat) matVec(v *vec) vec {
+	var out vec
+	for i := 0; i < dim; i++ {
+		s := 0.0
+		for j := 0; j < dim; j++ {
+			s += m[i][j] * v[j]
+		}
+		out[i] = s
+	}
+	return out
+}
+
+// dot returns x·y.
+func (x *vec) dot(y *vec) float64 {
+	s := 0.0
+	for i := 0; i < dim; i++ {
+		s += x[i] * y[i]
+	}
+	return s
+}
+
+// invert returns the inverse of m via partial-pivot Gauss-Jordan, or
+// (zero, false) when m is (numerically) singular. A is always SPD in practice
+// (λI + sum of outer products), so this is defensive.
+func (m *mat) invert() (mat, bool) {
+	aug := make([][]float64, dim)
+	for i := 0; i < dim; i++ {
+		aug[i] = make([]float64, 2*dim)
+		copy(aug[i][:dim], m[i][:])
+		aug[i][dim+i] = 1
+	}
+	for col := 0; col < dim; col++ {
+		piv := col
+		mx := math.Abs(aug[col][col])
+		for r := col + 1; r < dim; r++ {
+			if v := math.Abs(aug[r][col]); v > mx {
+				mx = v
+				piv = r
+			}
+		}
+		if mx < 1e-12 {
+			return mat{}, false
+		}
+		if piv != col {
+			aug[col], aug[piv] = aug[piv], aug[col]
+		}
+		p := aug[col][col]
+		for j := 0; j < 2*dim; j++ {
+			aug[col][j] /= p
+		}
+		for r := 0; r < dim; r++ {
+			if r == col {
+				continue
+			}
+			f := aug[r][col]
+			if f == 0 {
+				continue
+			}
+			for j := 0; j < 2*dim; j++ {
+				aug[r][j] -= f * aug[col][j]
+			}
+		}
+	}
+	var out mat
+	for i := 0; i < dim; i++ {
+		copy(out[i][:], aug[i][dim:])
+	}
+	return out, true
+}
+
+// armLin is one arm's LinUCB state.
+type armLin struct {
+	A mat
+	b vec
+}
+
+func newArmLin() *armLin {
+	l := &armLin{}
+	l.A.identityScale(ridge) // λI
+	return l
+}
+
 // Bandit is the learner. Safe for concurrent use.
 type Bandit struct {
-	mu    sync.Mutex
-	C     float64
-	arms  []Arm
-	stats map[string]*Stats
-	seed  uint64
+	mu     sync.Mutex
+	C      float64 // α: exploration scale
+	arms   []Arm
+	stats  map[string]*Stats
+	lin    map[string]*armLin
+	seed   uint64
 	// lastID is the previously selected arm, used for the diversity bonus
 	// during "suspected_change" (encourages rotating away from the status quo).
 	lastID string
 }
 
 // New creates a bandit over the given arms. c is the exploration constant
-// (1.0 is a good default). seed is retained for future seeded randomness;
-// selection is already deterministic without it.
+// α (1.0 is a good default). seed is retained for seeded tie-breaks; selection
+// is already deterministic without it.
 func New(c float64, seed uint64, arms []Arm) *Bandit {
 	if c <= 0 {
 		c = 1.0
 	}
-	b := &Bandit{C: c, seed: seed, stats: make(map[string]*Stats, len(arms))}
+	b := &Bandit{C: c, seed: seed, stats: make(map[string]*Stats, len(arms)), lin: make(map[string]*armLin, len(arms))}
 	for _, a := range arms {
-		if a.Host == "" || a.Transport == "" {
-			continue
-		}
-		if a.FP == "" {
-			a.FP = "chrome"
-		}
-		if _, ok := b.stats[a.ID()]; ok {
-			continue
-		}
-		b.arms = append(b.arms, a)
-		b.stats[a.ID()] = &Stats{}
+		b.addArmLocked(a)
 	}
 	if len(b.arms) == 0 {
 		panic("bandit.New: no valid arms")
 	}
 	return b
+}
+
+// addArmLocked registers one arm (caller holds b.mu).
+func (b *Bandit) addArmLocked(a Arm) {
+	if a.Host == "" || a.Transport == "" {
+		return
+	}
+	if a.FP == "" {
+		a.FP = "chrome"
+	}
+	id := a.ID()
+	if _, ok := b.stats[id]; ok {
+		return
+	}
+	b.arms = append(b.arms, a)
+	b.stats[id] = &Stats{}
+	b.lin[id] = newArmLin()
 }
 
 // ErrNoArm is returned when every arm is quarantined/pruned at selection time.
@@ -154,35 +345,65 @@ var ErrNoArm = errors.New("bandit: no selectable arm")
 // Score is the transparent per-arm decision trace (exported for the local
 // decision view and tests).
 type Score struct {
-	Arm        Arm     `json:"arm"`
-	Mean       float64 `json:"mean"`
-	Ucb        float64 `json:"ucb"`
-	Diversity  float64 `json:"diversity"`
-	WeakestHit float64 `json:"weakest_hit"`
-	Total      float64 `json:"total"`
-	Quarantined bool   `json:"quarantined"`
-	Pruned      bool   `json:"pruned"`
+	Arm         Arm     `json:"arm"`
+	Mean        float64 `json:"mean"`
+	Ucb         float64 `json:"ucb"` // LinUCB score (or untried boost)
+	Diversity   float64 `json:"diversity"`
+	WeakestHit  float64 `json:"weakest_hit"`
+	Total       float64 `json:"total"`
+	Quarantined bool    `json:"quarantined"`
+	Pruned      bool    `json:"pruned"`
 }
 
-// Scores exposes the full score table for the current context.
-func (b *Bandit) Scores(ctx Context) []Score {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	total := b.totalPulls()
-	exploration := b.C
-	if ctx.Regime == "suspected_change" {
-		exploration *= 1.8 // regime-driven exploration boost
+// linScore computes the LinUCB (mean, exploration) split for arm id at x.
+func (b *Bandit) linScore(id string, x *vec) (float64, float64) {
+	l := b.lin[id]
+	inv, ok := l.A.invert()
+	if !ok {
+		return 0, 0
 	}
+	theta := inv.matVec(&l.b)
+	mean := x.dot(&theta)
+	// xᵀ A¹ x = x · (A⁻¹ x)
+	ax := inv.matVec(x)
+	v := x.dot(&ax)
+	if v < 0 {
+		v = 0
+	}
+	exploration := b.C * math.Sqrt(v)
+	return mean, exploration
+}
+
+// explorationScale returns α with the regime-driven boost applied.
+func (b *Bandit) explorationScale(ctx Context) float64 {
+	alpha := b.C
+	if ctx.Regime == "suspected_change" {
+		alpha *= 1.8 // regime-driven exploration boost
+	}
+	return alpha
+}
+
+// scoresLocked is the core scorer; both Scores and Select use it.
+func (b *Bandit) scoresLocked(ctx Context) []Score {
+	x := features(ctx)
+	xp := x
+	alpha := b.explorationScale(ctx)
 	out := make([]Score, 0, len(b.arms))
 	for _, a := range b.arms {
-		s := b.stats[a.ID()]
+		id := a.ID()
+		s := b.stats[id]
 		sc := Score{Arm: a, Quarantined: s.QuarantinedUntilMS > ctx.NowMS, Pruned: s.Pruned}
 		sc.Mean = s.meanReward()
-		if s.Pulls > 0 {
-			sc.Ucb = sc.Mean + exploration*math.Sqrt(math.Log(float64(total+1))/float64(s.Pulls))
+		if s.Pulls == 0 {
+			// Untried arms get the maximum possible mean so they are explored
+			// before any exploitation. This is deliberate: the client must
+			// actually *try* every entry at least once or failover can never
+			// discover a path that is currently up. It also keeps the first
+			// pick deterministic (all equal -> stable ID tie-break).
+			sc.Ucb = 1.0 + alpha
 		} else {
-			// Untried arms get the max possible mean so they are explored.
-			sc.Ucb = 1.0 + exploration
+			mean, exploration := b.linScore(id, &xp)
+			sc.Ucb = mean + exploration
 		}
 		if ctx.WeakestTransport != "" && a.Transport == ctx.WeakestTransport && ctx.Regime != "stable" {
 			// A mild nudge OFF the currently weakest transport.
@@ -195,6 +416,13 @@ func (b *Bandit) Scores(ctx Context) []Score {
 		out = append(out, sc)
 	}
 	return out
+}
+
+// Scores exposes the full score table for the current context.
+func (b *Bandit) Scores(ctx Context) []Score {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.scoresLocked(ctx)
 }
 
 // Select returns the best arm for ctx (and the full score table). It never
@@ -235,52 +463,31 @@ func (b *Bandit) Select(ctx Context) (Arm, []Score, error) {
 	return scores[best].Arm, scores, nil
 }
 
-func (b *Bandit) scoresLocked(ctx Context) []Score {
-	total := b.totalPulls()
-	exploration := b.C
-	if ctx.Regime == "suspected_change" {
-		exploration *= 1.8
-	}
-	out := make([]Score, 0, len(b.arms))
-	for _, a := range b.arms {
-		s := b.stats[a.ID()]
-		sc := Score{Arm: a, Quarantined: s.QuarantinedUntilMS > ctx.NowMS, Pruned: s.Pruned}
-		sc.Mean = s.meanReward()
-		if s.Pulls > 0 {
-			sc.Ucb = sc.Mean + exploration*math.Sqrt(math.Log(float64(total+1))/float64(s.Pulls))
-		} else {
-			sc.Ucb = 1.0 + exploration
-		}
-		if ctx.WeakestTransport != "" && a.Transport == ctx.WeakestTransport && ctx.Regime != "stable" {
-			sc.WeakestHit = -0.05
-		}
-		if ctx.Regime == "suspected_change" && a.ID() != b.lastID && b.lastID != "" {
-			sc.Diversity = 0.05
-		}
-		sc.Total = sc.Ucb + sc.Diversity + sc.WeakestHit
-		out = append(out, sc)
-	}
-	return out
-}
-
-func (b *Bandit) totalPulls() int {
-	total := 0
-	for _, s := range b.stats {
-		total += s.Pulls
-	}
-	return total
-}
-
-// Observe feeds one outcome back for arm a at time now (ms).
-func (b *Bandit) Observe(a Arm, o Outcome, now int64) {
+// Observe feeds one outcome back for arm a, measured under context ctx at time
+// now (ms). ctx must be the same context that was current when the arm was
+// selected, so the LinUCB update lands on the right feature vector.
+func (b *Bandit) Observe(a Arm, o Outcome, ctx Context, now int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s, ok := b.stats[a.ID()]
+	id := a.ID()
+	s, ok := b.stats[id]
 	if !ok {
 		return
 	}
+	r := reward(o)
+	x := features(ctx)
+	if l, ok := b.lin[id]; ok {
+		l.A.addOuter(&x)
+		l.b.addScaled(&x, r)
+	} else {
+		l := newArmLin()
+		l.A.addOuter(&x)
+		l.b.addScaled(&x, r)
+		b.lin[id] = l
+	}
+
 	s.Pulls++
-	s.TotalReward += reward(o)
+	s.TotalReward += r
 	if o.OK {
 		s.ConsecOK++
 		s.ConsecFail = 0
@@ -359,14 +566,7 @@ func (b *Bandit) Prune() []string {
 func (b *Bandit) AddArm(a Arm) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if a.FP == "" {
-		a.FP = "chrome"
-	}
-	if _, ok := b.stats[a.ID()]; ok {
-		return
-	}
-	b.arms = append(b.arms, a)
-	b.stats[a.ID()] = &Stats{}
+	b.addArmLocked(a)
 }
 
 // Arms returns a copy of the arm list.
@@ -378,12 +578,19 @@ func (b *Bandit) Arms() []Arm {
 	return out
 }
 
-// Snapshot is the JSON-persistable state (arm set + stats + config).
+// LinState is the persistable per-arm LinUCB state.
+type LinState struct {
+	A mat `json:"a"`
+	B vec `json:"b"`
+}
+
+// Snapshot is the JSON-persistable state (arm set + stats + lin + config).
 type Snapshot struct {
-	C     float64            `json:"c"`
-	Seed  uint64             `json:"seed"`
-	Arms  []Arm              `json:"arms"`
-	Stats map[string]*Stats  `json:"stats"`
+	C     float64             `json:"c"`
+	Seed  uint64              `json:"seed"`
+	Arms  []Arm               `json:"arms"`
+	Stats map[string]*Stats   `json:"stats"`
+	Lin   map[string]*LinState `json:"lin,omitempty"`
 }
 
 // Snapshot exports state for persistence.
@@ -395,13 +602,18 @@ func (b *Bandit) Snapshot() Snapshot {
 		cp := *v
 		stats[k] = &cp
 	}
+	lin := make(map[string]*LinState, len(b.lin))
+	for k, v := range b.lin {
+		lin[k] = &LinState{A: v.A, B: v.b}
+	}
 	arms := make([]Arm, len(b.arms))
 	copy(arms, b.arms)
-	return Snapshot{C: b.C, Seed: b.seed, Arms: arms, Stats: stats}
+	return Snapshot{C: b.C, Seed: b.seed, Arms: arms, Stats: stats, Lin: lin}
 }
 
 // Restore loads persisted state. Unknown arms in old snapshots are ignored;
-// missing arms get fresh stats.
+// missing arms get fresh stats. Arms missing Lin state get a fresh λI so the
+// learner starts from the ridge prior for those arms.
 func (b *Bandit) Restore(s Snapshot) error {
 	if len(s.Arms) == 0 {
 		return fmt.Errorf("bandit: empty snapshot")
@@ -413,6 +625,7 @@ func (b *Bandit) Restore(s Snapshot) error {
 	}
 	b.arms = nil
 	b.stats = make(map[string]*Stats, len(s.Arms))
+	b.lin = make(map[string]*armLin, len(s.Arms))
 	for _, a := range s.Arms {
 		if a.Host == "" || a.Transport == "" {
 			continue
@@ -420,15 +633,22 @@ func (b *Bandit) Restore(s Snapshot) error {
 		if a.FP == "" {
 			a.FP = "chrome"
 		}
-		if _, ok := b.stats[a.ID()]; ok {
+		id := a.ID()
+		if _, ok := b.stats[id]; ok {
 			continue
 		}
 		b.arms = append(b.arms, a)
-		if st, ok := s.Stats[a.ID()]; ok {
+		if st, ok := s.Stats[id]; ok {
 			cp := *st
-			b.stats[a.ID()] = &cp
+			b.stats[id] = &cp
 		} else {
-			b.stats[a.ID()] = &Stats{}
+			b.stats[id] = &Stats{}
+		}
+		if ls, ok := s.Lin[id]; ok {
+			l := &armLin{A: ls.A, b: ls.B}
+			b.lin[id] = l
+		} else {
+			b.lin[id] = newArmLin()
 		}
 	}
 	if len(b.arms) == 0 {

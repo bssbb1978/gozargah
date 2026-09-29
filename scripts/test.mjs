@@ -26,6 +26,7 @@ const entries = [
   'fp-rotation',
   'shape',
   'decision',
+  'decoy',
 ];
 
 for (const name of entries) {

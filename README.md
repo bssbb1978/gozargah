@@ -1,4 +1,29 @@
-# Gozargah 2.14.0 — AXR Protocol Framework: Native Client Core + Machine Feed
+# Gozargah 2.15.0 — AXR-v2 Enterprise Core: LinUCB + Flow Morphing + Scanner Decoy
+
+## 2.15.0 — AXR-v2 Enterprise Core (advanced increment)
+
+### Highlights
+- **LinUCB contextual bandit (Go client, M1)** — the decision core upgrades from UCB1 to a zero-dependency **LinUCB** contextual bandit: per-arm ridge state (7×7 `A`, 7-dim `b`, pure-Go Gauss-Jordan inverse) scored against a **7-dim context** (RTT level, RTT variance, RST frequency, TLS drop delta, CUSUM loss step, protocol anomaly, bias) measured from the client's own outcomes. Same entry can be preferred or avoided as conditions change. Unchanged: [0,1] reward shaping, quarantine backoff, auto-prune (≥2 live arms), deterministic tie-breaks, atomic persistence (legacy 2.14 snapshots restore with the ridge prior rebuilt).
+- **App-class flow morphing (Go client, M2)** — new `internal/flowprofile`: post-handshake writes are split by a **packet-length histogram** toward a target app class (`web`/`video`/`chat`) with **lognormal inter-packet delays**; regime-driven (stable→web, watch→chat, suspected_change→video). Wired into `surgery.ChunkConn` via a `Slicer` interface. New `internal/sockopt`: **Nagle off + per-connection randomized `SO_SNDBUF`** (64–512 KB), build-tagged linux/darwin/windows, no-op elsewhere.
+- **Clean edge-IP harvesting (Go client, M3)** — `failover.HarvestedIPs` / `Engine.HarvestEntries` merge each entry's live **A records** (injectable resolver, IPv4-only, deduped, capped at 8, explicit operator IPs first) into the endpoint matrix at startup; the manifest's new `clean_ip_hints` (operator `CLEAN_EDGE_IPS`, validated) merge the same way.
+- **Session reuse + decision audit (Go client, M4 half)** — a tunnel ending on a clean local close keeps its WS **warm ≤ 30 s** for same-destination adoption (zero re-dial/re-handshake; stale sessions auto-fall-back to a fresh dial). Every decision appends to `~/.axr/decision.jsonl` (context, chosen arm, full score table, attempts tried, outcome; 4 MB rotation). Every entry now also runs a **`ws-alt`** arm — same host over the `gz_profile=fragmented` path/query shape — so the bandit learns the healthier shape.
+- **Scanner decoy layer (Worker, M4 half)** — new `src/panel/decoy.ts`: unmatched GET/HEAD requests with scanner path shapes (`/.env`, `/.git/…`, `/wp-login.php`, `/admin`, `/api/…`, `/config.json`, `/axr*`, `/sub/<bad>/…`, …) receive **benign variants** — 3 small-business HTML product pages (random 32-hex padding per response) or 2 benign JSON API shapes for JSON-typed probes — before the stealth landing. No user enumeration, no constant signature, real routes untouched, POST never decoyed.
+- **Manifest v2 fields (Worker)** — `transports: ["ws","ws-alt"]`, `flow_profile.mode` (regime-escalated web/chat/video from D1 state), `clean_ip_hints[]`.
+- **Reserved stubs, documented** — HTTP-chunked duplex relay measured untestable in CI (miniflare buffers request bodies → would ship unverified), so gRPC and HTTP/3 remain arm-set placeholders with documented status; WS (+ws-alt) is the shipped data plane.
+
+### Honest platform boundary (restated)
+Flow morphing shapes the client's own write segmentation — no payload inspection, no replayed traffic, no invisibility guarantee. The decoy layer changes *unmatched* probe responses only. A fully cut route (no path from the local network to any entry) cannot be created by client or Worker code; the core reports it instead of looping. See [AXR-v2 Advanced Features](docs/AXR-V2-ADVANCED.md).
+
+### Verification status
+Worker side: `npm run typecheck`, `npm test` (engine checks + 10 pure-logic suites incl. new `decoy` + 17 integration tests incl. new decoy/manifest-v2), and `npm run build` all pass. Go core: complete source + unit tests (LinUCB closed-form context tests, flowprofile distribution tests, sockopt, harvest), **not compiled in the authoring sandbox** (no Go toolchain) — deploy gate `go vet && go build && go test ./...` per [AXR-DEPLOY](docs/AXR-DEPLOY.md).
+
+### Engineering documents
+- [AXR-v2 Enterprise Core — Advanced Features (2.15)](docs/AXR-V2-ADVANCED.md)
+- [AXR Protocol Specification](docs/AXR-SPEC.md)
+- [AXR Cross-Compile & Deploy Guide](docs/AXR-DEPLOY.md)
+- [Client Core README](client/README.md)
+- [Test Report 2.15.0](TEST-REPORT-2.15.0.md)
+- [Persian Upgrade Report 2.15.0](UPGRADE-REPORT-FA-2.15.0.md)
 
 ## 2.14.0 — AXR Protocol Framework
 
