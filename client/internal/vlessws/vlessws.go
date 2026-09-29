@@ -305,7 +305,7 @@ func (f *Fragmenter) send(c *Client, payload []byte) error {
 	off := 0
 	last := len(sizes) - 1
 	for i, sz := range sizes {
-		op := opBinary
+		op := byte(opBinary)
 		if i > 0 {
 			op = opContinuation
 		}

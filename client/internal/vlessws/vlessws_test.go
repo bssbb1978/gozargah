@@ -429,7 +429,7 @@ func TestFragmenterSendRhythm(t *testing.T) {
 		if err != nil {
 			t.Fatalf("frame %d: %v", i, err)
 		}
-		wantOp := opBinary
+		var wantOp byte = opBinary
 		if i > 0 {
 			wantOp = opContinuation
 		}
