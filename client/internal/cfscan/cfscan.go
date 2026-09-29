@@ -239,7 +239,7 @@ func SampleCandidates(cidrs, priority, blocked []string, per int, rng Rng) []str
 		// cannot loop when the budget is tiny and collisions pile up.
 		maxTries := budget * 16
 		got := 0
-		mask := ipnet.Mask.Size()
+		mask, _ := ipnet.Mask.Size()
 		for i := 0; i < maxTries && got < budget; i++ {
 			off := uint32(rng() * float64(n))
 			// For prefixes wider than /31 the first address is the network

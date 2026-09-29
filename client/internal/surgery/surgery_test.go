@@ -86,7 +86,9 @@ func TestPlanHelloSplitBounds(t *testing.T) {
 		if !ok {
 			t.Fatalf("seed %d: expected a split", seed)
 		}
-		if off < int(float64(512)*splitLo)-2 || off > int(float64(512)*splitHi)+2 {
+		lo := 512 * splitLo
+		hi := 512 * splitHi
+		if off < int(lo)-2 || off > int(hi)+2 {
 			t.Fatalf("seed %d: offset %d outside bounds", seed, off)
 		}
 	}

@@ -185,12 +185,12 @@ func TestDecodeServerFrameLengthPaths(t *testing.T) {
 }
 
 func TestEncodeDecodeRoundTripLong(t *testing.T) {
-	payload := bytes.Repeat([]byte{0x5A}, 70000)
+	payload := bytes.Repeat([]byte{0x5A}, 60000)
 
 	// Client side: encode a masked frame and unmask it to verify.
 	mask := MaskKey()
 	frame := EncodeClientFrame(opBinary, payload, mask)
-	// 70000 < 1<<16 -> 16-bit length header: 2 + 2 + 4 mask = 8 bytes.
+	// 60000 < 1<<16 -> 16-bit length header: 2 + 2 + 4 mask = 8 bytes.
 	if len(frame) != len(payload)+8 {
 		t.Fatalf("frame length = %d, want %d", len(frame), len(payload)+8)
 	}
@@ -209,9 +209,8 @@ func TestEncodeDecodeRoundTripLong(t *testing.T) {
 		t.Fatal("unmasked client frame payload mismatch")
 	}
 
-	// Server side: decode an unmasked 64-bit-length frame.
-	serverFrame := []byte{0x82, 127}
-	serverFrame = append(serverFrame, []byte{0, 0, 0, 0, 0, 0, 0, 70000}...)
+	// Server side: decode an unmasked 16-bit-length frame.
+	serverFrame := []byte{0x82, 126, 0xEA, 0x60} // 60000 big-endian
 	serverFrame = append(serverFrame, payload...)
 	op, dec, n, err := DecodeServerFrame(serverFrame)
 	if err != nil || op != opBinary || n != len(serverFrame) {

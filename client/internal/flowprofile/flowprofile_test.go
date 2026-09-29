@@ -103,7 +103,7 @@ func TestSampleLengthDeterministicWithSeed(t *testing.T) {
 func TestNormalDrawFinite(t *testing.T) {
 	r := rand.New(rand.NewSource(3))
 	for i := 0; i < 10000; i++ {
-		z := normalDraw(r)
+		z := normalDraw(r.Float64)
 		if z != z { // NaN
 			t.Fatal("normalDraw returned NaN")
 		}

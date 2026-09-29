@@ -29,12 +29,12 @@ func rawControl(conn net.Conn, fn func(fd uintptr) error) error {
 
 func setNoNagle(conn net.Conn) error {
 	return rawControl(conn, func(fd uintptr) error {
-		return syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+		return syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 	})
 }
 
 func setSendBuf(conn net.Conn, size int) error {
 	return rawControl(conn, func(fd uintptr) error {
-		return syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, size)
+		return syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, size)
 	})
 }
