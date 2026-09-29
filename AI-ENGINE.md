@@ -28,7 +28,9 @@ This is lightweight statistical learning, not a large language model and not a D
 
 ## Workers AI is optional and read-only
 
-`diagnostics.ts` invokes Workers AI only for an authenticated, rate-limited aggregate operations-advice action. It receives aggregate panel counters — including 2.12's `regimeState`/`regimeConfidence` (aggregate statistics labels) and `backupEntryCount` — but never user credentials, UUIDs, subscription links, packet contents, or private keys. The advisor is instructed that `regimeState` must not be interpreted as DPI detection. Model output is text advice, not a network configuration, and does not affect the adaptive controller.
+`diagnostics.ts` invokes Workers AI only for an authenticated, rate-limited aggregate operations-advice action. It receives aggregate panel counters and bounded profile-outcome aggregates (sample count, rounded success rate, 100 ms latency bucket, and freshness) — including `regimeState` as an aggregate statistics label — but never user credentials, UUIDs, subscription links, hostnames, IPs, packet contents, or private keys. The advisor is instructed that regime labels are not DPI/censorship diagnoses.
+
+The model is asked for one `axr-strategy-advice/v1` JSON object. `strategy-recommendation.ts` rejects prose, Markdown, unknown fields, unsupported transport/profile/entry aliases, and invalid types; numeric ranges are clamped. Entry and SNI choices are opaque aliases (`primary`, `backup_1`…) rather than hostnames. Only the normalized enum/numeric object is returned, and the panel text is rendered from that normalized object; raw model output is never returned or used by the proxy data path. The recommendation is advisory-only, not auto-applied. Invalid output, model failure, or unavailable AI falls back to deterministic local diagnostics and leaves the existing local adaptive controller in charge.
 
 When `AI_CATALOG_ACCOUNT_ID` and `AI_CATALOG_API_TOKEN` are set, a Cloudflare model-catalog query is cached for six hours and candidate text models are ranked from available catalog metadata. `AI_MODELS` can explicitly prioritize IDs. Existing fallback model IDs remain a compatibility fallback if catalog discovery is unavailable; availability and plan eligibility are not guaranteed. D1 records per-model success/failure/quarantine where available; failures fall back to local deterministic advice.
 
@@ -40,7 +42,7 @@ DoH upstream ordering uses a bounded isolate-local EWMA latency and smoothed suc
 
 - No AI model identifies DPI or proves censorship.
 - No AI output activates profiles, changes transports or overrides the capability matrix.
-- No AI inference is required for health scoring or recovery.
-- This release adds no runtime model capability benchmarking, end-to-end inference cancellation, AI recommendation schema, or AI-driven network-profile ranking.
+- No AI inference is required for health scoring or recovery; the recommendation schema does not select or rank live network profiles.
+- The optional AI advisor is not on the data path, does not apply returned parameters, and does not prove a recommendation will work in a deployment.
 - This Worker cannot restore connectivity when the user's network has no route to the Worker/Cloudflare edge.
 - DNS64 creates synthetic AAAA answers only; a reachable NAT64 translator is still required.

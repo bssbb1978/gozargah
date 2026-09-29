@@ -326,10 +326,11 @@ func (d *Detector) stepLocked() Regime {
 			d.regime = RegimeRecovering
 		} else if frontingDead && canaryCut {
 			d.regime = RegimeCut
-		} else if !primaryDead {
-			// International reached again (at least one primary observation
-			// succeeded): fall back to the softer degraded label rather than
-			// holding a declared intranet window open.
+		} else if canaryLive || !primaryDead {
+			// The independent international liveness route recovered, or a
+			// primary entry itself carried again. Either removes the evidence
+			// for a domestic-only blackout; relax the blackout quiet policy and
+			// let bounded probes re-check the configured primary endpoints.
 			d.regime = RegimeDegraded
 		}
 	case RegimeDegraded:

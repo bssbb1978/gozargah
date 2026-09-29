@@ -1695,8 +1695,15 @@ func (s *server) applyPolicy() {
 	if r == s.lastRegime {
 		return
 	}
+	previous := s.lastRegime
 	s.lastRegime = r
 	pol := r.Policy()
+	if previous == netstate.RegimeNetEMelli && r != netstate.RegimeNetEMelli && r != netstate.RegimeCut {
+		// A fresh live canary ended the domestic-only classification. Old
+		// blackout quiet deadlines would otherwise keep primary paths out of
+		// the probe ladder even after the policy had relaxed.
+		s.failover.ClearQuiet()
+	}
 	for _, ep := range s.failover.Entries() {
 		p := pol.Backup
 		switch {

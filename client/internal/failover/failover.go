@@ -131,6 +131,9 @@ type Engine struct {
 	state   string // "normal" | "aggressive"
 	// failure streak that triggers aggressive mode
 	streak int
+	// When every address is quiet, probe one rotating candidate per round.
+	// A fixed first-candidate retry could starve a recovered alternate route.
+	quietCursor int
 	// quiet is the blackout-quiet gate (disabled until SetQuietPolicy).
 	quiet QuietPolicy
 }
@@ -315,6 +318,17 @@ func (e *Engine) SetQuietPolicy(p QuietPolicy) {
 	e.quiet = p
 }
 
+// ClearQuiet releases every dial address from its current quiet window. The
+// client calls this only after fresh independent liveness evidence ends a
+// domestic-only blackout, so primary routes can be checked immediately.
+func (e *Engine) ClearQuiet() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, h := range e.cache.Health {
+		h.QuietUntilMS = 0
+	}
+}
+
 // Quiet returns the audit view of the blackout-quiet gate.
 func (e *Engine) Quiet() QuietState {
 	e.mu.Lock()
@@ -447,7 +461,12 @@ func (e *Engine) ProbeRound(now time.Time) []Candidate {
 	order := e.failoverOrderLocked(nil, true, now.UnixMilli())
 	if len(order) == 0 {
 		if full := e.failoverOrderLocked(nil, false, now.UnixMilli()); len(full) > 0 {
-			order = full[:1]
+			// Keep blackout probe volume to one attempt per round, but rotate
+			// across the bounded ladder so a recovered non-leading path is not
+			// starved forever by one still-dead first entry.
+			index := e.quietCursor % len(full)
+			order = []Candidate{full[index]}
+			e.quietCursor = (index + 1) % len(full)
 		}
 	}
 	timeout := normalProbeTimeout

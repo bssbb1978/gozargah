@@ -329,6 +329,14 @@ func TestNetEMelliCanaryGuard(t *testing.T) {
 	if !d.IsBlackout() {
 		t.Fatal("netemelli must report as a blackout")
 	}
+	// Fresh international liveness must close the domestic-only classification
+	// and relax the blackout gate so bounded primary probes can resume.
+	if got := d.Record(obs(RoleCanary, true, 5)); got != RegimeDegraded {
+		t.Fatalf("a recovered international canary must leave netemelli, got %s", got)
+	}
+	if d.IsBlackout() {
+		t.Fatal("a fresh live international canary must clear the blackout label")
+	}
 }
 
 // TestNetEMelliWithoutACanary: a client with no canary configured has no

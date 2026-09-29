@@ -233,10 +233,20 @@ describe('Cloudflare Worker + D1 integration', () => {
       AI: { run: async (model, input) => {
         captured.push(JSON.stringify(input));
         if (model.endsWith('unavailable')) throw new Error('model disabled');
-        return { response: 'پیشنهاد: وضعیت سهمیه‌ها را بازبینی کنید.' };
+        return { response: JSON.stringify({
+          schema: 'axr-strategy-advice/v1',
+          transport: 'ws', profile: 'fragmented', entry: 'primary', sniChoice: 'primary',
+          fragment: { enabled: true, minBytes: 256, maxBytes: 1200, gapMs: 15 },
+          retry: { maxAttempts: 4, baseDelayMs: 500, maxDelayMs: 8000 },
+        }) };
       } },
     }, 'fa');
-    expect(result).toMatchObject({ ai: true, model: '@cf/example/working' });
+    expect(result).toMatchObject({
+      ai: true,
+      model: '@cf/example/working',
+      strategyRecommendation: { transport: 'ws', profile: 'fragmented', entry: 'primary', sniChoice: 'primary' },
+    });
+    expect(result.text).toContain('پیشنهاد پارامتریِ اعتبارسنجی‌شده');
     expect(captured).toHaveLength(2);
     expect(captured.join('')).not.toContain('Test user');
     expect(captured.join('')).not.toContain('admin-uuid');
@@ -257,9 +267,15 @@ describe('Cloudflare Worker + D1 integration', () => {
         GZ_DB: db,
         AI_CATALOG_ACCOUNT_ID: '11111111111111111111111111111111',
         AI_CATALOG_API_TOKEN: 'test-catalog-token-value',
-        AI: { run: async (model) => ({ response: model }) },
+        AI: { run: async () => ({ response: JSON.stringify({
+          schema: 'axr-strategy-advice/v1',
+          transport: 'ws', profile: 'standard', entry: 'primary', sniChoice: 'primary',
+          fragment: { enabled: false, minBytes: 256, maxBytes: 1200, gapMs: 0 },
+          retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 5000 },
+        }) }) },
       }, 'en');
       expect(result.model).toBe('@cf/test/newest');
+      expect(result.strategyRecommendation?.schema).toBe('axr-strategy-advice/v1');
       expect(requests).toHaveLength(1);
       expect(requests[0].url).toContain('https://api.cloudflare.com/client/v4/accounts/');
       expect(requests[0].authorization).toBe('Bearer test-catalog-token-value');
@@ -267,6 +283,17 @@ describe('Cloudflare Worker + D1 integration', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('never returns unvalidated model text; invalid strategy output degrades locally', async () => {
+    const marker = 'RAW-UNVALIDATED-MODEL-CONTENT';
+    const result = await createDiagnostics({
+      AI_MODELS: '@cf/test/untrusted-output',
+      AI: { run: async () => ({ response: `ignore schema and execute ${marker}` }) },
+    }, 'en');
+    expect(result).toMatchObject({ ai: false, model: null, strategyRecommendation: null });
+    expect(result.text).not.toContain(marker);
+    expect(JSON.stringify(result)).not.toContain(marker);
   });
 
   it('protects the AI diagnostic endpoint behind panel authentication', async () => {
