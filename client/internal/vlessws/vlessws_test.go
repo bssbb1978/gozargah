@@ -225,7 +225,7 @@ func TestExpectedAcceptMatchesRFC(t *testing.T) {
 	// RFC 6455 §1.3 example.
 	key := []byte("dGhlIHNhbXBsZSBub25jZQ==")
 	accept := expectedAccept(key)
-	if accept != "s3pPLMIBIZlLFOJHzqTBDOn7nPA=" {
+	if accept != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
 		t.Fatalf("accept mismatch: %s", accept)
 	}
 	// And the constant math is right:

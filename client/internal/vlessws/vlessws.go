@@ -129,15 +129,15 @@ func MaskKey() [4]byte {
 
 // EncodeClientFrame builds a MASKED client frame (FIN set) for one message.
 func EncodeClientFrame(opcode byte, payload []byte, mask [4]byte) []byte {
-	head := []byte{0x80 | (opcode & 0x0f), 0x80}
+	head := []byte{0x80 | (opcode & 0x0f)}
 	n := len(payload)
 	switch {
 	case n < 126:
-		head[1] |= byte(n)
+		head = append(head, 0x80|byte(n))
 	case n < 1<<16:
-		head = append(head, 126, byte(n>>8), byte(n))
+		head = append(head, 0x80|126, byte(n>>8), byte(n))
 	default:
-		head = append(head, 127, 0, 0, 0, 0, 0, 0, 0, 0)
+		head = append(head, 0x80|127, 0, 0, 0, 0, 0, 0, 0, 0)
 		binary.BigEndian.PutUint64(head[len(head)-8:], uint64(n))
 	}
 	head = append(head, mask[:]...)

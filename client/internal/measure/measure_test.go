@@ -6,13 +6,6 @@ import (
 	"testing"
 )
 
-func feedSeq(t *Tracker, samples ...Sample) {
-	for i := range samples {
-		samples[i].UnixMS += 100
-		t.Feed(samples[i])
-	}
-}
-
 func okSample(rtt float64) Sample { return Sample{OK: true, RTTMS: rtt, Transport: "ws"} }
 
 func TestStableStreamStaysStable(t *testing.T) {

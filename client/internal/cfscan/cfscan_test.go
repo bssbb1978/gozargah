@@ -117,10 +117,11 @@ func TestTopNRanking(t *testing.T) {
 	if top[0].IP != "2.2.2.2" || top[1].IP != "2.2.2.3" {
 		t.Fatalf("ranking wrong: %v", top)
 	}
-	// Failed results always sink below OK ones
-	top3 := TopN(rs, 3)
-	if top3[2].OK {
-		t.Fatalf("failed result must sink: %v", top3)
+	// Failed results always sink below OK ones — to the LAST slot of the
+	// full ranking (with 3 OK candidates they cannot appear in any top-3).
+	all := TopN(rs, len(rs))
+	if all[len(all)-1].OK || all[len(all)-1].IP != "3.3.3.3" {
+		t.Fatalf("failed result must sink to last: %v", all)
 	}
 }
 
