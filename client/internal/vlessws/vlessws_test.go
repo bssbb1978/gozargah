@@ -596,8 +596,9 @@ func TestUpgradeShapeOrderInvariants(t *testing.T) {
 			sh := NewUpgradeShape(rand.New(rand.NewSource(seed)).Float64, tpl, LocalePool[0], UAPool[0], OriginPool[0])
 			req := buildUpgradeRequest("ex.com", "/up", key, "ed", sh)
 			lines := strings.Split(req, "\r\n")
-			if len(lines) < 3 || !strings.HasPrefix(lines[1], "Host: ") {
-				t.Fatalf("seed %d tpl %d: first header must be Host: %q", seed, tpl, lines[1])
+			hk, _, ok := strings.Cut(lines[1], ":")
+			if !ok || !strings.EqualFold(hk, "Host") {
+				t.Fatalf("seed %d tpl %d: first header must be Host (case-insensitive): %q", seed, tpl, lines[1])
 			}
 			pos := func(name string) int {
 				for i, ln := range lines[1:] {
