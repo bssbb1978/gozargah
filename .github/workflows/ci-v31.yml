@@ -2,8 +2,9 @@
 # AXR v3.1 — Deep Evasion: ZERO-DEFECT release gate
 #
 # Job Suite A (go-client): Go client core engine verification
-#   - Matrix: ubuntu (linux/amd64, linux/arm64, android/arm64 + NDK)
-#             macos  (darwin/arm64, darwin/amd64)
+#   - Matrix: ubuntu-24.04 (linux/amd64, linux/arm64, android/arm64 + NDK)
+#             macos-15-intel (darwin/arm64, darwin/amd64; x64 pool keeps
+#             the run free of the macOS arm64 capacity notice)
 #             windows (windows/amd64)
 #   - Strict gates: go vet (0 warnings) + staticcheck (0 findings)
 #     + go test -race -count=1 on the native host arch (race detector is
@@ -58,7 +59,7 @@ jobs:
             targets: "linux/amd64 linux/arm64 android/arm64"
             native_race: true
             android: true
-          - os: macos-latest
+          - os: macos-15-intel
             targets: "darwin/arm64 darwin/amd64"
             native_race: true
             android: false
