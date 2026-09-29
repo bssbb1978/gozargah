@@ -1,4 +1,13 @@
-# AI Engine — Gozargah 2.12.0
+# AI Engine — Gozargah 2.13.0
+
+## 2.13 hardened dynamic layer (all local, no model runtime)
+
+- **Internal decision view** (`src/ai/decision.ts`): a pure synthesis of network state, condition estimator, regime label, probe state machine, traffic shape, protocol plan and the emergency entry ladder into one bounded verdict — `stable | watch | degraded | critical` — with a 0–100 score, reason codes and honest bilingual advice. Served at `GET /{panelPath}/api/network/decision` (authenticated). It is a read-only composition; it never acts on its own.
+- **Client fingerprint rotation** (`src/sub/fp-rotation.ts`): the generated configs rotate the neutral uTLS identity (chrome/firefox/safari — the intersection supported by Xray, Sing-box and Clash-Meta) per user and 6h window, in step with the rotating WS path. This is ClientHello *input* selected by the client's uTLS stack (JA3/JA4 diversity); TLS terminates at the Cloudflare edge and the Worker never sees or mutates the ClientHello.
+- **In-tunnel traffic shaping** (`src/utils/shape.ts`): bounded downlink segmentation (≤8 segments, conservative default) with randomized inter-frame micro-gaps and bounded handshake-timing jitter. It changes only size/timing statistics of the already-encrypted stream; zero protocol-byte change, fully stock-client-compatible. `TRAFFIC_SHAPE=conservative|aggressive|off`.
+- **Aggressive probing state machine** (scheduler): after a degraded cycle, the next cycle probes backup entries with full-path HTTPS (DNS+TCP+TLS+HTTP); transitions are audited (`probe_mode_changed`).
+- **Smart client reconnection**: the Xray-core observatory probe interval is emitted as 30s during engine recovery (90s otherwise); the live bundle advertises `client_behavior.reconnect` (observe-and-failover, backoff, ladder-ordered failover, immediate resume on route reopen).
+- **Stealth decoy variance**: rotated wording + random padding per response (byte-hash variance), no state leaked.
 
 ## Primary intelligence is local and deterministic
 

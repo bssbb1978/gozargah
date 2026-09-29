@@ -28,6 +28,9 @@ import { buildAdaptiveProtocolPlan } from '../ai/protocol-controller';
 import { assessHealth } from '../ai/predictive-mesh';
 import { defaultEdgeLearner, learnerConfidence } from '../ai/edge-learner';
 import { classifyFailureDomain, classifyNetworkCondition, normalizeFetchFailure } from '../ai/network-intelligence';
+import { buildDecisionView } from '../ai/decision';
+import type { RegimeAssessment } from '../ai/regime';
+import { shapeModeFor } from '../utils/shape';
 
 const JSON_CT = 'application/json; charset=utf-8';
 
@@ -516,6 +519,57 @@ export async function handlePanelApi(
     if (action === 'events' && method === 'GET') {
       if (!db) return json({ events: [] });
       return json({ events: await recentEvents(db, 10) });
+    }
+
+    // 2.13 — internal decision view: the synthesized verdict of the local
+    // intelligence engine (network state + condition + regime + probe state
+    // machine + traffic shape + protocol plan + emergency ladder).
+    if (action === 'network/decision' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const [state, signal, policy, settings, pathRows] = await Promise.all([
+        loadNetworkState(db), loadPolicySignalState(db), loadProtocolPolicyState(db), loadSettings(db), loadPathHealth(db),
+      ]);
+      let regime: RegimeAssessment | null = null;
+      try {
+        const rows = await loadPredictiveStates(db, 'regime');
+        const row = rows.find((r) => r.subjectId === 'global');
+        if (row) regime = JSON.parse(row.stateJson) as RegimeAssessment;
+      } catch { /* optional */ }
+      let signalJson: Record<string, unknown> | null = null;
+      try { signalJson = signal ? (JSON.parse(signal.stateJson) as Record<string, unknown>) : null; } catch { signalJson = null; }
+      const host = new URL(request.url).hostname;
+      const ladder: Array<{ host: string; role: string; status: string; latencyMs: number | null }> = [
+        { host, role: 'primary', status: 'primary', latencyMs: null },
+      ];
+      for (const bh of (settings?.backupEntryHosts ?? []).slice(0, 4)) {
+        const row = pathRows.find((r) => r.pathId === 'entry:' + bh);
+        ladder.push({
+          host: bh, role: 'backup',
+          status: row ? (row.ok ? 'measured_ok' : 'measured_failed') : 'unmeasured',
+          latencyMs: row?.latencyMs ?? null,
+        });
+      }
+      const conditionCode = state?.reasonCodes.find((c) => c.startsWith('condition_'));
+      const view = buildDecisionView({
+        networkState: state ? {
+          state: state.state as 'healthy' | 'degraded' | 'recovery' | 'no_healthy_path',
+          confidence: state.confidence, updatedAt: state.updatedAt, reasonCodes: state.reasonCodes,
+        } : null,
+        conditionState: conditionCode ? conditionCode.slice('condition_'.length).toUpperCase() : null,
+        regime,
+        probeMode: signalJson?.probeMode === 'aggressive' ? 'aggressive' : 'normal',
+        shape: shapeModeFor(env.TRAFFIC_SHAPE),
+        plan: policy ? {
+          selected: policy.selectedProfile || null,
+          strategy: (signalJson?.strategy as 'stable' | 'diversify' | 'safe') ?? 'stable',
+          confidence: policy.confidence,
+          mode: policy.mode as 'normal' | 'degraded' | 'recovery' | 'no_healthy_path',
+          fallbackLadder: policy.fallbackLadder,
+          reasonCodes: policy.reasonCodes,
+        } : null,
+        ladder,
+      });
+      return json(view);
     }
 
     return json({ error: 'not_found' }, 404);

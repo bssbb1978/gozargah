@@ -1,6 +1,6 @@
-# Capability Matrix — Gozargah 2.12.0
+# Capability Matrix — Gozargah 2.13.0
 
-> 2.12 adds no new protocol/transport pairs. It adds regime-driven strategy selection, a deterministic 6h-rotating WebSocket path, and the emergency entry ladder (backup domains with the same Worker credentials). All rows below are unchanged.
+> 2.13 adds no new protocol/transport pairs. It adds client fingerprint (uTLS/JA4) rotation in generated configs, in-tunnel traffic shaping (size/timing entropy, `TRAFFIC_SHAPE`), an aggressive probing state machine, the internal decision view, and smart client reconnection cadence. 2.12 added regime-driven strategy selection, the 6h-rotating WebSocket path, and the emergency entry ladder. All rows below are unchanged.
 
 ## Source of truth
 

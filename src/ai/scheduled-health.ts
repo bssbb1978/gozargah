@@ -9,7 +9,7 @@ import { connect } from 'cloudflare:sockets';
 import { Env } from '../config';
 import { addEvent, loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadProfileHealth, loadSettings, loadRecentHealthSamples, saveAdaptiveGuardState, saveNetworkState, savePathHealth, saveProtocolPolicyState, loadHealthSamples, loadPredictiveStates, saveHealthSample, savePredictiveState, savePolicySignalState } from '../db/store';
 import { classifyNetworkState } from './network-state';
-import { classifyNetworkCondition, normalizeSocketFailure } from './network-intelligence';
+import { classifyNetworkCondition, normalizeSocketFailure, normalizeFetchFailure } from './network-intelligence';
 import { updateObservation } from './resilience';
 import { buildAdaptiveProtocolPlan } from './protocol-controller';
 import { assessHealth } from './predictive-mesh';
@@ -46,6 +46,21 @@ async function probeEndpoint(host: string, port: number): Promise<{ ok: boolean;
   }
 }
 
+/** 2.13 — full-path entry probe (DNS+TCP+TLS+HTTP) used in aggressive mode. */
+async function probeEntryHttps(host: string): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
+  const started = Date.now();
+  try {
+    const res = await fetch('https://' + host + '/healthz', {
+      method: 'GET',
+      redirect: 'error',
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    return { ok: res.ok, latencyMs: Date.now() - started, error: res.ok ? undefined : 'http_status_' + res.status };
+  } catch (e) {
+    return { ok: false, latencyMs: Date.now() - started, error: normalizeFetchFailure(e) };
+  }
+}
+
 export async function runScheduledHealth(env: Env): Promise<void> {
   if (!env.GZ_DB) return;
   const settings = await loadSettings(env.GZ_DB);
@@ -55,6 +70,19 @@ export async function runScheduledHealth(env: Env): Promise<void> {
   const ports = parsePorts(env.HEALTH_PROBE_PORTS);
   const existing = await loadPathHealth(env.GZ_DB);
   const byId = new Map(existing.map((r) => [r.pathId, r]));
+
+  // 2.13 — probe state machine: when the PREVIOUS cycle was degraded
+  // (recovery / no_healthy_path / UPSTREAM_UNAVAILABLE / SEVERELY_DEGRADED),
+  // this tick probes entries with full-path HTTPS (DNS+TCP+TLS+HTTP) so the
+  // first route that reopens is detected and selected immediately. Bounded:
+  // ≤ 4 entries × (1 TCP + 1 HTTPS) per tick.
+  const previousNetworkState = (await loadNetworkState(env.GZ_DB).catch(() => null));
+  const previousConditionCode = previousNetworkState?.reasonCodes.find((code) => code.startsWith('condition_'));
+  const prevProbeMode: 'normal' | 'aggressive' =
+    previousNetworkState?.state === 'recovery' || previousNetworkState?.state === 'no_healthy_path' ||
+    previousConditionCode === 'condition_upstream_unavailable' || previousConditionCode === 'condition_severely_degraded'
+      ? 'aggressive'
+      : 'normal';
 
   for (const endpoint of endpoints) {
     // One primary probe plus at most one alternate port per cycle keeps cron
@@ -114,7 +142,9 @@ export async function runScheduledHealth(env: Env): Promise<void> {
     .slice(0, 4);
   for (const host of backupHosts) {
     const pathId = 'entry:' + host;
-    const result = await probeEndpoint(host, 443);
+    const tcpResult = await probeEndpoint(host, 443);
+    // aggressive mode: the deeper full-path signal supersedes the TCP open
+    const result = prevProbeMode === 'aggressive' ? await probeEntryHttps(host) : tcpResult;
     const previous = byId.get(pathId);
     const next = updateObservation(previous ? {
       id: previous.pathId,
@@ -134,7 +164,7 @@ export async function runScheduledHealth(env: Env): Promise<void> {
       quarantineUntil: next.quarantineUntil, checkedAt: next.checkedAt, lastError: next.lastError,
       consecutiveFailures: next.consecutiveFailures, consecutiveSuccesses: next.consecutiveSuccesses,
     });
-    await saveHealthSample(env.GZ_DB, { kind: 'path_tcp', subjectId: pathId, ts: next.checkedAt, ok: next.ok, latencyMs: next.latencyMs });
+    await saveHealthSample(env.GZ_DB, { kind: prevProbeMode === 'aggressive' ? 'path_https' : 'path_tcp', subjectId: pathId, ts: next.checkedAt, ok: next.ok, latencyMs: next.latencyMs });
     byId.set(pathId, {
       pathId, latencyMs: next.latencyMs, ok: next.ok,
       failures: next.failures, successes: next.successes, quarantineUntil: next.quarantineUntil,
@@ -161,8 +191,6 @@ export async function runScheduledHealth(env: Env): Promise<void> {
     lastError: row.lastError,
   })), state.generatedAt);
   const conditionCode = 'condition_' + condition.state.toLowerCase();
-  const previousNetworkState = await loadNetworkState(env.GZ_DB);
-  const previousConditionCode = previousNetworkState?.reasonCodes.find((code) => code.startsWith('condition_'));
   await saveNetworkState(env.GZ_DB, {
     state: state.state,
     quorum: state.quorum,
@@ -184,6 +212,18 @@ export async function runScheduledHealth(env: Env): Promise<void> {
       evidence: condition.evidence.slice(0, 5),
       scope: condition.scope,
     }).slice(0, 1400));
+  }
+
+  // 2.13 — probe state machine: next tick's mode + audit the transition.
+  const probeMode: 'normal' | 'aggressive' =
+    state.state === 'recovery' || state.state === 'no_healthy_path' ||
+    condition.state === 'UPSTREAM_UNAVAILABLE' || condition.state === 'SEVERELY_DEGRADED'
+      ? 'aggressive'
+      : 'normal';
+  if (prevProbeMode !== probeMode) {
+    await addEvent(env.GZ_DB, 'probe_mode_changed', JSON.stringify({
+      from: prevProbeMode, to: probeMode, networkState: state.state, condition: condition.state,
+    }).slice(0, 400));
   }
 
   // 2.12 — regime intelligence: one bounded assessment of the global aggregate
@@ -284,6 +324,7 @@ export async function runScheduledHealth(env: Env): Promise<void> {
         selected: plan.selected,
         regimeState: plan.regimeState,
         regimeConfidence: plan.regimeConfidence,
+        probeMode,
         reasonCodes: plan.reasonCodes.slice(0, 20),
       }),
       updatedAt: plan.generatedAt,

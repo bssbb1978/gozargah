@@ -18,6 +18,8 @@ import { nextAdaptiveGuardState, reconcileAdaptivePlan } from './ai/adaptive-gua
 import { EffectiveSettings } from './settings';
 import { DEFAULT_FP, FragPreset, adaptiveProfiles, fpFor, opBranding, resolveOp, SubOpts, AdaptiveProfile } from './sub/operators';
 import { PATH_ROTATION_WINDOW_MS, rotatedPathBase } from './sub/path-rotation';
+import { NEUTRAL_FINGERPRINTS, rotatedFingerprint } from './sub/fp-rotation';
+import { shapeModeFor } from './utils/shape';
 import type { RegimeAssessment } from './ai/regime';
 import { ALPN_PROFILES, protocolCatalog, adaptiveProtocolOrder, parseOriginTransports, type ProtocolCapability } from './protocols/catalog';
 import { buildAdaptiveProtocolPolicy, choosePreferredProfiles, policySummary } from './protocols/policy';
@@ -103,6 +105,17 @@ export function buildAdaptiveClientBundle(host: string, user: { uuid: string; tr
       rotationMinutes: PATH_ROTATION_WINDOW_MS / 60_000,
       currentBase: rotatedPathBase(user.uuid),
       note: 'The WebSocket path rotates deterministically per window; older windows remain valid, so installed clients are never stranded.',
+    },
+    fingerprint: {
+      rotation: '6h-window',
+      current: fpFor(opts, user.uuid),
+      neutralSet: [...NEUTRAL_FINGERPRINTS],
+      operatorWins: true,
+      note: 'Client-side uTLS/JA4 diversity: the generated configs rotate the ClientHello identity (extension order/ciphers/curves) per window. TLS is terminated at the Cloudflare edge; the Worker never sees or mutates the ClientHello.',
+    },
+    traffic_shape: {
+      mode: shapeModeFor(env?.TRAFFIC_SHAPE),
+      note: 'Server-side, in-tunnel size/timing entropy (bounded downlink segmentation + handshake jitter). The payload stays inside the edge TLS tunnel; no protocol bytes change.',
     },
     dns_forwarding: {
       doh_url: dnsUrl || null,
@@ -268,6 +281,15 @@ export async function buildLiveAdaptiveClientBundle(
       switch_only_on_degrade_or_failure: true,
       bounded_recovery_candidates: resilience?.recoveryCandidates?.slice(0, 2) ?? [],
       no_random_protocol_generation: true,
+      // 2.13 — smart reconnection loop: probe harder while the engine reports
+      // recovery, back off calmly otherwise; failover follows the ladder.
+      reconnect: {
+        strategy: 'observe_and_failover',
+        probeIntervalMs: activePlan.mode === 'recovery' || activePlan.mode === 'no_healthy_path' ? 30_000 : 90_000,
+        backoffMs: [1000, 2000, 5000, 15000, 30000],
+        failoverOrder: entries.map((e) => e.host as string),
+        on_route_reopen: 'immediate_resume',
+      },
     },
   };
   return JSON.stringify(base, null, 2);
@@ -295,7 +317,8 @@ export function buildLinks(
   const port = opts?.port && opts.port !== 443 ? opts.port : 443;
   // 2.12 — deterministic 6h-rotating path; the Worker accepts any path.
   const wsPath = rotatedPathBase(user.uuid) + '?ed=2048&gz_profile=standard';
-  const fp = fpFor(opts);
+  // 2.13 — neutral uTLS/JA4 fingerprint rotates per (uuid | 6h window).
+  const fp = fpFor(opts, user.uuid);
   const ech = opts?.ech ? '&ech=' : '';
   const tag = encodeURIComponent(remarkFor(user, opts));
   const params =
@@ -346,7 +369,7 @@ export function buildClashYaml(
 ): string {
   const port = opts?.port && opts.port !== 443 ? opts.port : 443;
   const wsPath = rotatedPathBase(user.uuid) + '?ed=2048&gz_profile=standard';
-  const fp = fpFor(opts);
+  const fp = fpFor(opts, user.uuid);
   const brand = opBranding(opts);
   const vName = 'Gozargah-VLESS-' + (brand ? brand.en.split(' ')[0] + '-' : '') + user.name;
   const tName = 'Gozargah-Trojan-' + (brand ? brand.en.split(' ')[0] + '-' : '') + user.name;
@@ -453,7 +476,7 @@ export function buildSingBoxJson(
 ): string {
   const port = opts?.port && opts.port !== 443 ? opts.port : 443;
   const wsPath = rotatedPathBase(user.uuid) + '?ed=2048&gz_profile=standard';
-  const fp = fpFor(opts);
+  const fp = fpFor(opts, user.uuid);
   const tls: Record<string, unknown> = {
     enabled: true,
     server_name: host,
@@ -544,8 +567,9 @@ export function buildXrayJson(
   opts: BuildOpts | null | undefined,
   env?: Env,
   backupHosts?: string[],
+  observatoryIntervalSec = 90,
 ): string {
-  const profiles = adaptiveProfiles(opts);
+  const profiles = adaptiveProfiles(opts, user.uuid);
   // 2.12 — deterministic 6h-rotating path base (all profiles share it).
   const wsPathBase = rotatedPathBase(user.uuid);
   const wsPath = (profileId: string) => wsPathBase + '?ed=2048&gz_profile=' + profileId;
@@ -680,10 +704,12 @@ export function buildXrayJson(
       { tag: 'http-in', listen: '127.0.0.1', port: 10809, protocol: 'http', settings: {}, sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'] } },
     ],
     outbounds,
+    // 2.13 — smart reconnection: the observatory probes harder (30s) while
+    // the engine is in recovery/no_healthy_path, 90s otherwise.
     observatory: {
       subjectSelector: ['gz-'],
       probeUrl: 'https://connectivitycheck.gstatic.com/generate_204',
-      probeInterval: '90s',
+      probeInterval: observatoryIntervalSec + 's',
       enableConcurrency: true,
     },
     routing: {
@@ -782,6 +808,8 @@ export function subHeaders(
 export async function renderSub(app: string, host: string, user: GzUser, opts: SubOpts | null | undefined, env?: Env, dnsUrl?: string): Promise<{ body: string; app: string }> {
   // 2.12 — configured backup entry hosts (cached; best-effort).
   let backupHosts: string[] = [];
+  // 2.13 — smart reconnection cadence (30s while the engine is in recovery).
+  let observatoryIntervalSec = 90;
   if (env?.GZ_DB) {
     try {
       const s = await loadSettings(env.GZ_DB);
@@ -790,10 +818,14 @@ export async function renderSub(app: string, host: string, user: GzUser, opts: S
         .filter((x) => /^[a-z0-9][a-z0-9.-]{2,252}$/.test(x) && x.includes('.'))
         .slice(0, 4);
     } catch { /* best-effort; ladder simply stays primary-only */ }
+    try {
+      const ns = await loadNetworkState(env.GZ_DB);
+      if (ns && (ns.state === 'recovery' || ns.state === 'no_healthy_path')) observatoryIntervalSec = 30;
+    } catch { /* best-effort; keep the calm 90s cadence */ }
   }
   if (app === 'clash') return { body: buildClashYaml(host, user, opts, dnsUrl, backupHosts), app };
   if (app === 'singbox') return { body: buildSingBoxJson(host, user, opts, dnsUrl, backupHosts), app };
-  if (app === 'xray') return { body: buildXrayJson(host, user, opts, env, backupHosts), app };
+  if (app === 'xray') return { body: buildXrayJson(host, user, opts, env, backupHosts, observatoryIntervalSec), app };
   if (app === 'profiles') return { body: buildAdaptiveClientBundle(host, user, opts, env, dnsUrl), app };
   if (app === 'capabilities') return { body: JSON.stringify(buildProtocolMatrix(env, host), null, 2), app };
   const links = buildLinks(host, user, opts);

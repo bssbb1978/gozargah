@@ -30,6 +30,14 @@ import { loadPathHealth, savePathHealth, loadProfileHealth, saveProfileHealth, l
 import { nextProfileObservation } from '../ai/edge-brain';
 import { defaultEdgeLearner, observationFeatures, updateEdgeLearner } from '../ai/edge-learner';
 import { assessHealth } from '../ai/predictive-mesh';
+import { SHAPE_PROFILES, shapeModeFor, jitterDelay, sendShaped, type ShapeProfile } from '../utils/shape';
+
+/** 2.13 — traffic shaping profile for this isolate (env TRAFFIC_SHAPE). */
+function shapeProfile(env: Env): ShapeProfile | null {
+  const mode = shapeModeFor(env.TRAFFIC_SHAPE);
+  return mode === 'off' ? null : SHAPE_PROFILES[mode];
+}
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /** Implicit single user in no-database mode. */
 // Bounded revocation/quota lag without a database round-trip per traffic chunk.
@@ -269,6 +277,11 @@ async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, 
     })());
   });
 
+  // 2.13 — bounded handshake timing jitter: smears the burst-timing signature
+  // of the upgrade→first-response exchange without changing any protocol byte.
+  const shape = shapeProfile(env);
+  if (shape) await sleep(jitterDelay(shape.firstResponseJitterMs));
+
   if (info.proto === 'vless') server.send(vlessOkResponse(info.version));
 
   // --- client -> remote (decode SIP004 for Shadowsocks, otherwise raw stream) ---
@@ -317,7 +330,12 @@ async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, 
       new WritableStream<Uint8Array>({
         async write(chunk) {
           down += chunk.byteLength;
-          server.send(ssEncoder ? await ssEncoder.encode(chunk) : chunk);
+          // 2.13 — bounded downlink segmentation + inter-frame micro-gaps:
+          // in-tunnel size/timing entropy, fully client-compatible (WS frames
+          // and stream latency are normal network behavior).
+          const out = ssEncoder ? await ssEncoder.encode(chunk) : chunk;
+          if (shape) await sendShaped((c) => server.send(c), out, shape);
+          else server.send(out);
         },
         close() { try { server.close(); } catch { /* ignore */ } },
         abort() { try { server.close(1011); } catch { /* ignore */ } },

@@ -15,6 +15,11 @@ The scheduler runs the condition estimator over configured Worker-egress TCP che
 
 On `UPSTREAM_UNAVAILABLE`, the diagnostic recommends retaining last-known-good and bounded recovery probes. It does not instruct the controller to rotate profiles endlessly or declare service restored. The core controller still uses the existing network quorum and guard.
 
+## 2.13 additions
+
+- The probe loop is now a two-state machine: `normal` (periodic TCP probe per entry) and `aggressive` (full-path HTTPS probe — DNS+TCP+TLS+HTTP on `/healthz` — of every backup entry), entered when the previous cycle's network state/condition was degraded. The first route that reopens during a partial blackout is therefore detected and ordered immediately; transitions are audited via `probe_mode_changed` and the mode is visible in `/api/network/state` and the internal decision view.
+- Client-side reconnection tightens in the same situation: Xray-core observatory probes at 30s (vs 90s) while the engine reports recovery, and the live bundle advertises a bounded observe-and-failover reconnection block with ladder-ordered failover.
+
 ## 2.12 additions
 
 - The five-minute scheduler also probes configured `backupEntryHosts` on port 443 (`entry:<host>` rows), so the emergency ladder's entries carry measured health in the live bundle and the user status page.

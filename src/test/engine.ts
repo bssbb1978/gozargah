@@ -10,6 +10,7 @@ import {
   isBrowserUa, renderSub, resolveApp, sniffApp, subHeaders,
 } from '../subscription';
 import { DEFAULT_FP, OPERATORS, TLS_PORTS, fpFor, opBranding, resolveOp, resolveOpts } from '../sub/operators';
+import { NEUTRAL_FINGERPRINTS } from '../sub/fp-rotation';
 import { effectiveExpiry, isUserAllowed, resetDue } from '../db/users';
 import { userPageHtml } from '../panel/userpage';
 import { qrSvg } from '../utils/qr';
@@ -84,10 +85,14 @@ async function main() {
   });
 
   /* ---------------- links ---------------- */
-  await ok('links: default shape with chrome fp, no ech', () => {
+  await ok('links: default shape with rotating neutral fp, no ech', () => {
     const l = buildLinks(HOST, USER, {});
     assert.ok(l.vless.startsWith('vless://' + USER.uuid + '@' + HOST + ':443?'));
-    assert.ok(l.vless.includes('fp=chrome'));
+    // 2.13 — neutral fingerprint rotates deterministically per (uuid | window)
+    const neutralFp = fpFor({}, USER.uuid);
+    assert.ok(NEUTRAL_FINGERPRINTS.includes(neutralFp as (typeof NEUTRAL_FINGERPRINTS)[number]));
+    assert.ok(l.vless.includes('fp=' + neutralFp));
+    assert.equal(neutralFp, fpFor({}, USER.uuid)); // deterministic
     assert.ok(!l.vless.includes('ech='));
     assert.ok(l.trojan.startsWith('trojan://' + USER.trojanPass + '@'));
     assert.ok(l.shadowsocks.startsWith('ss://'));
@@ -113,7 +118,7 @@ async function main() {
   await ok('clash: ech-opts only when opted-in + op fingerprint', () => {
     const plain = buildClashYaml(HOST, USER, {});
     assert.ok(!plain.includes('ech-opts'));
-    assert.ok(plain.includes('client-fingerprint: chrome'));
+    assert.ok(plain.includes('client-fingerprint: ' + fpFor({}, USER.uuid)));
     const ech = buildClashYaml(HOST, USER, { ech: true });
     assert.ok(ech.includes('ech-opts:'));
     assert.ok(ech.includes('enabled: true'));
@@ -129,7 +134,7 @@ async function main() {
   });
   await ok('singbox: utls + ech opt-in + Shadowsocks plugin', () => {
     const plain = JSON.parse(buildSingBoxJson(HOST, USER, {}));
-    assert.equal((plain.outbounds[0].tls as { utls: { fingerprint: string } }).utls.fingerprint, 'chrome');
+    assert.equal((plain.outbounds[0].tls as { utls: { fingerprint: string } }).utls.fingerprint, fpFor({}, USER.uuid));
     assert.equal((plain.outbounds[0].tls as Record<string, unknown>).ech, undefined);
     const ech = JSON.parse(buildSingBoxJson(HOST, USER, { ech: true }));
     assert.deepEqual((ech.outbounds[0].tls as Record<string, unknown>).ech, { enabled: true });

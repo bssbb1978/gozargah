@@ -2,7 +2,7 @@
  * Gozargah — global config, types and shared errors.
  */
 
-export const VERSION = '2.12.0';
+export const VERSION = '2.13.0';
 export const SCHEMA_VERSION = 15;
 
 /** D1 binding name (see wrangler.toml) */
@@ -36,6 +36,8 @@ export interface Env {
   DNS64_PREFIX?: string;
   /** Comma-separated ports for scheduled health probes of configured endpoints. */
   HEALTH_PROBE_PORTS?: string;
+  /** 2.13 — in-tunnel traffic shaping: 'conservative' (default), 'aggressive' or 'off'. */
+  TRAFFIC_SHAPE?: string;
   /** Optional Xray/sing-box origin engine for protocols not terminated natively by the Worker. */
   ORIGIN_ENGINE_HOST?: string;
   /** Optional origin engine port; defaults to 443. */

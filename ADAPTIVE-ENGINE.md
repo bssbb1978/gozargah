@@ -1,4 +1,12 @@
-# Adaptive Engine — Gozargah 2.12.0
+# Adaptive Engine — Gozargah 2.13.0
+
+## 2.13 hardened dynamic layer
+
+- **Fingerprint rotation:** `fpFor(opts, seed)` rotates the neutral uTLS identity (chrome/firefox/safari) per (uuid | 6h window) across every generated format; explicit operator presets keep precedence. The identity a user presents at the TLS layer is therefore window-varying even though the edge TLS stack is Cloudflare's (the Worker neither sees nor mutates the ClientHello).
+- **In-tunnel shaping:** the WS downlink segments large bursts (bounded count/size) with randomized micro-gaps and the first protocol response carries bounded timing jitter. Pure size/timing entropy inside the encrypted tunnel; `TRAFFIC_SHAPE` env selects conservative (default) / aggressive / off.
+- **Probe state machine:** the scheduler is a two-state machine — `normal` (periodic TCP probes) and `aggressive` (full-path HTTPS probes of every backup entry) — entered when the previous cycle was degraded, with `probe_mode_changed` audit events.
+- **Internal decision view:** `/api/network/decision` composes the engine signals into one bounded verdict with honest advice; it informs operators and is exposed in the panel.
+- **Client reconnection:** Xray observatory cadence (30s recovery / 90s normal) and the bundle's `client_behavior.reconnect` block (observe-and-failover, backoff, ladder order, immediate resume) close the loop client-side.
 
 ## 2.12 dynamic path rotation
 

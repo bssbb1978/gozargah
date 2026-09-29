@@ -1,4 +1,23 @@
-# Gozargah 2.12.0 — Dynamic Intelligence, Rotating Paths & Emergency Ladder
+# Gozargah 2.13.0 — Hardened Dynamic Layer: Fingerprint Rotation, In-Tunnel Shaping & Aggressive Probing
+
+## 2.13.0 — Hardened dynamic layer
+
+### Highlights
+- **Client fingerprint rotation** (`src/sub/fp-rotation.ts`): generated configs rotate the neutral uTLS identity (chrome/firefox/safari — the set every format supports) deterministically per user and 6h window, in step with the rotating WS path. Static JA3/JA4 blocklist entries go stale across windows. Explicit operator presets always win. TLS itself terminates at the Cloudflare edge — the Worker never sees or mutates the ClientHello.
+- **In-tunnel traffic shaping** (`src/utils/shape.ts`, WS pipeline): bounded downlink segmentation (≤8 segments, conservative default) with randomized inter-frame micro-gaps plus bounded handshake-timing jitter. Pure size/timing entropy inside the edge TLS tunnel; zero protocol-byte change; fully stock-client-compatible. `TRAFFIC_SHAPE=conservative|aggressive|off`.
+- **Aggressive probing state machine**: when the previous cycle was `recovery`/`no_healthy_path`/`UPSTREAM_UNAVAILABLE`/`SEVERELY_DEGRADED`, the next cycle probes backup entries with full-path HTTPS (DNS+TCP+TLS+HTTP on `/healthz`) so a reopening route is detected and selected immediately. Transitions audited via `probe_mode_changed`.
+- **Internal decision view**: `GET /{panelPath}/api/network/decision` — one bounded verdict (`stable|watch|degraded|critical`) with score, regime label, controller strategy, probe mode, traffic shape, active profile, fallback ladder, emergency entries and honest bilingual advice. Synthesized from the existing engines; no external model required.
+- **Smart client reconnection**: Xray-core `observatory.probeInterval` is emitted as 30s during engine recovery and 90s otherwise; the live bundle gains `client_behavior.reconnect` (observe-and-failover, backoff schedule, ladder-ordered failover, immediate resume on route reopen) plus `fingerprint` and `traffic_shape` metadata blocks.
+- **Stealth decoy hardening**: the landing page now serves rotated wording variants + random padding per response (byte-hash/length variance) while still leaking no state.
+
+### Honest platform boundary (unchanged, restated)
+The Worker cannot create or mutate the TLS ClientHello, cannot add FEC, and does not mutate protocol framing — VLESS/Trojan/Shadowsocks remain stock-client-compatible. Shaping, fingerprint rotation, path rotation and entry diversity raise the odds a route survives partial filtering; they are aggregate-statistics adaptation, not a DPI classifier, and no bypass is guaranteed. A fully cut route (no path from the user's network to the Worker/Cloudflare edge) cannot be restored remotely by any Worker code.
+
+### Engineering documents
+- [Test Report 2.13.0](TEST-REPORT-2.13.0.md)
+- [Persian Upgrade Report 2.13.0](UPGRADE-REPORT-FA-2.13.0.md)
+- [Adaptive Engine](ADAPTIVE-ENGINE.md)
+- [AI Engine and limits](AI-ENGINE.md)
 
 ## 2.12.0 — Fully dynamic adaptive layer
 
@@ -94,7 +113,7 @@ New endpoints:
 
 **گذرگاه** یک پنل پروکسی چندکاربرهٔ کامل است که به‌صورت بومی روی Cloudflare Workers زندگی می‌کند: یک فایل جاوااسکریپت که همه‌چیز داخلش تعبیه شده — پنل مدیریت، موتور پروکسی، اشتراک‌ساز، صفحهٔ وضعیت کاربر و تمام دارایی‌های رابط کاربری. نه سرور می‌خواهد، نه نصب، نه هزینه؛ یک اکانت رایگان کلودفلر و پنج دقیقه وقت کافی است تا یک پنل کامل با دیتابیس اختصاصی، داشبورد فارسی/انگلیسی و لینک اشتراک برای هر کاربر داشته باشید.
 
-طراحی گذرگاه از روز اول با سه قاعده پیش رفته: **امنیت واقعی به‌جای نمایشی**، **حسابداری دقیق به‌جای تخمین**، و **تصمیم‌گیری محلیِ قابل‌توضیح**. قابلیت‌های قدیمی‌تر مانند پریست اپراتورها، کانفیگ تطبیقی و صفحهٔ وضعیت حفظ شده‌اند. در نسخهٔ **2.12.0**، لایهٔ داینامیک و پویا اضافه شده: تشخیص تغییر رژیم با هوش مصنوعی داخلی (آمار تجمیعی، بدون payload)، مسیر چرخشی WebSocket هر ۶ ساعت، و پلهٔ اضطراری نقاط ورود جایگزین — که در قطع‌های موضعی شانس بقای مسیر را بالا می‌برند اما قطع کامل مسیر را از راه دور رفع نمی‌کنند. در نسخهٔ **2.11.0**، Shadowsocks AEAD روی WebSocket/TLS، DNS-over-HTTPS احراز هویت‌شده، فوروارد DNS از VLESS UDP پورت ۵۳ و DNS64 اضافه شده‌اند. این قابلیت‌ها مرزهای واقعی Worker را تغییر نمی‌دهند: UDP عمومی و NAT64 gateway ارائه نمی‌شود و هیچ مدل AI نمی‌تواند مسیر شبکه‌ای ازدست‌رفته یا عبور تضمینی از DPI ایجاد کند.
+طراحی گذرگاه از روز اول با سه قاعده پیش رفته: **امنیت واقعی به‌جای نمایشی**، **حسابداری دقیق به‌جای تخمین**، و **تصمیم‌گیری محلیِ قابل‌توضیح**. قابلیت‌های قدیمی‌تر مانند پریست اپراتورها، کانفیگ تطبیقی و صفحهٔ وضعیت حفظ شده‌اند. در نسخهٔ **2.13.0**، لایهٔ سخت‌افزای‌شده اضافه شد: چرخش فینگرپرینت کلاینت (uTLS/JA4) هر ۶ ساعت، شکل‌دهی ترافیک درون تونل (سایز/زمان‌بندی)، ماشین حالت پروب تهاجمی، و نمای تصمیم هوش مصنوعی داخلی. در نسخهٔ **2.12.0**، لایهٔ داینامیک و پویا اضافه شده: تشخیص تغییر رژیم با هوش مصنوعی داخلی (آمار تجمیعی، بدون payload)، مسیر چرخشی WebSocket هر ۶ ساعت، و پلهٔ اضطراری نقاط ورود جایگزین — که در قطع‌های موضعی شانس بقای مسیر را بالا می‌برند اما قطع کامل مسیر را از راه دور رفع نمی‌کنند. در نسخهٔ **2.11.0**، Shadowsocks AEAD روی WebSocket/TLS، DNS-over-HTTPS احراز هویت‌شده، فوروارد DNS از VLESS UDP پورت ۵۳ و DNS64 اضافه شده‌اند. این قابلیت‌ها مرزهای واقعی Worker را تغییر نمی‌دهند: UDP عمومی و NAT64 gateway ارائه نمی‌شود و هیچ مدل AI نمی‌تواند مسیر شبکه‌ای ازدست‌رفته یا عبور تضمینی از DPI ایجاد کند.
 
 ## ✨ چرا گذرگاه؟
 

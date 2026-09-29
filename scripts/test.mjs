@@ -23,6 +23,9 @@ const entries = [
   'vless-dns',
   'regime',
   'path-rotation',
+  'fp-rotation',
+  'shape',
+  'decision',
 ];
 
 for (const name of entries) {

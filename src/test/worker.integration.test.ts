@@ -116,6 +116,11 @@ describe('Cloudflare Worker + D1 integration', () => {
     expect(response.status).toBe(404);
   });
 
+  it('exposes the internal decision view behind panel auth (2.13)', async () => {
+    const response = await mf.dispatchFetch('https://gozargah.test/gozargah/api/network/decision');
+    expect(response.status).toBe(401);
+  });
+
   it('persists FSM state and applies allowlisted per-user disable in D1', async () => {
     const send = async (update_id: number, text: string) => mf.dispatchFetch('https://gozargah.test/_telegram/webhook', {
       method: 'POST',

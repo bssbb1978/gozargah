@@ -14,6 +14,8 @@
  *    them natively); URI links carry the fingerprint
  */
 
+import { rotatedFingerprint } from './fp-rotation';
+
 export interface FragPreset {
   /** which packets to fragment — always tlshello (documented cap) */
   packets: 'tlshello';
@@ -94,9 +96,9 @@ export interface AdaptiveProfile {
  * ports or fragment sizes. Xray observatory / Clash url-test / Sing-box
  * selector can evaluate these variants independently.
  */
-export function adaptiveProfiles(opts: SubOpts | null | undefined): AdaptiveProfile[] {
+export function adaptiveProfiles(opts: SubOpts | null | undefined, seed?: string): AdaptiveProfile[] {
   const op = opts?.opKey ? resolveOp(opts.opKey) : null;
-  const fp = fpFor(opts);
+  const fp = fpFor(opts, seed);
   const ports = op?.ports?.length ? op.ports : TLS_PORTS;
   const altPort = ports.find((p) => p !== 443) ?? 443;
   const frag = op?.frag ?? null;
@@ -140,13 +142,18 @@ export function resolveOpts(opKey?: string | null, ech?: string | null): SubOpts
   return { opKey: opKey ?? undefined, ech: ech === '1' || ech === 'true' };
 }
 
-/** uTLS fingerprint for the resolved operator. */
-export function fpFor(opts: SubOpts | null | undefined): string {
+/**
+ * uTLS fingerprint for the resolved operator.
+ * 2.13 — without an explicit operator preset, the neutral fingerprint rotates
+ * deterministically per (seed | 6h window) so generated identities differ
+ * over time (client-side JA3/JA4 diversity). Same seed + window => same fp.
+ */
+export function fpFor(opts: SubOpts | null | undefined, seed?: string): string {
   if (opts?.opKey) {
     const op = resolveOp(opts.opKey);
     if (op) return op.fp;
   }
-  return DEFAULT_FP;
+  return seed ? rotatedFingerprint(seed) : DEFAULT_FP;
 }
 
 /** True when an operator preset is explicitly active (allows honest branding). */
