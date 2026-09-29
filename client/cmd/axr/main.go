@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/bssbb1978/gozargah/axr/internal/bandit"
+	"github.com/bssbb1978/gozargah/axr/internal/evade"
 	"github.com/bssbb1978/gozargah/axr/internal/failover"
 	"github.com/bssbb1978/gozargah/axr/internal/flowprofile"
 	"github.com/bssbb1978/gozargah/axr/internal/measure"
@@ -218,6 +219,7 @@ type server struct {
 
 	// 2.17 — AXR-v3.1 state.
 	netstate     *netstate.Detector // route-regime hysteresis (net-e-melli)
+	gov          *evade.Governor    // 2.19 — adaptive evasion governor
 	policyMu     sync.Mutex         // guards lastRegime (tunnel + canary goroutines)
 	lastRegime   netstate.Regime    // last regime the policy was applied for
 	frontingHost string             // manifest fronting_hint host (role tag)
@@ -326,6 +328,7 @@ func newServer(cfg Config, l *logger, timeout time.Duration) (*server, error) {
 		frameHist: make([]int, len(flowprofile.FrameBucketEdges)-1),
 		// 2.17 — net-e-melli regime hysteresis + canary defaults.
 		netstate:    netstate.NewDetector(),
+		gov:         evade.NewGovernor(),
 		lastRegime:  netstate.RegimeStable,
 		canaryInt:   300 * time.Second,
 		configHosts: make(map[string]bool, len(cfg.Entries)),
@@ -523,27 +526,33 @@ func mergeCleanIPsFile(fo *failover.Engine, path string) int {
 
 // fragParams returns the per-connection ClientHello surgery parameters:
 // the randomized cut count, the split-write budget, cut window (SNI
-// region), and micro-gap bounds.
-func (s *server) fragParams() (cuts, writes int, lo, hi float64, gapMin, gapMax time.Duration) {
+// region), and micro-gap bounds. The operator's configured ranges are
+// element-wise MAXED with the 2.19 governor's stance escalation: the
+// governor can WIDEN the shape under stress, never narrow it (the steady
+// stance is a pure no-op, so unconfigured behaviour is unchanged).
+func (s *server) fragParams(esc evade.Escalation) (cuts, writes int, lo, hi float64, gapMin, gapMax time.Duration) {
 	cuts, writes = 1, 1
 	gapMin, gapMax = 20*time.Millisecond, 120*time.Millisecond
 	if g := s.cfg.SplitGapMS; g[0] > 0 && g[1] > g[0] {
 		gapMin, gapMax = time.Duration(g[0])*time.Millisecond, time.Duration(g[1])*time.Millisecond
 	}
-	if f := s.cfg.FragCuts; f[0] > 0 && f[1] >= f[0] {
-		cuts = f[0] + int(randFloat()*float64(f[1]-f[0]+1))
+	fCuts := [2]int{max(s.cfg.FragCuts[0], esc.Cuts[0]), max(s.cfg.FragCuts[1], esc.Cuts[1])}
+	fWrites := [2]int{max(s.cfg.FragWrites[0], esc.Writes[0]), max(s.cfg.FragWrites[1], esc.Writes[1])}
+	fGap := [2]int{max(s.cfg.FragMicroGapMS[0], esc.MicroGapMS[0]), max(s.cfg.FragMicroGapMS[1], esc.MicroGapMS[1])}
+	if fCuts[0] > 0 && fCuts[1] >= fCuts[0] {
+		cuts = fCuts[0] + int(randFloat()*float64(fCuts[1]-fCuts[0]+1))
 		// 2.17 — extend the fragmented shape past the ClientHello to the
 		// next one or two client-flight writes (default [1,3] = 1-3 writes).
 		writes = 1
-		if w := s.cfg.FragWrites; w[0] > 0 && w[1] >= w[0] {
-			writes = w[0] + int(randFloat()*float64(w[1]-w[0]+1))
+		if fWrites[0] > 0 && fWrites[1] >= fWrites[0] {
+			writes = fWrites[0] + int(randFloat()*float64(fWrites[1]-fWrites[0]+1))
 			if writes > 5 {
 				writes = 5
 			}
 		}
 		gMin, gMax := 1, 8
-		if g := s.cfg.FragMicroGapMS; g[0] > 0 && g[1] > g[0] {
-			gMin, gMax = g[0], g[1]
+		if fGap[0] > 0 && fGap[1] > fGap[0] {
+			gMin, gMax = fGap[0], fGap[1]
 		}
 		gapMin, gapMax = time.Duration(gMin)*time.Millisecond, time.Duration(gMax)*time.Millisecond
 	}
@@ -877,6 +886,16 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 	regime := s.mergedRegime(vec.Regime)
 	profile := flowprofile.ForRegime(regime)
 	profile = flowprofile.Escalate(profile, flowprofile.ProfileByRank(s.flowFloor))
+	// 2.19 — adaptive evasion governor: local evidence (route regime,
+	// measured delivery, failover stress) picks the bounded shape
+	// escalation for this connection setup; its flow floor sits on top
+	// of the fleet floor (escalate = harsher wins).
+	esc := s.gov.Update(evade.Evidence{
+		Regime:   s.netstate.Regime(),
+		Measure:  vec,
+		FailAggr: s.failover.State() == failover.StateAggressive,
+	})
+	profile = flowprofile.Escalate(profile, flowprofile.ProfileByRank(esc.FlowRank))
 	bctx := s.banditContext(vec, now.UnixMilli(), profile)
 
 	// 2.15 — session reuse: adopt the previous tunnel for the SAME
@@ -951,7 +970,7 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 	for _, cand := range cands {
 		tag := cand.Endpoint.Host + "/" + cand.DialAddr + "[" + cand.Endpoint.Transport + "]"
 		tried = append(tried, tag)
-		res := s.attemptTunnel(ctx, client, cand, header, profile, host, port)
+		res := s.attemptTunnel(ctx, client, cand, header, profile, esc, host, port)
 		last = res
 		if res.ok {
 			break
@@ -995,6 +1014,9 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 			Role: s.roleOf(last.entry.Host), OK: last.ok, At: time.Now(),
 		})
 		s.applyPolicy()
+		// 2.19 — feed the governor's per-stance posterior with the
+		// result of the connection that used that stance.
+		s.gov.Outcome(esc.Stance, last.ok)
 	}
 	_ = s.bandit.Save(s.cfg.CacheDir + "/bandit.json")
 
@@ -1032,7 +1054,7 @@ type tunnelResult struct {
 // attemptTunnel dials one candidate, performs the full VLESS-WS handshake
 // (with surgery), and hands the open tunnel to pumpTunnel. dstHost/dstPort
 // are the SOCKS destination (label the warm session for reuse).
-func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failover.Candidate, header []byte, profile flowprofile.ProfileID, dstHost string, dstPort int) tunnelResult {
+func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failover.Candidate, header []byte, profile flowprofile.ProfileID, esc evade.Escalation, dstHost string, dstPort int) tunnelResult {
 	res := tunnelResult{entry: cand.Endpoint, dialAddr: cand.DialAddr}
 	start := time.Now()
 
@@ -1050,16 +1072,17 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 		// 2.16/2.17 — multi-segment ClientHello surgery (fragA/fragB style):
 		// randomized 1-3 cuts in the SNI region, 1-8 ms SKEWED micro-gaps,
 		// extended (2.17) across the first 1-3 client-flight writes.
-		cuts, writes, lo, hi, gapMin, gapMax := s.fragParams()
+		cuts, writes, lo, hi, gapMin, gapMax := s.fragParams(esc)
 		inner = surgery.NewMultiSplitConnV2(raw, cuts, writes, lo, hi, gapMin, gapMax, s.rngFloat)
 	}
 	surg := s.surgeryOn()
 	var frag *vlessws.Fragmenter
 	if surg {
-		// 2.18 — WS frame-rhythm fragmentation: each binary message rides
-		// as 2-4 masked continuation frames with randomized sizes and
-		// skewed micro-gaps (Worker reassembles natively).
-		frag = vlessws.NewFragmenter(s.rngFloat)
+		// 2.18/2.19 — WS frame-rhythm fragmentation: each binary message
+		// rides as 2-6 masked continuation frames with randomized sizes
+		// and skewed micro-gaps (Worker reassembles natively); the
+		// governor tunes the rhythm bounds per stance.
+		frag = vlessws.NewFragmenterWith(s.rngFloat, esc.WSMinB, esc.WSMaxB, esc.WSCount, time.Duration(esc.WSGapMS)*time.Millisecond)
 	}
 	ws, err := vlessws.DialConn(ctx, inner, vlessws.DialOptions{
 		Host:       cand.Endpoint.Host,

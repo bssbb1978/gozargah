@@ -207,7 +207,15 @@ type Fragmenter struct {
 // NewFragmenter returns a Fragmenter with the default rhythm: fragments in
 // [256, 16384] bytes, 2-4 per message, skewed 0..3 ms gaps.
 func NewFragmenter(rng Rng) *Fragmenter {
-	return &Fragmenter{
+	return NewFragmenterWith(rng, fragMinBytes, fragMaxBytes, fragMaxCount, fragGapMaxMS*time.Millisecond)
+}
+
+// NewFragmenterWith returns a Fragmenter with explicit rhythm bounds — the
+// 2.19 governor tunes these per stance. Out-of-range values keep the
+// corresponding default (min in [64, max/2], max in [min*2, 1 MiB], count
+// in [2, 8], gapMax in [0, 50 ms]).
+func NewFragmenterWith(rng Rng, minB, maxB, count int, gapMax time.Duration) *Fragmenter {
+	f := &Fragmenter{
 		rng:     rng,
 		min:     fragMinBytes,
 		max:     fragMaxBytes,
@@ -215,6 +223,16 @@ func NewFragmenter(rng Rng) *Fragmenter {
 		gapMin:  0,
 		gapMax:  fragGapMaxMS * time.Millisecond,
 	}
+	if minB >= 64 && maxB >= 1024 && maxB <= 1<<20 && minB*2 <= maxB {
+		f.min, f.max = minB, maxB
+	}
+	if count >= 2 && count <= 8 {
+		f.maxFrag = count
+	}
+	if gapMax >= 0 && gapMax <= 50*time.Millisecond {
+		f.gapMax = gapMax
+	}
+	return f
 }
 
 // Split returns the per-fragment sizes for a payload of length n: [n]

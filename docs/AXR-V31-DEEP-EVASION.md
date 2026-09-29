@@ -227,6 +227,47 @@ Honest boundary: this is framing rhythm, not encryption — the fingerprint
 no longer matches a single-frame-per-write VLESS client, but the stream
 is still recognizably WebSocket.
 
+### 6.2 Adaptive evasion governor (2.19, `evade`)
+
+The pieces so far measure (cfscan, netstate, measure), learn (bandit
+ensemble), and shape (surgery v2, flow morphing, frame rhythm) — 2.19
+closes the loop with a **policy brain** that re-tunes the shape to the
+evidence, per connection, automatically.
+
+**Inputs (all local, already computed):** the net-e-melli route regime
+(hysteresis), the measured delivery vector (drop/RST/TLS-error rates,
+CUSUM step alarm), and the failover engine's stress state.
+
+**Bounded stance ladder** (the only parameters the governor may emit;
+ranges are element-wise MAXED with the operator's configured baseline,
+so the governor can widen a shape, never narrow one — `steady` is a
+pure no-op):
+
+| param (range)        | steady | cautious | aggressive |
+|----------------------|:------:|:--------:|:----------:|
+| ClientHello cuts     | —      | [2,3]    | [2,4]      |
+| cut writes           | —      | [1,3]    | [2,3]      |
+| micro-gap (ms)       | —      | [1,10]   | [2,12]     |
+| flow-profile floor   | web    | chat     | video      |
+| WS frag count / gap  | ≤4/3ms | ≤5/4ms   | ≤6/6ms     |
+| WS frag min (B)      | 256    | 256      | 192        |
+
+**Transition rules (hysteresis):** escalation commits after **2**
+consecutive stressed samples; de-escalation needs **4** calm ones — a
+flapping network cannot flap the shape.
+
+**Internal AI:** a per-stance **Beta posterior** is fed with the outcome
+of every connection that used that stance. Its posterior mean may lift
+the target by exactly one level (margin 0.15) when the data says the
+stronger stance is connecting better than the rule floor suggests; it
+can never lower the target or skip levels. A single-connection trial of
+the next stance every 20 samples gives the posterior its exploration
+contrast. The operator's `surgery: false` remains the hard off switch.
+
+Honest boundary: the governor changes *shape*, never *semantics* — the
+VLESS payload, the destination, and the entry selection (bandit +
+failover) are untouched; every parameter is bounded and auditable.
+
 ---
 
 ## 7. Verification
