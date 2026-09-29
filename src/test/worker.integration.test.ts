@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
 import type { D1Database } from '@cloudflare/workers-types';
+import { VERSION } from '../config';
 import { getUserByIdFresh, recordUsageDelta } from '../db/users';
 import { consumeAiDiagnosticQuota } from '../db/store';
 import { createDiagnostics, getAiModelCandidates, rankCatalogModels } from '../ai/diagnostics';
@@ -41,7 +42,8 @@ describe('Cloudflare Worker + D1 integration', () => {
   it('serves health without initializing admin state', async () => {
     const response = await mf.dispatchFetch('https://gozargah.test/healthz');
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true, version: '2.1.0' });
+    // Compare with the shared constant, not a literal, so version bumps can't leave this test stale.
+    expect(await response.json()).toMatchObject({ ok: true, version: VERSION });
   });
 
   it('rejects webhook requests without Telegram secret', async () => {
