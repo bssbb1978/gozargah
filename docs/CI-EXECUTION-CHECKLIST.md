@@ -18,7 +18,7 @@ Gates, in order (any failure fails the run; nothing is skipped):
    `sum.golang.org`, module graph: utls v1.6.7 → brotli, circl →
    go-ristretto, compress, x/crypto, x/net, x/sys, x/term, x/text).
 2. `go vet ./...` — zero warnings (any output = failure).
-3. `go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...` — zero
+3. `go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 (= staticcheck 2025.1.1) ./...` — zero
    findings.
 4. `go test -race -v -count=1 ./...` — **native host arch only** (the race
    detector cannot cross-compile). This is the gate for the concurrent

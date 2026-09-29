@@ -81,8 +81,7 @@ const (
 	// been tried enough and is persistently much worse than its peers.
 	PruneMinPulls  = 12
 	PruneMaxRatio  = 0.10
-	ridge        = 1.0 // λ: ridge regularisation on A (keeps A invertible)
-	featureScale = 1.0 // reserved for future per-feature rescaling
+	ridge = 1.0 // λ: ridge regularisation on A (keeps A invertible)
 
 	successThroughputTarget = 2.0 * 1000 * 1000 // 2 MB/s saturates the bonus
 )

@@ -279,8 +279,9 @@ func (t *Tracker) vectorLocked() Vector {
 
 	// weakest transport: lowest success ratio among transports with >=3 obs.
 	for tr, cnt := range trN {
-		if cnt >= 3 && trOK[tr]/float64(cnt) < 0.75 {
-			if v.WeakestTransport == "" || trOK[tr]/float64(cnt) < trOK[v.WeakestTransport]/float64(trN[v.WeakestTransport]) {
+		ratio := float64(trOK[tr]) / float64(cnt)
+		if cnt >= 3 && ratio < 0.75 {
+			if v.WeakestTransport == "" || ratio < float64(trOK[v.WeakestTransport])/float64(trN[v.WeakestTransport]) {
 				v.WeakestTransport = tr
 			}
 		}

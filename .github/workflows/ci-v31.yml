@@ -94,8 +94,8 @@ jobs:
       - name: "Gate 2 — staticcheck (zero findings, both TLS identities)"
         working-directory: client
         run: |
-          go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
-          go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 -tags axr_utls ./...
+          go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 ./...
+          go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 -tags axr_utls ./...
 
       - name: "Gate 3 — go test -race -count=1 (native arch: ${{ matrix.os }})"
         if: matrix.native_race
@@ -199,10 +199,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node 20 (18+ required) with npm cache
+      - name: Setup Node 22 with npm cache
+        # The pinned wrangler (4.143.0, package-lock) hard-requires
+        # Node >= 22 ("Wrangler requires at least Node.js v22.0.0");
+        # this matches the v3.1 spec ("Node.js 22+").
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Clean install (npm ci)
