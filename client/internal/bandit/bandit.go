@@ -14,26 +14,35 @@
 //
 // 2.16 upgrade: 7-dim -> 16-dim context (AXR-v3). The v3 additions and their
 // honest data sources (all LOCAL client measurements — nothing else):
+//
 //   - f7  throughput level     EWMA of measured tunnel bytes/sec
+//
 //   - f8  loss velocity        recent (8-obs) drop rate minus window drop rate
+//
 //   - f9  TLS error rate       window fraction failing at the TLS handshake
+//
 //   - f10 entry churn          0/1 proxy: the best dial address changed since
-//                              the last success (a BGP-flap/anyshift proxy —
-//                              the client cannot see routing tables)
+//     the last success (a BGP-flap/anyshift proxy —
+//     the client cannot see routing tables)
+//
 //   - f11 flow-profile KL      KL(empirical outflow frame-size histogram ||
-//                              target profile) — the core's self-monitoring
+//     target profile) — the core's self-monitoring
+//
 //   - f12 time-of-day sin      derived from NowMS
+//
 //   - f13 time-of-day cos      derived from NowMS
+//
 //   - f14 session longevity    core uptime in hours (24h = max)
+//
 //   - f15 regime ordinal       derived from the regime label (a NOVEL regime
-//                              widens the confidence interval on purpose:
-//                              unexplored conditions deserve exploration)
+//     widens the confidence interval on purpose:
+//     unexplored conditions deserve exploration)
 //
 //   - Per arm we keep the ridge-regularised normal-equation state
-//         A_a = λI + Σ x xᵀ      (16×16, symmetric positive definite)
-//         b_a = Σ r x            (16)
+//     A_a = λI + Σ x xᵀ      (16×16, symmetric positive definite)
+//     b_a = Σ r x            (16)
 //     with θ_a = A_a⁻¹ b_a, and score an arm at context x by
-//         xᵀθ_a + α · √(x A_a⁻¹ x)
+//     xᵀθ_a + α · √(x A_a⁻¹ x)
 //     (exploitation + width of the confidence interval). A is inverted with a
 //     partial-pivot Gauss-Jordan in pure Go — no external math dependency.
 //
@@ -79,9 +88,9 @@ const (
 	PruneKeepAlive = 2
 	// PruneMinPulls / PruneMaxRatio: an arm is prunable only after it has
 	// been tried enough and is persistently much worse than its peers.
-	PruneMinPulls  = 12
-	PruneMaxRatio  = 0.10
-	ridge = 1.0 // λ: ridge regularisation on A (keeps A invertible)
+	PruneMinPulls = 12
+	PruneMaxRatio = 0.10
+	ridge         = 1.0 // λ: ridge regularisation on A (keeps A invertible)
 
 	successThroughputTarget = 2.0 * 1000 * 1000 // 2 MB/s saturates the bonus
 )
@@ -255,6 +264,12 @@ func regimeOrdinal(regime string) float64 {
 		return 0.35
 	case "degraded":
 		return 0.5
+	case "netemelli":
+		// 2.21 — the declared national-intranet window is its own condition:
+		// the international entries are dead and the domestic fronting relay
+		// is the live path, so the learner must treat it as a distinct
+		// regime (own θ per arm) rather than reusing the degraded one.
+		return 0.6
 	case "suspected_change":
 		return 0.7
 	case "cut":
@@ -396,12 +411,12 @@ func (t *armTS) posteriorMean() float64 {
 
 // Bandit is the learner. Safe for concurrent use.
 type Bandit struct {
-	mu     sync.Mutex
-	C      float64 // α: exploration scale
-	arms   []Arm
-	stats  map[string]*Stats
-	lin    map[string]*armLin
-	seed   uint64
+	mu    sync.Mutex
+	C     float64 // α: exploration scale
+	arms  []Arm
+	stats map[string]*Stats
+	lin   map[string]*armLin
+	seed  uint64
 	// lastID is the previously selected arm, used for the diversity bonus
 	// during "suspected_change" (encourages rotating away from the status quo).
 	lastID string
@@ -488,7 +503,7 @@ func gammaSample(shape float64, rng *rand.Rand) float64 {
 		if u < 1-1.5*x*x*x*x {
 			return d * v
 		}
-		if math.Log(u) < 0.5*x*x + d*(1-v+math.Log(v)) {
+		if math.Log(u) < 0.5*x*x+d*(1-v+math.Log(v)) {
 			return d * v
 		}
 	}
@@ -766,7 +781,7 @@ func (b *Bandit) Observe(a Arm, o Outcome, ctx Context, now int64) {
 			if step > 4 {
 				step = 4
 			}
-			backoff := int64(60 * 1000) << step
+			backoff := int64(60*1000) << step
 			if backoff > MaxQuarantineMS {
 				backoff = MaxQuarantineMS
 			}

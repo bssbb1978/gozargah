@@ -29,10 +29,10 @@ func TestBuildVLESSHeaderDomain(t *testing.T) {
 	want := make([]byte, 0, 1+16+1+1+2+1+1+len("example.com"))
 	want = append(want, 0x00)
 	want = append(want, testUUID...)
-	want = append(want, 0x00) // optLen
-	want = append(want, 0x01) // cmd TCP
+	want = append(want, 0x00)       // optLen
+	want = append(want, 0x01)       // cmd TCP
 	want = append(want, 0x1F, 0x90) // 8080 BE
-	want = append(want, 0x02) // atyp domain
+	want = append(want, 0x02)       // atyp domain
 	want = append(want, byte(len("example.com")))
 	want = append(want, []byte("example.com")...)
 	if !reflect.DeepEqual(h, want) {
@@ -228,19 +228,88 @@ func TestEncodeDecodeRoundTripLong(t *testing.T) {
 	}
 }
 
+// The RFC 6455 §1.3 handshake vector. NOTE the key is the BASE64 TEXT the
+// client sends ("dGhlIHNhbXBsZSBub25jZQ==" is itself the key text), so the
+// test must pass its RAW BYTES and let expectedAccept encode them.
 func TestExpectedAcceptMatchesRFC(t *testing.T) {
-	// RFC 6455 §1.3 example.
-	key := []byte("dGhlIHNhbXBsZSBub25jZQ==")
-	accept := expectedAccept(key)
-	if accept != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
-		t.Fatalf("accept mismatch: %s", accept)
+	keyText := "dGhlIHNhbXBsZSBub25jZQ=="
+	raw, err := base64.StdEncoding.DecodeString(keyText)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// And the constant math is right:
-	h := sha1.New()
-	h.Write(key)
-	h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-	if base64.StdEncoding.EncodeToString(h.Sum(nil)) != accept {
-		t.Fatal("accept derivation mismatch")
+	if got := expectedAccept(raw); got != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
+		t.Fatalf("accept = %q, want the RFC 6455 value s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", got)
+	}
+	// Key text in, same answer out (the two entry points must agree).
+	if got := expectedAcceptKeyText(keyText); got != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
+		t.Fatalf("acceptKeyText = %q, want the RFC value", got)
+	}
+}
+
+// Ground truth captured from the real runtime: `wrangler dev` (workerd)
+// answered this exact upgrade request with
+//
+//	HTTP/1.1 101 Switching Protocols
+//	Sec-WebSocket-Accept: tOF+vOsflyPDt5oaQKZhi9QHIZU=
+//
+// for Sec-WebSocket-Key: x+wUxPeC3EFrrGbyLDuNyQ==. A client that cannot
+// reproduce this value cannot talk to the Cloudflare edge at all.
+func TestExpectedAcceptMatchesWorkerdGroundTruth(t *testing.T) {
+	keyText := "x+wUxPeC3EFrrGbyLDuNyQ=="
+	raw, err := base64.StdEncoding.DecodeString(keyText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const workerd = "tOF+vOsflyPDt5oaQKZhi9QHIZU="
+	if got := expectedAccept(raw); got != workerd {
+		t.Fatalf("accept = %q, want the workerd value %q — the client would reject a genuine 101", got, workerd)
+	}
+	if got := expectedAcceptKeyText(keyText); got != workerd {
+		t.Fatalf("acceptKeyText = %q, want %q", got, workerd)
+	}
+}
+
+// The contract that was missing: the accept the client DEMANDS must be the
+// independent RFC formula applied to the key TEXT that the upgrade request
+// actually carries. The oracle below is a second implementation written
+// straight from RFC 6455 §4.2.2, so a bug in either side fails the test.
+func TestUpgradeRequestKeyAndAcceptAgree(t *testing.T) {
+	rng := func() float64 { return 0.5 }
+	shapes := map[string]*UpgradeShape{
+		"classic": nil,
+		"bare":    NewUpgradeShape(rng, UpgradeBare, "", "", ""),
+		"lite":    NewUpgradeShape(rng, UpgradeLite, "en-US", "UA/1", ""),
+		"full":    NewUpgradeShape(rng, UpgradeFull, "en-US", "UA/1", "https://o.example"),
+	}
+	for name, shape := range shapes {
+		// Deterministic per-shape key bytes: the accept math must not
+		// depend on where the key came from.
+		raw := make([]byte, 16)
+		for i := range raw {
+			raw[i] = byte(i*11 + len(name))
+		}
+		req := buildUpgradeRequest("edge.example", "/p?ed=8", raw, "QUFB", shape)
+
+		var keyText string
+		for _, line := range strings.Split(req, "\r\n") {
+			if len(line) >= len("Sec-WebSocket-Key:") && strings.EqualFold(line[:len("Sec-WebSocket-Key:")], "sec-websocket-key:") {
+				keyText = strings.TrimSpace(line[len("Sec-WebSocket-Key:"):])
+			}
+		}
+		if keyText == "" {
+			t.Fatalf("shape %s: request carries no Sec-WebSocket-Key:\n%s", name, req)
+		}
+
+		// Independent oracle: RFC 6455 §4.2.2, written from the spec text.
+		oracle := sha1.Sum([]byte(keyText + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+		want := base64.StdEncoding.EncodeToString(oracle[:])
+
+		if got := expectedAccept(raw); got != want {
+			t.Errorf("shape %s: expectedAccept = %q, oracle = %q", name, got, want)
+		}
+		if got := expectedAcceptKeyText(keyText); got != want {
+			t.Errorf("shape %s: expectedAcceptKeyText = %q, oracle = %q", name, got, want)
+		}
 	}
 }
 
@@ -276,7 +345,7 @@ func decodeClientFrame(f []byte) (opcode byte, fin bool, payload []byte, err err
 	if len(f) < off+4+l {
 		return 0, false, nil, io.ErrShortBuffer
 	}
-	mask := [4]byte{f[off], f[off + 1], f[off + 2], f[off + 3]}
+	mask := [4]byte{f[off], f[off+1], f[off+2], f[off+3]}
 	payload = make([]byte, l)
 	for i := 0; i < l; i++ {
 		payload[i] = f[off+4+i] ^ mask[i%4]
@@ -398,10 +467,10 @@ func (c *frConn) Write(b []byte) (int, error) {
 	c.r.mu.Unlock()
 	return len(b), nil
 }
-func (c *frConn) Close() error                   { return nil }
-func (c *frConn) LocalAddr() net.Addr            { return frAddr("local") }
-func (c *frConn) RemoteAddr() net.Addr           { return frAddr("remote") }
-func (c *frConn) SetDeadline(time.Time) error    { return nil }
+func (c *frConn) Close() error                { return nil }
+func (c *frConn) LocalAddr() net.Addr         { return frAddr("local") }
+func (c *frConn) RemoteAddr() net.Addr        { return frAddr("remote") }
+func (c *frConn) SetDeadline(time.Time) error { return nil }
 func (c *frConn) SetReadDeadline(time.Time) error {
 	return nil
 }

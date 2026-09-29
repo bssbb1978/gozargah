@@ -28,9 +28,9 @@ type Rng func() float64
 type ProfileID string
 
 const (
-	ProfileWeb    ProfileID = "web"
-	ProfileVideo  ProfileID = "video"
-	ProfileChat   ProfileID = "chat"
+	ProfileWeb   ProfileID = "web"
+	ProfileVideo ProfileID = "video"
+	ProfileChat  ProfileID = "chat"
 )
 
 // ForRegime maps the measured network regime to a flow profile:
@@ -38,12 +38,17 @@ const (
 //	stable            -> web     (mixed request/response, the boring baseline)
 //	watch             -> chat    (small, bursty, human-paced — hard to flag)
 //	degraded          -> chat    (net-e-melli partial cut: low-profile bursts)
+//	netemelli         -> chat    (2.21 declared intranet window: the domestic
+//	                              path carries, so stay in the LOW-PROFILE
+//	                              class on purpose — a bulk/video shape over a
+//	                              domestic CDN relay is exactly the anomaly a
+//	                              volumetric classifier keys on)
 //	suspected_change  -> video   (sustained large flow — mimics bulk transfer)
 //	cut               -> video   (sparse retry traffic shaped like bulk)
 //	recovering/other  -> web
 func ForRegime(regime string) ProfileID {
 	switch regime {
-	case "watch", "degraded":
+	case "watch", "degraded", "netemelli":
 		return ProfileChat
 	case "suspected_change", "cut":
 		return ProfileVideo
@@ -96,12 +101,12 @@ type bin struct {
 
 // Profile is one target class: a length histogram + lognormal IPD parameters.
 type Profile struct {
-	ID      ProfileID
-	Bins    []bin
-	IPDMu   float64 // lognormal mu of the gap (log-seconds)
+	ID       ProfileID
+	Bins     []bin
+	IPDMu    float64 // lognormal mu of the gap (log-seconds)
 	IPDSigma float64 // lognormal sigma
-	IPDMin  time.Duration
-	IPDMax  time.Duration
+	IPDMin   time.Duration
+	IPDMax   time.Duration
 }
 
 // Profiles returns the built-in class set.
@@ -199,7 +204,7 @@ func normalDraw(rng Rng) float64 {
 			u1 = 1e-12
 		}
 		u2 := rng()
-		z := math.Sqrt(-2 * math.Log(u1)) * math.Cos(2*math.Pi*u2)
+		z := math.Sqrt(-2*math.Log(u1)) * math.Cos(2*math.Pi*u2)
 		if math.IsNaN(z) || math.IsInf(z, 0) {
 			continue
 		}

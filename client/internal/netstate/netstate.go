@@ -42,12 +42,22 @@ import (
 type Regime int
 
 // The route regimes (ordinal doubles as the bandit context rank source).
+//
+// RegimeNetEMelli is the declared national-intranet (net-e-melli) window: the
+// international route is demonstrably dead (the canary is DOWN, or no canary
+// is configured) while the DOMESTIC fronting entry is demonstrably ALIVE.
+// That combination is materially different from plain "degraded" (where
+// international entries fail intermittently but the route still exists): it
+// means the only reachable path is the domestic CDN, so the ladder must put
+// it first AND stop re-dialing the international class, whose failed TLS
+// handshakes are themselves a dense, clusterable signature.
 const (
 	RegimeUnknown Regime = iota
 	RegimeStable
 	RegimeDegraded
 	RegimeCut
 	RegimeRecovering
+	RegimeNetEMelli
 )
 
 // Label is the wire/string form (bandit context + audit logs).
@@ -61,6 +71,8 @@ func (r Regime) Label() string {
 		return "cut"
 	case RegimeRecovering:
 		return "recovering"
+	case RegimeNetEMelli:
+		return "netemelli"
 	default:
 		return "unknown"
 	}
@@ -73,7 +85,7 @@ func (r Regime) Rank() int {
 	switch r {
 	case RegimeCut:
 		return 3
-	case RegimeDegraded:
+	case RegimeDegraded, RegimeNetEMelli:
 		return 2
 	case RegimeRecovering:
 		return 1
@@ -124,6 +136,20 @@ type Policy struct {
 	Primary    int
 	Backup     int
 	Aggressive bool // use the aggressive probe cadence
+	// QuietPrimary / QuietBackup ask the failover engine to take the
+	// international classes OFF THE WIRE (the blackout-quiet gate) while
+	// the regime holds. Only ever set on RegimeNetEMelli, where the
+	// international route is known-dead and re-dialing it is pure
+	// failed-attempt signature. A recovered route always returns to the
+	// ladder because the gate is bounded (QuietPolicy.MaxMS).
+	QuietPrimary bool
+	QuietBackup  bool
+}
+
+// IsBlackout reports whether the regime means "no international path"
+// (RegimeCut: nothing carried at all; RegimeNetEMelli: domestic only).
+func (r Regime) IsBlackout() bool {
+	return r == RegimeCut || r == RegimeNetEMelli
 }
 
 // Policy returns the regime's priority table.
@@ -138,6 +164,12 @@ func (r Regime) Policy() Policy {
 	switch r {
 	case RegimeCut:
 		return Policy{Fronting: 0, Primary: 30, Backup: 40, Aggressive: true}
+	case RegimeNetEMelli:
+		// Declared intranet window: the domestic fronting entry is the ONLY
+		// path, so it leads the ladder, and the international classes are
+		// put behind the quiet gate.
+		return Policy{Fronting: 0, Primary: 35, Backup: 45, Aggressive: true,
+			QuietPrimary: true, QuietBackup: true}
 	case RegimeDegraded, RegimeRecovering:
 		return Policy{Fronting: 10, Primary: 20, Backup: 40, Aggressive: true}
 	default: // stable, unknown
@@ -181,15 +213,19 @@ func (d *Detector) Regime() Regime {
 // Policy returns the current regime's priority table.
 func (d *Detector) Policy() Policy { return d.Regime().Policy() }
 
-// IsStressed reports degraded-or-cut (the fronting-first + aggressive
+// IsStressed reports degraded-or-worse (the fronting-first + aggressive
 // cadence conditions).
 func (d *Detector) IsStressed() bool {
 	switch d.Regime() {
-	case RegimeDegraded, RegimeCut:
+	case RegimeDegraded, RegimeCut, RegimeNetEMelli:
 		return true
 	}
 	return false
 }
+
+// IsBlackout reports whether the current regime says "no international
+// path" (domestic-only or worse).
+func (d *Detector) IsBlackout() bool { return d.Regime().IsBlackout() }
 
 // stepLocked applies the hysteresis rules (caller holds d.mu).
 //
@@ -221,7 +257,7 @@ func (d *Detector) stepLocked() Regime {
 	okCount := 0
 	distinct := map[Role]bool{}
 	primaryOK, primaryFail, frontingOK, frontingFail := 0, 0, 0, 0
-	canaryLive := false
+	canaryLive, canarySeen := false, false
 	for _, o := range w {
 		if o.OK {
 			okCount++
@@ -243,6 +279,7 @@ func (d *Detector) stepLocked() Regime {
 		case RoleCanary:
 			// ascending iteration: the last (newest) canary obs wins
 			canaryLive = o.OK
+			canarySeen = true
 		}
 	}
 	allFail := okCount == 0 && n >= minWindowCut && len(distinct) >= minDistinct
@@ -251,6 +288,15 @@ func (d *Detector) stepLocked() Regime {
 	// a canary with NO observation in the window is not "live" — it is
 	// simply silent (the guard is only a veto, never a trigger)
 	canaryCut := allFail && !canaryLive
+	// net-e-melli signature: the domestic CDN fronting entry CARRIES
+	// (frontingOK >= 1) while every international primary observation
+	// failed, and the international liveness signal is either explicitly
+	// down (canary seen and failing) or absent (no canary configured — the
+	// client has no international evidence at all, so "domestic works,
+	// international does not" is the best-supported label). It is NOT a
+	// "cut": by definition something in the window still works.
+	netEMelli := frontingOK >= 1 && primaryDead && !allFail &&
+		(!canarySeen || !canaryLive)
 
 	recovery := false
 	if n >= recoveryStreak {
@@ -265,12 +311,32 @@ func (d *Detector) stepLocked() Regime {
 
 	switch d.regime {
 	case RegimeCut:
-		if recovery {
+		// A cut can resolve straight into the intranet window: the canary
+		// is still down but the domestic fronting entry started carrying —
+		// that is exactly the net-e-melli shape, and it must not be
+		// reported as plain "degraded" (the ladder reacts differently).
+		if netEMelli {
+			d.regime = RegimeNetEMelli
+		} else if recovery {
 			d.regime = RegimeRecovering
+		}
+	case RegimeNetEMelli:
+		if recovery && primaryOK >= 2 {
+			// International primaries carried again: the window closed.
+			d.regime = RegimeRecovering
+		} else if frontingDead && canaryCut {
+			d.regime = RegimeCut
+		} else if !primaryDead {
+			// International reached again (at least one primary observation
+			// succeeded): fall back to the softer degraded label rather than
+			// holding a declared intranet window open.
+			d.regime = RegimeDegraded
 		}
 	case RegimeDegraded:
 		if canaryCut {
 			d.regime = RegimeCut
+		} else if netEMelli {
+			d.regime = RegimeNetEMelli
 		} else if recovery {
 			d.regime = RegimeRecovering
 		}
@@ -283,6 +349,8 @@ func (d *Detector) stepLocked() Regime {
 	default: // RegimeUnknown / RegimeStable
 		if canaryCut && frontingDead {
 			d.regime = RegimeCut
+		} else if netEMelli {
+			d.regime = RegimeNetEMelli
 		} else if primaryDead && !allFail {
 			d.regime = RegimeDegraded
 		}

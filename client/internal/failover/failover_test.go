@@ -161,8 +161,8 @@ func TestFailoverOrderRespectsBanditScore(t *testing.T) {
 	e := New(testEntries(), nil)
 	// Bandit score: backup beats primary (opposite of priority order).
 	scores := map[string]float64{
-		"backup.example|ws|firefox":  0.9,
-		"primary.example|ws|chrome":  0.4,
+		"backup.example|ws|firefox": 0.9,
+		"primary.example|ws|chrome": 0.4,
 	}
 	order := e.FailoverOrder(func(a Arm) float64 {
 		return scores[a.Host+"|"+a.Transport+"|"+a.FP]

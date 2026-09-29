@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -35,23 +36,86 @@ type Endpoint struct {
 	Transport string   `json:"transport"`
 	FP        string   `json:"fp"`
 	Priority  int      `json:"priority"` // lower = preferred
+	// Port is the TCP port dialled on the host and on every explicit IP
+	// (0 → 443). Non-standard ports make non-443 edge endpoints, split
+	// deployments and LOCAL TEST HARNESSES reachable: without it the
+	// ladder could only ever speak to :443, so no end-to-end test could
+	// run against a dev server on a high port.
+	Port int `json:"port,omitempty"`
+}
+
+// dialPort is the effective port (0 means the conventional 443).
+func (e Endpoint) dialPort() int {
+	if e.Port > 0 && e.Port <= 65535 {
+		return e.Port
+	}
+	return 443
 }
 
 // IPHealth is the live health record for one (endpoint, dial-address).
 type IPHealth struct {
-	DialAddr     string  `json:"dial_addr"` // ip:443 or host:443
-	RTTMS        float64 `json:"rtt_ms"`
-	Score        float64 `json:"score"`    // 0..1 composite health
-	ConsecFail   int     `json:"consec_fail"`
-	ConsecOK     int     `json:"consec_ok"`
-	LastOKMS     int64   `json:"last_ok_ms"`
-	LastErr      string  `json:"last_err"`
+	DialAddr   string  `json:"dial_addr"` // ip:port or host:port (port defaults to 443)
+	RTTMS      float64 `json:"rtt_ms"`
+	Score      float64 `json:"score"` // 0..1 composite health
+	ConsecFail int     `json:"consec_fail"`
+	ConsecOK   int     `json:"consec_ok"`
+	LastOKMS   int64   `json:"last_ok_ms"`
+	LastErr    string  `json:"last_err"`
+	// QuietUntilMS is the blackout-quiet gate (2.21): the dial address is
+	// skipped by the ladder until this unix-ms instant. Cleared on the next
+	// success. 0 = not quiet.
+	QuietUntilMS int64 `json:"quiet_until_ms,omitempty"`
+}
+
+// QuietPolicy bounds the blackout-quiet window. A repeatedly failing dial
+// address is not merely deprioritised, it is *taken off the wire* for a
+// bounded period: during a net-e-melli window the international entries
+// cannot carry traffic anyway, so re-dialing them every round only produces
+// a dense, highly clusterable burst of failed TLS handshakes (RST/EOF at
+// SNI time) from every client of the fleet at once — itself a fingerprint.
+//
+// The window is exponential in the consecutive-failure count and capped, so
+// a recovered route is always rediscovered: after MaxMS the address returns
+// to the ladder and gets a real attempt.
+type QuietPolicy struct {
+	// BaseMS is the quiet window after quietMinFails consecutive failures.
+	BaseMS int64
+	// MaxMS caps the window.
+	MaxMS int64
+}
+
+// Enabled reports whether the gate is active.
+func (p QuietPolicy) Enabled() bool { return p.BaseMS > 0 && p.MaxMS > 0 }
+
+// quietFor returns the quiet window for a consecutive-failure count.
+func (p QuietPolicy) quietFor(consecFail int) int64 {
+	if !p.Enabled() || consecFail < quietMinFails {
+		return 0
+	}
+	step := consecFail - quietMinFails
+	if step > 6 {
+		step = 6
+	}
+	d := p.BaseMS << step
+	if d > p.MaxMS || d <= 0 {
+		d = p.MaxMS
+	}
+	return d
+}
+
+// QuietState is the audit view of the blackout-quiet gate.
+type QuietState struct {
+	Enabled bool  `json:"enabled"`
+	Quiet   int   `json:"quiet"` // dial addresses inside their quiet window
+	Total   int   `json:"total"` // tracked dial addresses
+	BaseMS  int64 `json:"base_ms"`
+	MaxMS   int64 `json:"max_ms"`
 }
 
 // Cache is the persistable routing cache.
 type Cache struct {
-	UpdatedAtMS int64                 `json:"updated_at_ms"`
-	Health      map[string]*IPHealth  `json:"health"` // key: host|dialaddr
+	UpdatedAtMS int64                `json:"updated_at_ms"`
+	Health      map[string]*IPHealth `json:"health"` // key: host|dialaddr
 }
 
 // ProbeFunc performs one connectivity probe and reports latency.
@@ -67,10 +131,12 @@ type Engine struct {
 	state   string // "normal" | "aggressive"
 	// failure streak that triggers aggressive mode
 	streak int
+	// quiet is the blackout-quiet gate (disabled until SetQuietPolicy).
+	quiet QuietPolicy
 }
 
 const (
-	StateNormal    = "normal"
+	StateNormal     = "normal"
 	StateAggressive = "aggressive"
 
 	// Aggressive mode triggers after this many consecutive engine-level
@@ -78,17 +144,30 @@ const (
 	aggressiveStreak = 2
 	// In aggressive mode the probe timeout is relaxed (deep-packet paths
 	// answer slowly) and the candidate cap is raised.
-	normalProbeTimeout  = 3 * time.Second
-	aggressiveTimeout   = 5 * time.Second
-	normalCandidateCap  = 3
+	normalProbeTimeout     = 3 * time.Second
+	aggressiveTimeout      = 5 * time.Second
+	normalCandidateCap     = 3
 	aggressiveCandidateCap = 6
 
 	// health scoring
 	healthOKBase   = 1.0
-	healthDecay    = 0.6 // per consecutive failure
+	healthDecay    = 0.6  // per consecutive failure
 	healthRTTFloor = 0.25 // 400ms+ RTT starts costing score
 	healthRTTMax   = 400.0
+
+	// quietMinFails is the consecutive-failure count that arms the
+	// blackout-quiet gate. Below it, a single unlucky dial never silences a
+	// healthy entry.
+	quietMinFails = 3
 )
+
+// DefaultQuietPolicy is the baseline blackout-quiet gate the axr core
+// installs: after 3 consecutive failures a dial address goes quiet for 20 s,
+// doubling per further failure up to 10 minutes. A netstate net-e-melli or
+// cut regime widens it (see cmd/axr), and any success clears it instantly.
+func DefaultQuietPolicy() QuietPolicy {
+	return QuietPolicy{BaseMS: 20_000, MaxMS: 10 * 60_000}
+}
 
 // New builds an engine. probe may be nil (then the built-in TCP+TLS-dial
 // probe is used by ProbeAll).
@@ -227,12 +306,64 @@ type Candidate struct {
 	Score    float64
 }
 
+// SetQuietPolicy installs the blackout-quiet gate. A zero/negative policy
+// disables it (the default for a bare Engine; cmd/axr always installs
+// DefaultQuietPolicy and widens it under a net-e-melli regime).
+func (e *Engine) SetQuietPolicy(p QuietPolicy) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.quiet = p
+}
+
+// Quiet returns the audit view of the blackout-quiet gate.
+func (e *Engine) Quiet() QuietState {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.quietLocked()
+}
+
+// QuietState reports the gate's current state (caller holds e.mu).
+func (e *Engine) quietLocked() QuietState {
+	now := time.Now().UnixMilli()
+	qs := QuietState{Enabled: e.quiet.Enabled(), BaseMS: e.quiet.BaseMS, MaxMS: e.quiet.MaxMS}
+	for _, h := range e.cache.Health {
+		qs.Total++
+		if h.QuietUntilMS > now {
+			qs.Quiet++
+		}
+	}
+	return qs
+}
+
+// quietNow reports whether a dial address is inside its quiet window
+// (caller holds e.mu).
+func (e *Engine) quietNow(h *IPHealth, nowMS int64) bool {
+	return h != nil && h.QuietUntilMS > nowMS
+}
+
 // FailoverOrder returns the global ordered candidate list, capped per mode.
 // orderFn (usually the bandit score for the arm) ranks endpoints; within an
 // endpoint, health ranks dial addresses.
+//
+// Blackout-quiet: dial addresses inside their quiet window (see
+// QuietPolicy) are omitted. The invariant "never silence everything" is
+// enforced here: if every candidate is quiet the unfiltered order is
+// returned, so a caller can always try *something*.
 func (e *Engine) FailoverOrder(orderFn func(Arm) float64) []Candidate {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	now := time.Now().UnixMilli()
+	out := e.failoverOrderLocked(orderFn, true, now)
+	if len(out) == 0 {
+		out = e.failoverOrderLocked(orderFn, false, now)
+	}
+	return out
+}
+
+// failoverOrderLocked builds the ordered candidate list. skipQuiet drops
+// addresses inside their quiet window; the caller decides what an empty
+// result means.
+func (e *Engine) failoverOrderLocked(orderFn func(Arm) float64, skipQuiet bool, nowMS int64) []Candidate {
 	cap := normalCandidateCap
 	if e.state == StateAggressive {
 		cap = aggressiveCandidateCap
@@ -261,6 +392,9 @@ func (e *Engine) FailoverOrder(orderFn func(Arm) float64) []Candidate {
 	for _, r := range ranks {
 		addrs := e.candidatesForLocked(r.ep)
 		for _, a := range addrs {
+			if skipQuiet && e.quietNow(e.cache.Health[r.ep.Host+"|"+a.addr], nowMS) {
+				continue
+			}
 			if len(out) >= cap {
 				return out
 			}
@@ -285,10 +419,11 @@ func (e *Engine) candidatesForLocked(ep Endpoint) []cand {
 		}
 		out = append(out, cand{addr: addr, score: h.Score})
 	}
+	port := strconv.Itoa(ep.dialPort())
 	for _, ip := range ep.IPs {
-		add(ip + ":443")
+		add(net.JoinHostPort(ip, port))
 	}
-	add(ep.Host + ":443")
+	add(net.JoinHostPort(ep.Host, port))
 	sort.SliceStable(out, func(i, j int) bool { return out[i].score > out[j].score })
 	return out
 }
@@ -305,17 +440,25 @@ type Arm struct {
 // records health. Returns the candidates that came back healthy, in order.
 func (e *Engine) ProbeRound(now time.Time) []Candidate {
 	e.mu.Lock()
-	state := e.state
-	e.mu.Unlock()
+	// Quiet-aware order first: addresses that repeatedly failed are off the
+	// wire. If that leaves nothing, the whole ladder is quiet — the
+	// blackout case, where one candidate per round is probed (the minimum
+	// failed-attempt signature that still discovers a reopened route).
+	order := e.failoverOrderLocked(nil, true, now.UnixMilli())
+	if len(order) == 0 {
+		if full := e.failoverOrderLocked(nil, false, now.UnixMilli()); len(full) > 0 {
+			order = full[:1]
+		}
+	}
 	timeout := normalProbeTimeout
-	if state == StateAggressive {
+	if e.state == StateAggressive {
 		timeout = aggressiveTimeout
 	}
 	probe := e.probe
+	e.mu.Unlock()
 	if probe == nil {
 		probe = DefaultProbe
 	}
-	order := e.FailoverOrder(nil)
 	var healthy []Candidate
 	anyOK := false
 	for _, c := range order {
@@ -352,6 +495,9 @@ func (e *Engine) observe(ep Endpoint, dialAddr string, ok bool, rttMS float64, e
 		h.ConsecFail = 0
 		h.LastOKMS = now.UnixMilli()
 		h.LastErr = ""
+		// A single success un-gates the address immediately: the route
+		// came back, and the next dial must be allowed to use it.
+		h.QuietUntilMS = 0
 		if rttMS > 0 {
 			if h.RTTMS == 0 {
 				h.RTTMS = rttMS
@@ -375,6 +521,9 @@ func (e *Engine) observe(ep Endpoint, dialAddr string, ok bool, rttMS float64, e
 		h.Score *= healthDecay
 		if h.Score < 0.001 {
 			h.Score = 0
+		}
+		if d := e.quiet.quietFor(h.ConsecFail); d > 0 {
+			h.QuietUntilMS = now.UnixMilli() + d
 		}
 	}
 	e.cache.UpdatedAtMS = now.UnixMilli()

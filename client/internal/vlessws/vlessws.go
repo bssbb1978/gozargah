@@ -47,6 +47,18 @@ const (
 
 const maxFrame = 1 << 20 // 1 MiB guard per (re)assembled message
 
+// errFrameTooLarge is returned when a peer declares a payload length beyond
+// maxFrame. The client refuses to allocate for it: RFC 6455 §5.2 allows the
+// 64-bit length form up to 2^63-1, which is far more memory than a tunnel
+// endpoint should ever be able to make this process reserve.
+var errFrameTooLarge = errors.New("ws: frame too large")
+
+// errOrphanContinuation is returned when a message STARTS with a
+// continuation opcode. RFC 6455 §5.4 forbids it, and readFrame already
+// reassembles legitimately fragmented messages, so delivering such a frame
+// as a complete message would silently desynchronise the VLESS stream.
+var errOrphanContinuation = errors.New("ws: orphan continuation frame")
+
 // BuildVLESSHeader assembles the VLESS v1 request header for a TCP stream
 // (cmd 0x01) or UDP association (cmd 0x02) to host:port.
 func BuildVLESSHeader(uuid []byte, host string, port uint16, udp bool) ([]byte, error) {
@@ -250,7 +262,7 @@ func (f *Fragmenter) Split(n int) []int {
 	}
 	kmax := f.maxFrag
 	if kmax > (n-1)/f.min+1 { // fragments allowed so each can reach min
-		kmax = (n - 1) / f.min + 1
+		kmax = (n-1)/f.min + 1
 	}
 	if kmin > kmax {
 		return []int{n}
@@ -261,7 +273,7 @@ func (f *Fragmenter) Split(n int) []int {
 	for i := 0; i < k-1; i++ {
 		remaining := n - used
 		// Later full fragments (>= min) plus a 1-byte tail must still fit.
-		reserve := (k - 2 - i) * f.min + 1
+		reserve := (k-2-i)*f.min + 1
 		hi := f.max
 		if lim := remaining - reserve; lim < hi {
 			hi = lim
@@ -526,7 +538,8 @@ func DecodeServerFrame(buf []byte) (opcode byte, payload []byte, n int, err erro
 // DialOptions configures a VLESS-WS dial.
 type DialOptions struct {
 	Host      string // entry hostname (SNI + Host header + cert validation)
-	DialAddr  string // optional explicit "ip:443" clean-IP override
+	DialAddr  string // optional explicit "ip:port" clean-IP override
+	Port      int    // entry port used when DialAddr is empty (0 → 443)
 	Path      string // websocket path, e.g. "/sub/<base>?ed=2048"
 	EarlyData []byte // optional VLESS header for 0-RTT early data
 	FP        string // uTLS identity (used only in the axr_utls build)
@@ -560,7 +573,11 @@ func Dial(ctx context.Context, opts DialOptions) (*Client, error) {
 		if opts.Host == "" {
 			return nil, errors.New("vlessws: Host is required")
 		}
-		addr = opts.Host + ":443"
+		port := opts.Port
+		if port <= 0 || port > 65535 {
+			port = 443
+		}
+		addr = net.JoinHostPort(opts.Host, strconv.Itoa(port))
 	}
 	timeout := 8 * time.Second
 	if dl, ok := ctx.Deadline(); ok {
@@ -621,6 +638,9 @@ func DialConn(ctx context.Context, conn net.Conn, opts DialOptions) (*Client, er
 		}
 		ed = v
 	}
+	// The accept value is derived from the exact key text the request
+	// carries, so the two can never drift apart again.
+	keyText := base64.StdEncoding.EncodeToString(key)
 	req := buildUpgradeRequest(opts.Host, opts.Path, key, ed, opts.Upgrade)
 	if _, err := tconn.Write([]byte(req)); err != nil {
 		tconn.Close()
@@ -636,7 +656,7 @@ func DialConn(ctx context.Context, conn net.Conn, opts DialOptions) (*Client, er
 		tconn.Close()
 		return nil, fmt.Errorf("vlessws: websocket upgrade rejected (HTTP %d)", code)
 	}
-	accept := expectedAccept(key)
+	accept := expectedAcceptKeyText(keyText)
 	if got, err := readUpgradeHeader(br, "Sec-WebSocket-Accept"); err != nil {
 		// Absence of the accept header is tolerated for compatibility;
 		// presence with a wrong value is not.
@@ -696,7 +716,11 @@ func (c *Client) RecvBinary() ([]byte, error) {
 			_ = c.SendControl(opClose, payload)
 			return nil, io.EOF
 		case opContinuation:
-			return payload, nil
+			// readFrame reassembles a fragmented message and reports the
+			// opcode of its FIRST frame, so a continuation here can only be
+			// an orphan (RFC 6455 §5.4). Returning it as a complete message
+			// would hand the caller half a VLESS payload.
+			return nil, errOrphanContinuation
 		default:
 			return nil, fmt.Errorf("vlessws: unexpected frame opcode %d", opcode)
 		}
@@ -704,6 +728,23 @@ func (c *Client) RecvBinary() ([]byte, error) {
 }
 
 // WaitVLESSOK reads the 2-byte VLESS response and verifies success.
+// WaitVLESSOKUntil is WaitVLESSOK bounded by a deadline.
+//
+// DialConn sets a handshake deadline and then CLEARS it
+// (SetDeadline(time.Time{})), so after a successful upgrade the socket has no
+// deadline at all. An edge that accepts the upgrade and then goes silent — a
+// wedged worker, a blackholed (rather than reset) path, a middlebox that
+// swallows the stream — would leave WaitVLESSOK blocked on a read until the
+// process dies, and with it the client's SOCKS5 CONNECT: the application
+// hangs with no error instead of failing over. This bounds that wait and
+// restores the connection to its previous (no-deadline) state afterwards,
+// because the tunnel pump owns the deadline from here on.
+func (c *Client) WaitVLESSOKUntil(deadline time.Time) error {
+	_ = c.conn.SetReadDeadline(deadline)
+	defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
+	return c.WaitVLESSOK()
+}
+
 func (c *Client) WaitVLESSOK() error {
 	frame, err := c.RecvBinary()
 	if err != nil {
@@ -751,7 +792,7 @@ func (c *Client) readFrame() (byte, []byte, error) {
 				return 0, nil, err
 			}
 			if l2 > maxFrame {
-				return 0, nil, errors.New("ws: fragment too large")
+				return 0, nil, errFrameTooLarge
 			}
 			chunk := make([]byte, l2)
 			if _, err := io.ReadFull(c.r, chunk); err != nil {
@@ -793,7 +834,16 @@ func extLen(r io.ByteReader, b byte) (int, error) {
 		if err := readBytes(r, e[:]); err != nil {
 			return 0, err
 		}
-		return int(binary.BigEndian.Uint64(e[:])), nil
+		v := binary.BigEndian.Uint64(e[:])
+		// Bound BEFORE the int conversion: on 32-bit targets the matrix
+		// builds (android/arm64 is 64-bit, but the same code compiles for
+		// 386/arm) a 64-bit length can wrap into a small or negative int —
+		// and make([]byte, negative) panics. A remote peer must never be
+		// able to turn a length field into an allocation or a panic.
+		if v > maxFrame {
+			return 0, errFrameTooLarge
+		}
+		return int(v), nil
 	default:
 		return int(b), nil
 	}
@@ -833,9 +883,29 @@ func readUpgradeHeader(r *bufio.Reader, name string) (string, error) {
 	}
 }
 
+// wsAcceptGUID is the RFC 6455 §4.2.2 handshake constant.
+const wsAcceptGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// expectedAccept computes the Sec-WebSocket-Accept value for a client key:
+//
+//	base64( SHA1( base64(key) + GUID ) )
+//
+// The key is hashed as the BASE64 TEXT that was written to the wire, never
+// as its raw 16 bytes. Hashing the raw bytes yields a value that no
+// conforming server ever returns, which is exactly what happened before
+// 2.21: the client sent base64(key) but demanded SHA1(raw key) back, so
+// every genuine 101 from the Cloudflare edge — workerd always emits the
+// header — was rejected as "Sec-WebSocket-Accept mismatch" and no tunnel
+// could ever come up. DialConn now derives both the request line and this
+// expected value from the same base64 text.
 func expectedAccept(key []byte) string {
+	return expectedAcceptKeyText(base64.StdEncoding.EncodeToString(key))
+}
+
+// expectedAcceptKeyText is expectedAccept for an already-encoded key text.
+func expectedAcceptKeyText(keyB64 string) string {
 	h := sha1.New()
-	h.Write(key)
-	h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	h.Write([]byte(keyB64))
+	h.Write([]byte(wsAcceptGUID))
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }

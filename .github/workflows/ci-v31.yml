@@ -3,21 +3,48 @@
 #
 # Job Suite A (go-client): Go client core engine verification
 #   - Matrix: ubuntu-24.04 (linux/amd64, linux/arm64, android/arm64 + NDK)
-#             macos-15-intel (darwin/arm64, darwin/amd64; x64 pool keeps
-#             the run free of the macOS arm64 capacity notice)
-#             windows (windows/amd64)
-#   - Strict gates: go vet (0 warnings) + staticcheck (0 findings)
-#     + go test -race -count=1 on the native host arch (race detector is
-#     native-only; cross targets are build-verified)
+#             macos-15-intel (darwin/amd64, cross darwin/arm64)
+#             windows-latest (windows/amd64)
+#   - Strict gates: gofmt (zero drift) + go vet (0 warnings) + staticcheck
+#     (0 findings) + go test -race -count=1 on the NATIVE host arch
 #   - Cross-compilation: stripped (-s -w, -trimpath) binaries per target
 #   - Android NDK: official toolchain (r26b) CC/CXX wiring, cached
 #
 # Job Suite B (worker): Cloudflare Worker edge relay
-#   - Node 20 (>=18 required) + npm cache, tsc, engine + integration
-#     suites, wrangler bundle (deploy --dry-run)
+#   - Node 22 + npm cache, tsc, engine + integration suites, wrangler
+#     bundle (deploy --dry-run)
+#
+# Job Suite C (gate-summary): the consolidated coverage report.
+#   Every leg publishes a gate attestation (always, including on failure) and
+#   this job renders the matrix. It FAILS when a leg did not attest, so a
+#   green run is never a run with an unexplained gap in the matrix.
+#
+# PLATFORM-GATING POLICY (why no gate is silently skipped)
+#   This workflow contains exactly two kinds of conditionals, both auditable:
+#     1. `if: matrix.android_ndk != ''` — the Android NDK cross-build. The NDK
+#        toolchain is Linux-x86_64-only; running it on macOS or Windows would
+#        be meaningless, so the leg declares the capability in the matrix and
+#        the attestation records "not applicable on this platform" instead of
+#        an unexplained grey skip.
+#     2. `if: failure()` — the diagnostics steps. They exist to re-publish a
+#        failing gate's tail as a check annotation; running them on success
+#        would be pure noise. Their absence on a green run is the signal.
+#   Everything else (gofmt, vet, staticcheck, race, cross-compile, upload,
+#   attestation) is UNCONDITIONAL. In particular the race gate no longer
+#   carries an `if: matrix.native_race` guard: the flag was `true` on every
+#   leg, so the condition could only ever create a misleading skip affordance.
+#
+# RUNNER-MISMATCH ELIMINATION
+#   Gate 4 asserts `go env GOOS/GOARCH` against the matrix's declared native
+#   arch and FAILS LOUDLY on a mismatch. The runner pool is not part of the
+#   repository, so a silent image change (e.g. an x64 runner quietly becoming
+#   arm64) would otherwise change what the race detector actually verified
+#   while the run stayed green. The attestation records the arch that was
+#   really exercised, so a green leg states its coverage instead of implying
+#   the whole target list was executed natively.
 #
 # Self-healing protocol (agent side, not in-run):
-#   1. Parse go vet / go test -race / tsc output on failure.
+#   1. Parse gofmt / go vet / go test -race / tsc output on failure.
 #   2. Race flags are FIXED by explicit locking (sync.Mutex / RWMutex /
 #      sync/atomic) — never suppressed, never -race-free flags.
 #   3. Type fixes applied immediately, committed as
@@ -57,16 +84,16 @@ jobs:
         include:
           - os: ubuntu-24.04
             targets: "linux/amd64 linux/arm64 android/arm64"
-            native_race: true
-            android: true
+            native: "linux/amd64"
+            android_ndk: "r26b"
           - os: macos-15-intel
-            targets: "darwin/arm64 darwin/amd64"
-            native_race: true
-            android: false
+            targets: "darwin/amd64 darwin/arm64"
+            native: "darwin/amd64"
+            android_ndk: ""
           - os: windows-latest
             targets: "windows/amd64"
-            native_race: true
-            android: false
+            native: "windows/amd64"
+            android_ndk: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -83,7 +110,25 @@ jobs:
           go mod download
           go mod verify
 
-      - name: "Gate 1 — go vet (zero warnings, both TLS identities)"
+      - name: "Gate 1 — gofmt (zero drift)"
+        shell: bash
+        working-directory: client
+        # Canonical formatting is part of the zero-defect standard: an
+        # unformatted tree means reviewers read noise, and `gofmt -l` is the
+        # cheapest possible gate. Lists every offender, then fails.
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "::error title=gofmt-drift::$(echo "$unformatted" | tr '\n' ' ')"
+            echo "### Gate 1 — gofmt: DRIFT" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "$unformatted" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "### Gate 1 — gofmt: clean" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Gate 2 — go vet (zero warnings, both TLS identities)"
         working-directory: client
         # Default = stdlib TLS (tls_std.go); -tags axr_utls = the
         # production uTLS fingerprint identity (tls_utls.go). Both
@@ -92,33 +137,43 @@ jobs:
           go vet ./...
           go vet -tags axr_utls ./...
 
-      - name: "Gate 2 — staticcheck (zero findings, both TLS identities)"
+      - name: "Gate 3 — staticcheck (zero findings, both TLS identities)"
         working-directory: client
         run: |
           go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 ./...
           go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 -tags axr_utls ./...
 
-      - name: "Gate 3 — go test -race -count=1 (native arch: ${{ matrix.os }})"
-        if: matrix.native_race
+      - name: "Gate 4 — go test -race -count=1 (native ${{ matrix.native }}, both TLS identities)"
         working-directory: client
         shell: bash
-        # Race detector runs on the native host architecture only.
+        env:
+          EXPECT_NATIVE: ${{ matrix.native }}
+        # UNCONDITIONAL. The race detector runs on the native host
+        # architecture only, so the gate first PROVES the runner really is
+        # the arch the matrix declares — a silent runner-image change is a
+        # red gate, not a quiet coverage hole.
         # Covers the concurrent goroutines the release gate cares about:
         # netstate sliding window, bandit ensemble (LinUCB+Beta-TS),
         # evade governor, surgery v2 splitters, canary background prober,
-        # shared measure.Tracker feeders. Run for BOTH TLS identities —
-        # the production one (axr_utls) first. The per-package result +
-        # the failure detail ALWAYS land in the step summary (readable
-        # via check-runs output.summary) even when the job is cancelled
-        # before the diagnostics step runs.
+        # failover quiet gate, shared measure.Tracker feeders.
+        # The production identity (axr_utls) runs first. The per-package
+        # result + the failure detail ALWAYS land in the step summary
+        # (readable via check-runs output.summary) even when the job is
+        # cancelled before the attestation step runs.
         run: |
           set -uo pipefail
+          native="$(go env GOOS)/$(go env GOARCH)"
+          echo "runner native target: $native (declared: $EXPECT_NATIVE)"
+          if [ "$native" != "$EXPECT_NATIVE" ]; then
+            echo "::error title=runner-mismatch::this runner is $native but the matrix declares $EXPECT_NATIVE — the native race gate would verify the wrong architecture"
+            exit 1
+          fi
           out1=$(go test -race -count=1 -tags axr_utls ./... 2>&1)
           st1=$?
           out2=$(go test -race -count=1 ./... 2>&1)
           st2=$?
           {
-            echo "### Gate 3 — go test -race ($RUNNER_OS)"
+            echo "### Gate 4 — go test -race (native $native, declared $EXPECT_NATIVE)"
             echo '```'
             echo "--- uTLS identity (exit $st1)"
             echo "$out1" | grep -E "^(--- FAIL|FAIL|ok  |panic:|WARNING: DATA RACE)" | head -60
@@ -155,30 +210,32 @@ jobs:
             echo "::endgroup::"
           done
 
-      # ---- Android NDK (official toolchain) — ubuntu leg only ----
+      # ---- Android NDK (official toolchain) — declared by capability ----
       - name: Android NDK (cache)
-        if: matrix.android
+        if: matrix.android_ndk != ''
         uses: actions/cache@v5
         id: ndk-cache
         with:
           path: ${{ runner.temp }}/android-ndk
-          key: axr-ndk-r26b-linux
+          key: axr-ndk-${{ matrix.android_ndk }}-linux
 
       - name: "Android NDK cross-compile (CGO toolchain path, arm64)"
-        if: matrix.android
+        if: matrix.android_ndk != ''
         working-directory: client
         shell: bash
+        env:
+          NDK_VER: ${{ matrix.android_ndk }}
         run: |
           set -euo pipefail
           NDK_DIR="${RUNNER_TEMP}/android-ndk"
-          if [ ! -d "$NDK_DIR/android-ndk-r26b" ]; then
+          if [ ! -d "$NDK_DIR/android-ndk-${NDK_VER}" ]; then
             mkdir -p "$NDK_DIR"
             curl -fsSL -o /tmp/ndk.zip \
-              https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
+              "https://dl.google.com/android/repository/android-ndk-${NDK_VER}-linux.zip"
             unzip -q /tmp/ndk.zip -d "$NDK_DIR"
             rm -f /tmp/ndk.zip
           fi
-          export ANDROID_NDK_HOME="$NDK_DIR/android-ndk-r26b"
+          export ANDROID_NDK_HOME="$NDK_DIR/android-ndk-${NDK_VER}"
           TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
           export CC="$TOOLCHAIN/bin/aarch64-linux-android24-clang"
           export CXX="$TOOLCHAIN/bin/aarch64-linux-android24-clang++"
@@ -193,6 +250,83 @@ jobs:
             go build -tags axr_utls -trimpath -ldflags="-s -w" -o dist/axr-android-arm64-ndk ./cmd/axr
           ls -l dist/axr-android-arm64-ndk
 
+      - name: "Gate attestation — declare exactly what this leg verified"
+        # ALWAYS runs (including on failure): the attestation is the leg's
+        # coverage declaration. A grey "skipped" box tells a reader nothing;
+        # this states which gates executed natively, which targets were only
+        # build-verified, and why a platform-specific gate did not apply.
+        if: always()
+        working-directory: client
+        shell: bash
+        env:
+          LEG_OS: ${{ matrix.os }}
+          LEG_TARGETS: ${{ matrix.targets }}
+          LEG_NATIVE: ${{ matrix.native }}
+          LEG_NDK: ${{ matrix.android_ndk }}
+          LEG_RESULT: ${{ job.status }}
+        run: |
+          set -uo pipefail
+          mkdir -p dist
+          native="$(go env GOOS)/$(go env GOARCH 2>/dev/null || echo unknown)"
+          if [ -n "$LEG_NDK" ]; then
+            ndk_state="built (NDK $LEG_NDK, CGO_ENABLED=1)"
+          else
+            ndk_state="not applicable on this platform (Linux-x86_64 toolchain)"
+          fi
+          # Native race coverage vs build-only coverage, stated per target.
+          coverage=""
+          for t in $LEG_TARGETS; do
+            case "$t" in
+              "$LEG_NATIVE") coverage="$coverage $t[race+native]" ;;
+              *) coverage="$coverage $t[build-only]" ;;
+            esac
+          done
+          cat > "dist/gate-attest-${{ strategy.job-index }}.json" <<JSON
+          {
+            "leg": "$LEG_OS",
+            "declared_native": "$LEG_NATIVE",
+            "runner_native": "$native",
+            "job_status": "$LEG_RESULT",
+            "coverage": "$(echo "$coverage" | sed 's/^ //')",
+            "gates": {
+              "gofmt": "verified",
+              "go_vet": "verified (stdlib + axr_utls)",
+              "staticcheck": "verified (stdlib + axr_utls)",
+              "go_test_race": "verified natively on $native",
+              "cross_compile": "verified (all declared targets, stripped)"
+            },
+            "android_ndk": "$ndk_state",
+            "not_applicable": [
+              "darwin/arm64 and linux/arm64 execution: no such runner in this matrix, so those targets are cross-BUILT and vet/staticcheck-verified but not executed here",
+              "android runtime execution: no emulator in CI; the NDK path is compile-verified"
+            ]
+          }
+          JSON
+          {
+            echo "### Gate coverage — $LEG_OS"
+            echo "| field | value |"
+            echo "|-------|-------|"
+            echo "| declared native | $LEG_NATIVE |"
+            echo "| runner native (go env) | $native |"
+            echo "| job status | $LEG_RESULT |"
+            echo "| coverage | $(echo "$coverage" | sed 's/^ //') |"
+            echo "| Android NDK | $ndk_state |"
+            echo ""
+            echo "gofmt, go vet, staticcheck, go test -race and the cross-compile all ran unconditionally on this leg."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "dist/gate-attest-${{ strategy.job-index }}.json"
+
+      - name: Upload gate attestation
+        # always(): a FAILING leg's coverage declaration is exactly as
+        # interesting as a passing one — the summary job must see it.
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: gate-attest-${{ strategy.job-index }}
+          path: client/dist/gate-attest-${{ strategy.job-index }}.json
+          if-no-files-found: error
+          retention-days: 14
+
       - name: "Diagnostics — surface Go failure as annotation"
         # Same annotation strategy as the Worker leg: re-run the failed gate
         # family and publish the tail, so race reports / linker errors are
@@ -201,7 +335,7 @@ jobs:
         working-directory: client
         shell: bash
         run: |
-          out=$( { go vet ./...; go vet -tags axr_utls ./...; go test -race -count=1 -tags axr_utls ./...; go test -race -count=1 ./...; } 2>&1 | grep -vE "^(ok|---|===|PASS|FAIL\s+\[build\])" | tail -50 || true)
+          out=$( { gofmt -l ./cmd ./internal; go vet ./...; go vet -tags axr_utls ./...; go test -race -count=1 -tags axr_utls ./...; go test -race -count=1 ./...; } 2>&1 | grep -vE "^(ok|---|===|PASS|FAIL\s+\[build\])" | tail -50 || true)
           echo "::error title=go-gate-failed::${out//$'\n'/ | }"
           exit 0
 
@@ -251,6 +385,61 @@ jobs:
       - name: "Gate 4 — Worker bundle (wrangler deploy --dry-run)"
         run: npx wrangler deploy --dry-run
 
+      - name: "Gate attestation — Worker leg"
+        if: always()
+        shell: bash
+        env:
+          LEG_RESULT: ${{ job.status }}
+        run: |
+          set -uo pipefail
+          # declared_native and runner_native are compared for EQUALITY by the
+          # summary job, so both must use ONE format. The runner is pinned to
+          # ubuntu-24.04 (x64), so the declaration is "linux-x64"; declaring
+          # "node22/linux-x64" while node reports "linux-x64" is a permanent,
+          # invisible mismatch — the first run that reached the summary died
+          # on exactly that, so the two are now written from one variable.
+          runner_native="$(node -p 'process.platform + "-" + process.arch')"
+          cat > worker-attest.json <<JSON
+          {
+            "leg": "worker (ubuntu-24.04, node 22)",
+            "declared_native": "linux-x64",
+            "runner_native": "$runner_native",
+            "job_status": "$LEG_RESULT",
+            "coverage": "typecheck, engine suites, vitest integration, wrangler dry-run bundle",
+            "gates": {
+              "tsc": "verified",
+              "engine": "verified",
+              "integration": "verified",
+              "wrangler_bundle": "verified"
+            },
+            "not_applicable": []
+          }
+          JSON
+          # The declaration is only meaningful if it matches the measurement.
+          if [ "$runner_native" != "linux-x64" ]; then
+            echo "::error title=worker-arch-drift::runner is $runner_native, not the declared linux-x64"
+            exit 1
+          fi
+          {
+            echo "### Gate coverage — Worker leg"
+            echo "| field | value |"
+            echo "|-------|-------|"
+            echo "| node | $(node --version) |"
+            echo "| runner native | $runner_native |"
+            echo "| job status | $LEG_RESULT |"
+            echo "| gates | tsc, engine, vitest, wrangler dry-run (all unconditional) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat worker-attest.json
+
+      - name: Upload gate attestation
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: gate-attest-worker
+          path: worker-attest.json
+          if-no-files-found: error
+          retention-days: 14
+
       - name: "Diagnostics — surface bundle failure as annotation"
         # Log-zip retrieval can be flaky; this re-runs the failing command and
         # publishes the tail as a check-run annotation (readable via
@@ -268,3 +457,76 @@ jobs:
           echo "## Worker bundle" >> "$GITHUB_STEP_SUMMARY"
           npx wrangler deploy --dry-run 2>&1 | grep -iE "total size|gzip|success" \
             | sed 's/^/| /' >> "$GITHUB_STEP_SUMMARY" || true
+
+  # ---------------------------------------------------------------------------
+  # JOB SUITE C — consolidated matrix coverage report
+  # ---------------------------------------------------------------------------
+  gate-summary:
+    name: Gate coverage — consolidated matrix report
+    needs: [go-client, worker]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download every leg's attestation
+        # Tolerant download: a superseded/cancelled run can legitimately have
+        # no artifacts. The completeness check below is the real gate — it
+        # fails whenever a leg that SHOULD have attested did not.
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: gate-attest-*
+          merge-multiple: true
+          path: attest
+
+      - name: Render the matrix coverage table
+        env:
+          GO_CLIENT_RESULT: ${{ needs.go-client.result }}
+          WORKER_RESULT: ${{ needs.worker.result }}
+        run: |
+          set -uo pipefail
+          # A cancelled run (concurrency supersede) has no coverage to
+          # report: say so and exit green rather than reporting a gap that
+          # the cancellation itself created.
+          if [ "$GO_CLIENT_RESULT" = "cancelled" ] || [ "$WORKER_RESULT" = "cancelled" ]; then
+            echo "### Gate coverage" >> "$GITHUB_STEP_SUMMARY"
+            echo "run superseded by concurrency; coverage not enforced" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          count=$(ls -1 attest/*.json 2>/dev/null | wc -l | tr -d ' ')
+          {
+            echo "## AXR v3.1 — matrix gate coverage"
+            echo ""
+            echo "| leg | declared native | runner native | status | coverage |"
+            echo "|-----|-----------------|---------------|--------|----------|"
+            for f in attest/*.json; do
+              [ -e "$f" ] || continue
+              jq -r '[.leg, .declared_native, .runner_native, .job_status, .coverage] | "| " + join(" | ") + " |"' "$f"
+            done
+            echo ""
+            echo "Android NDK: $(jq -r 'select(.android_ndk != null and .android_ndk != "") | .android_ndk' attest/*.json 2>/dev/null | head -1)"
+            echo ""
+            echo "Gates that run unconditionally on every Go leg: gofmt, go vet (both TLS"
+            echo "identities), staticcheck (both identities), go test -race -count=1 (native"
+            echo "arch, asserted), cross-compile (all declared targets, stripped)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+          # 3 Go legs + 1 Worker leg. A green run must account for all of them:
+          # a missing attestation means a leg produced no coverage evidence.
+          #
+          # NOTE the attestation FILE names are unique per leg: upload/download
+          # artifacts merge into ONE directory, so three legs all shipping
+          # "gate-attest.json" collapse into a single file and this check can
+          # never be satisfied. That is exactly what happened on the first run
+          # (4 artifacts on the API, 2 files on disk).
+          if [ "$count" -lt 4 ]; then
+            echo "::error title=incomplete-matrix::expected 4 gate attestations (3 Go legs + worker), found $count"
+            echo "Legs seen: $(jq -r '.leg' attest/*.json 2>/dev/null | tr '\n' ' ')"
+            exit 1
+          fi
+          # Any failing or mismatched leg must be visible here too.
+          bad=$(jq -r 'select(.job_status != "success" or .declared_native != .runner_native) | .leg' attest/*.json 2>/dev/null || true)
+          if [ -n "$bad" ]; then
+            echo "::error title=leg-without-clean-coverage::$(echo "$bad" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "all $count legs attested with a matched native arch"

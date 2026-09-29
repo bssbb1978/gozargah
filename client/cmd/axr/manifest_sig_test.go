@@ -8,9 +8,9 @@ import (
 // Shared test vector — MUST stay byte-identical to the Worker's
 // src/test/manifest-integrity.ts and docs/AXR-V3-HYPER-RESILIENCE.md.
 const (
-	vectorToken      = "0123456789abcdef0123"
-	vectorCanonical  = "gozargah-axr-manifest/v3|2.16.0|example.com|/abc123|360|ws,ws-alt|backup.example.com:backup,example.com:primary|104.16.13.37,172.67.0.1||web|90000"
-	vectorSig        = "996daa7821aa8eae4b89608bff2b61a37cbf590f29826467006d80fbb7e952ac"
+	vectorToken     = "0123456789abcdef0123"
+	vectorCanonical = "gozargah-axr-manifest/v3|2.16.0|example.com|/abc123|360|ws,ws-alt|backup.example.com:backup,example.com:primary|104.16.13.37,172.67.0.1||web|90000"
+	vectorSig       = "996daa7821aa8eae4b89608bff2b61a37cbf590f29826467006d80fbb7e952ac"
 )
 
 func TestManifestHMACSharedVector(t *testing.T) {
@@ -35,8 +35,10 @@ func TestCanonicalFromManifestMatchesVector(t *testing.T) {
 			{Host: "backup.example.com", Role: "backup"}, // reverse order: must sort
 		},
 		CleanIPHints: []string{"104.16.13.37", "172.67.0.1"},
-		FlowProfile:  struct{ Mode string `json:"mode"` }{Mode: "web"},
-		Reconnect:    struct {
+		FlowProfile: struct {
+			Mode string `json:"mode"`
+		}{Mode: "web"},
+		Reconnect: struct {
 			ProbeIntervalMS float64 `json:"probe_interval_ms"`
 			ProbeJitterMS   float64 `json:"probe_jitter_ms"`
 		}{ProbeIntervalMS: 90000},
@@ -61,13 +63,15 @@ func TestVerifyManifestSig(t *testing.T) {
 			{Host: "example.com", Role: "primary"},
 			{Host: "backup.example.com", Role: "backup"},
 		},
-		CleanIPHints:    []string{"104.16.13.37", "172.67.0.1"},
-		FlowProfile:     struct{ Mode string `json:"mode"` }{Mode: "web"},
+		CleanIPHints: []string{"104.16.13.37", "172.67.0.1"},
+		FlowProfile: struct {
+			Mode string `json:"mode"`
+		}{Mode: "web"},
 		Reconnect: struct {
 			ProbeIntervalMS float64 `json:"probe_interval_ms"`
 			ProbeJitterMS   float64 `json:"probe_jitter_ms"`
 		}{ProbeIntervalMS: 90000},
-		ManifestSig:     vectorSig,
+		ManifestSig: vectorSig,
 	}
 	if valid, present := verifyManifestSig(m, vectorToken); !valid || !present {
 		t.Fatalf("valid manifest must verify: valid=%v present=%v", valid, present)
@@ -104,8 +108,8 @@ func TestSubTokenFromURL(t *testing.T) {
 		{"https://h.com/sub/0123456789abcdef0123/axr-manifest", "0123456789abcdef0123"},
 		{"https://h.com/gozargah-sub/abc123/axr-manifest", "abc123"},
 		{"https://h.com/sub/abc123/axr-manifest?x=1", "abc123"},
-		{"https://h.com/sub/axr-manifest", ""},           // no token segment
-		{"https://h.com/other/abc123/feed", ""},          // not a manifest URL
+		{"https://h.com/sub/axr-manifest", ""},  // no token segment
+		{"https://h.com/other/abc123/feed", ""}, // not a manifest URL
 		{"not a url", ""},
 	}
 	for i, c := range cases {

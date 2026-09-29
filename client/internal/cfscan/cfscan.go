@@ -46,8 +46,8 @@ type Rng func() float64
 
 // Options is the full scan configuration (every knob the Rust scanner had).
 type Options struct {
-	RelayHost   string // SNI anchor: the relay's public hostname
-	Cidrs       []string
+	RelayHost string // SNI anchor: the relay's public hostname
+	Cidrs     []string
 	// CFAPIDisabled skips the live API entirely (explicit Cidrs or snapshot).
 	CFAPIDisabled bool
 	// APIURL defaults to the official Cloudflare list endpoint.

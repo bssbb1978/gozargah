@@ -175,7 +175,7 @@ func TestQuarantineAfterFailures(t *testing.T) {
 		t.Fatal("expected quarantine after 5 consecutive failures")
 	}
 	// Backoff grows with the failure run: 5th failure -> step 2 -> 4 min.
-	want := int64(60 * 1000) << 2
+	want := int64(60*1000) << 2
 	if st.QuarantinedUntilMS != now+want {
 		t.Fatalf("backoff = %d, want %d", st.QuarantinedUntilMS, now+want)
 	}
@@ -538,8 +538,8 @@ func TestEnsembleConvergesToGoodArm(t *testing.T) {
 // tops B's converged confidence-bound score, so the members DISAGREE.
 func TestEnsembleArbitration(t *testing.T) {
 	arms := []Arm{
-		{Host: "h.example", Transport: "ws", FP: "chrome"},   // A: untried
-		{Host: "h.example", Transport: "ws", FP: "firefox"},  // B: proven
+		{Host: "h.example", Transport: "ws", FP: "chrome"},  // A: untried
+		{Host: "h.example", Transport: "ws", FP: "firefox"}, // B: proven
 	}
 	b := New(1.0, 42, arms)
 	A, B := arms[0], arms[1]

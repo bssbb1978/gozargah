@@ -30,13 +30,13 @@ const (
 	cusumAlarm = 2.5
 
 	// Regime thresholds.
-	baselineHealthy   = 0.55
-	recentBad         = 0.20
-	recentGood        = 0.75
-	watchDropRate     = 0.25
-	hardDropRate      = 0.50
-	rstAlarmRate      = 0.25
-	timeoutAlarmRate  = 0.30
+	baselineHealthy  = 0.55
+	recentBad        = 0.20
+	recentGood       = 0.75
+	watchDropRate    = 0.25
+	hardDropRate     = 0.50
+	rstAlarmRate     = 0.25
+	timeoutAlarmRate = 0.30
 )
 
 // Error classes for non-OK samples. Keep the set small and stable; the
@@ -51,30 +51,30 @@ const (
 
 // Sample is one observation.
 type Sample struct {
-	OK        bool
-	RTTMS     float64 // handshake+first-bytes latency, 0 if unknown
+	OK    bool
+	RTTMS float64 // handshake+first-bytes latency, 0 if unknown
 	// Throughput is the measured tunnel throughput in bytes/sec (2.16),
 	// 0 when unknown (e.g. the stream ended before any traffic).
 	Throughput float64
-	ErrClass  string  // one of the Err* constants when !OK
-	Anomaly   int     // last non-2xx/3xx HTTP status or protocol code, 0 = none
-	Transport string  // "ws"|"h2"|"h3"|"grpc" (for per-transport weakest)
-	UnixMS    int64
+	ErrClass   string // one of the Err* constants when !OK
+	Anomaly    int    // last non-2xx/3xx HTTP status or protocol code, 0 = none
+	Transport  string // "ws"|"h2"|"h3"|"grpc" (for per-transport weakest)
+	UnixMS     int64
 }
 
 // Vector is the exported state.
 type Vector struct {
-	RTTMS          float64 `json:"rtt_ms"`
-	JitterMS       float64 `json:"jitter_ms"`
-	RSTRate        float64 `json:"rst_rate"`        // fraction of window
-	TimeoutRate    float64 `json:"timeout_rate"`    // fraction of window
-	DropRate       float64 `json:"drop_rate"`       // fraction of window !OK
-	StepDelta      float64 `json:"step_delta"`      // CUSUM accumulator (0..cusumCap)
-	StepAlarm      bool    `json:"step_alarm"`
-	LastAnomaly    int     `json:"last_anomaly"`
-	WeakestTransport string `json:"weakest_transport"`
-	Regime         string  `json:"regime"`
-	Observations   int     `json:"observations"`
+	RTTMS            float64 `json:"rtt_ms"`
+	JitterMS         float64 `json:"jitter_ms"`
+	RSTRate          float64 `json:"rst_rate"`     // fraction of window
+	TimeoutRate      float64 `json:"timeout_rate"` // fraction of window
+	DropRate         float64 `json:"drop_rate"`    // fraction of window !OK
+	StepDelta        float64 `json:"step_delta"`   // CUSUM accumulator (0..cusumCap)
+	StepAlarm        bool    `json:"step_alarm"`
+	LastAnomaly      int     `json:"last_anomaly"`
+	WeakestTransport string  `json:"weakest_transport"`
+	Regime           string  `json:"regime"`
+	Observations     int     `json:"observations"`
 	// 2.16 — AXR-v3 context extensions (all derived from local outcomes):
 	ThroughputBPS float64 `json:"throughput_bps"` // EWMA of measured tunnel bytes/sec
 	RTTSlopeMS    float64 `json:"rtt_slope_ms"`   // EWMA of signed RTT change per obs
@@ -112,8 +112,8 @@ type Tracker struct {
 	cusum float64
 	// baseline success over the whole window at the moment the CUSUM last
 	// reset to 0 (or the start), used for "step change" semantics.
-	baseOK  int
-	baseN   int
+	baseOK int
+	baseN  int
 }
 
 func NewTracker() *Tracker { return &Tracker{} }
