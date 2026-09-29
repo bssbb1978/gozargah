@@ -207,11 +207,15 @@ func TestConcurrentGovernor(t *testing.T) {
 	g := NewGovernor()
 	deg := clean()
 	deg.Regime = netstate.RegimeDegraded
-	var wg sync.WaitGroup
+	// The reader is tracked with its OWN wait group: it runs until stop
+	// is closed, which happens only after the workers finish. (One shared
+	// WaitGroup would deadlock: the reader would wait on stop while
+	// wg.Wait waited on the reader.)
 	stop := make(chan struct{})
-	wg.Add(1)
+	var readerWG sync.WaitGroup
+	readerWG.Add(1)
 	go func() {
-		defer wg.Done()
+		defer readerWG.Done()
 		for {
 			select {
 			case <-stop:
@@ -221,6 +225,7 @@ func TestConcurrentGovernor(t *testing.T) {
 			}
 		}
 	}()
+	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func(i int) {
@@ -237,6 +242,7 @@ func TestConcurrentGovernor(t *testing.T) {
 	}
 	wg.Wait()
 	close(stop)
+	readerWG.Wait()
 	// Posterior invariants: counts never go negative, means in [0,1].
 	g.mu.Lock()
 	for i := 0; i < 3; i++ {
