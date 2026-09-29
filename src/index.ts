@@ -108,7 +108,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       const lang = url.searchParams.get('lang') === 'en' ? 'en' : 'fa';
       // 2.14 — AXR machine feed: bootstrap JSON for the native AXR core (no UA sniffing).
       if (segs.length === 2 && segs[1] === 'axr-manifest') {
-        const body = await buildAxrManifest(url.hostname, user, env);
+        // 2.16 — the token keys the manifest HMAC (manifest_sig).
+        const body = await buildAxrManifest(url.hostname, user, env, token);
         return new Response(body, { headers: subHeaders(eff, url.hostname, user, 'adaptive', opts, token) });
       }
       const dnsUrl = url.origin + '/' + eff.subPath + '/' + token + '/dns-query';

@@ -1,6 +1,7 @@
 package flowprofile
 
 import (
+	"math"
 	"math/rand"
 	"testing"
 	"time"
@@ -155,5 +156,88 @@ func TestSlicerNilRng(t *testing.T) {
 	size, _ := s.Next(1000)
 	if size < 1 || size > 1000 {
 		t.Fatalf("nil-rng slicer size %d out of bounds", size)
+	}
+}
+
+// ---- 2.16 — KLDiv / TargetBins self-monitoring ----
+
+func TestTargetBinsSumsToOne(t *testing.T) {
+	for _, id := range []ProfileID{ProfileWeb, ProfileVideo, ProfileChat} {
+		bins := TargetBins(Get(id))
+		if len(bins) != len(FrameBucketEdges)-1 {
+			t.Fatalf("%s: bucket count %d want %d", id, len(bins), len(FrameBucketEdges)-1)
+		}
+		sum := 0.0
+		for _, v := range bins {
+			if v < 0 || v > 1 {
+				t.Fatalf("%s: bin weight out of [0,1]: %v", id, v)
+			}
+			sum += v
+		}
+		if math.Abs(sum-1) > 1e-9 {
+			t.Fatalf("%s: TargetBins must sum to 1, got %v", id, sum)
+		}
+	}
+}
+
+func TestTargetBinsClassSeparation(t *testing.T) {
+	web := TargetBins(Get(ProfileWeb))
+	video := TargetBins(Get(ProfileVideo))
+	chat := TargetBins(Get(ProfileChat))
+	// web and chat both mass in the low buckets, but video is dominated by
+	// the 1200-1400 band -> a higher index. video's peak index must exceed
+	// chat's peak index.
+	peak := func(v []float64) int {
+		mi := 0
+		for i, x := range v {
+			if x > v[mi] {
+				mi = i
+			}
+		}
+		return mi
+	}
+	if peak(video) <= peak(chat) {
+		t.Fatalf("video peak %d must exceed chat peak %d", peak(video), peak(chat))
+	}
+	_ = web
+}
+
+func TestKLDivBasics(t *testing.T) {
+	// identical -> ~0
+	p := []float64{0.5, 0.25, 0.25}
+	if got := KLDiv(p, p); got > 1e-9 {
+		t.Fatalf("KL(p,p) must be 0, got %v", got)
+	}
+	// empty / mismatched -> 0
+	if KLDiv(nil, nil) != 0 {
+		t.Fatal("empty KL must be 0")
+	}
+	if KLDiv([]float64{1}, nil) != 0 {
+		t.Fatal("mismatched length must be 0")
+	}
+	// zero target mass never explodes (epsilon floor)
+	q := []float64{1, 0, 0}
+	if got := KLDiv([]float64{0.5, 0.25, 0.25}, q); math.IsInf(got, 0) || got > 30 {
+		t.Fatalf("KL with zero target mass must stay finite, got %v", got)
+	}
+	// KL is never negative
+	if got := KLDiv([]float64{0.1, 0.9}, []float64{0.9, 0.1}); got < 0 {
+		t.Fatalf("KL negative: %v", got)
+	}
+}
+
+func TestKLDivDriftDetection(t *testing.T) {
+	// A histogram that matches the target sits near 0; a shifted one is large.
+	target := TargetBins(Get(ProfileWeb))
+	match := make([]float64, len(target))
+	copy(match, target)
+	if got := KLDiv(match, target); got > 1e-6 {
+		t.Fatalf("matching histogram KL must be ~0, got %v", got)
+	}
+	// Shift all mass into the top bucket -> large divergence.
+	shifted := make([]float64, len(target))
+	shifted[len(shifted)-1] = 1.0
+	if got := KLDiv(shifted, target); got < 1.0 {
+		t.Fatalf("shifted histogram must yield KL >= 1, got %v", got)
 	}
 }

@@ -52,6 +52,9 @@ const (
 type Sample struct {
 	OK        bool
 	RTTMS     float64 // handshake+first-bytes latency, 0 if unknown
+	// Throughput is the measured tunnel throughput in bytes/sec (2.16),
+	// 0 when unknown (e.g. the stream ended before any traffic).
+	Throughput float64
 	ErrClass  string  // one of the Err* constants when !OK
 	Anomaly   int     // last non-2xx/3xx HTTP status or protocol code, 0 = none
 	Transport string  // "ws"|"h2"|"h3"|"grpc" (for per-transport weakest)
@@ -71,12 +74,18 @@ type Vector struct {
 	WeakestTransport string `json:"weakest_transport"`
 	Regime         string  `json:"regime"`
 	Observations   int     `json:"observations"`
+	// 2.16 — AXR-v3 context extensions (all derived from local outcomes):
+	ThroughputBPS float64 `json:"throughput_bps"` // EWMA of measured tunnel bytes/sec
+	RTTSlopeMS    float64 `json:"rtt_slope_ms"`   // EWMA of signed RTT change per obs
+	LossVel       float64 `json:"loss_vel"`       // recent drop rate - window drop rate (-1..1)
+	TLSErrRate    float64 `json:"tls_err_rate"`   // fraction of window failing at TLS
 }
 
 type obs struct {
 	ok   bool
 	rst  bool
 	tmo  bool
+	tls  bool // 2.16: failed at the TLS handshake
 	anom int
 	tr   string
 }
@@ -89,6 +98,8 @@ type Tracker struct {
 
 	rttEMA   float64
 	jitEMA   float64
+	rttSlope float64 // 2.16: EWMA of signed RTT delta (ms)
+	through  float64 // 2.16: EWMA of measured throughput (bytes/sec)
 	prevRTT  float64
 	haveRTT  bool
 
@@ -110,6 +121,16 @@ func (t *Tracker) Feed(s Sample) {
 			o.rst = true
 		case ErrTimeout:
 			o.tmo = true
+		case ErrTLS:
+			o.tls = true
+		}
+	}
+	// 2.16 — measured tunnel throughput (OK samples only).
+	if s.OK && s.Throughput > 0 {
+		if t.through == 0 {
+			t.through = s.Throughput
+		} else {
+			t.through = 0.3*s.Throughput + 0.7*t.through
 		}
 	}
 	if s.Anomaly != 0 {
@@ -125,7 +146,7 @@ func (t *Tracker) Feed(s Sample) {
 	}
 	t.head = (t.head + 1) % windowSize
 
-	// --- RTT EWMA + jitter EWMA (only over OK samples with known rtt) ---
+	// --- RTT EWMA + jitter EWMA + signed slope (OK samples with rtt) ---
 	if s.OK && s.RTTMS > 0 {
 		if !t.haveRTT {
 			t.rttEMA = s.RTTMS
@@ -138,6 +159,15 @@ func (t *Tracker) Feed(s Sample) {
 			} else {
 				t.jitEMA = alphaJit*delta + (1-alphaJit)*t.jitEMA
 			}
+			// 2.16 — signed slope: positive = RTT climbing (congesting),
+			// negative = improving. Capped so one outlier cannot dominate.
+			slope := s.RTTMS - t.prevRTT
+			if slope > 500 {
+				slope = 500
+			} else if slope < -500 {
+				slope = -500
+			}
+			t.rttSlope = 0.3*slope + 0.7*t.rttSlope
 			t.prevRTT = s.RTTMS
 			t.rttEMA = alphaRTT*s.RTTMS + (1-alphaRTT)*t.rttEMA
 		}
@@ -174,7 +204,7 @@ func (t *Tracker) Vector() Vector {
 		return v
 	}
 	ok := 0
-	rst, tmo := 0, 0
+	rst, tmo, tls := 0, 0, 0
 	trOK := map[string]int{}
 	trN := map[string]int{}
 	for i := 0; i < n; i++ {
@@ -188,6 +218,9 @@ func (t *Tracker) Vector() Vector {
 		}
 		if o.tmo {
 			tmo++
+		}
+		if o.tls {
+			tls++
 		}
 		if o.tr != "" {
 			trN[o.tr]++
@@ -206,6 +239,23 @@ func (t *Tracker) Vector() Vector {
 	v.DropRate = 1 - float64(ok)/float64(n)
 	v.StepDelta = t.cusum
 	v.StepAlarm = t.cusum >= cusumAlarm
+	// 2.16 — v3 context fields.
+	v.ThroughputBPS = t.through
+	v.RTTSlopeMS = t.rttSlope
+	v.TLSErrRate = float64(tls) / float64(n)
+	// Loss velocity: how much WORSE (positive) or better (negative) the
+	// recent short horizon is than the window baseline.
+	recentK := 8
+	if recentK > n {
+		recentK = n
+	}
+	recentOK := 0
+	for i := 0; i < recentK; i++ {
+		if t.win[(t.head-i-1+windowSize*2)%windowSize].ok {
+			recentOK++
+		}
+	}
+	v.LossVel = (1 - float64(recentOK)/float64(recentK)) - v.DropRate
 
 	// weakest transport: lowest success ratio among transports with >=3 obs.
 	for tr, cnt := range trN {
@@ -283,6 +333,7 @@ func (t *Tracker) recentN(k int) int {
 
 // String is for logs and the local decision view.
 func (v Vector) String() string {
-	return fmt.Sprintf("rtt=%.0fms jit=%.0fms drop=%.0f%% rst=%.0f%% tmo=%.0f%% cusum=%.2f anom=%d regime=%s",
-		v.RTTMS, v.JitterMS, v.DropRate*100, v.RSTRate*100, v.TimeoutRate*100, v.StepDelta, v.LastAnomaly, v.Regime)
+	return fmt.Sprintf("rtt=%.0fms jit=%.0fms drop=%.0f%% rst=%.0f%% tmo=%.0f%% tls=%.0f%% vel=%.2f thr=%.0fB/s cusum=%.2f anom=%d regime=%s",
+		v.RTTMS, v.JitterMS, v.DropRate*100, v.RSTRate*100, v.TimeoutRate*100, v.TLSErrRate*100,
+		v.LossVel, v.ThroughputBPS, v.StepDelta, v.LastAnomaly, v.Regime)
 }

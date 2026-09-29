@@ -243,26 +243,37 @@ func TestSuspectedChangeBoostsExploration(t *testing.T) {
 		now += 10
 		b.Observe(testArms()[0], Outcome{OK: true, Throughput: 3 * 1000 * 1000}, cleanCtx(now), now)
 	}
-	// Under suspected_change the exploration term is multiplied by 1.8:
-	// check via the score table (dominant arm vs an untried arm).
+	// Under suspected_change the same arm's exploration term must be
+	// materially amplified: the regime multiplier is 1.8x AND the regime
+	// ordinal feature (2.16) widens the confidence interval because the
+	// regime has never been observed for this arm. We assert amplification
+	// of the exploration part (Ucb - Mean) rather than a fixed ratio, since
+	// the width change is data-dependent by design.
 	scStable := b.Scores(Context{Regime: "stable", NowMS: now})
 	scChange := b.Scores(Context{Regime: "suspected_change", NowMS: now})
-	u := func(scores []Score, id string) float64 {
+	expl := func(scores []Score, id string) float64 {
 		for _, s := range scores {
 			if s.Arm.ID() == id {
-				return s.Ucb
+				return s.Ucb - s.Mean
 			}
 		}
 		t.Fatalf("arm %s missing from scores", id)
 		return 0
 	}
-	dStable := u(scStable, testArms()[0].ID()) - u(scStable, testArms()[1].ID())
-	dChange := u(scChange, testArms()[0].ID()) - u(scChange, testArms()[1].ID())
-	if dStable == 0 {
-		t.Fatal("degenerate gap")
+	id0 := testArms()[0].ID()
+	eStable := expl(scStable, id0)
+	eChange := expl(scChange, id0)
+	if eStable <= 0 {
+		t.Fatalf("degenerate stable exploration: %v", eStable)
 	}
-	if math.Abs((dChange/dStable-1.8)/1.8) > 0.05 {
-		t.Fatalf("expected ~1.8x exploration scaling, got %.3f vs %.3f", dChange, dStable)
+	if eChange < 1.3*eStable {
+		t.Fatalf("suspected_change must amplify exploration: stable=%.3f change=%.3f", eStable, eChange)
+	}
+	// And the regime ordinal feature must actually move the vector.
+	xStable := features(Context{Regime: "stable", NowMS: now})
+	xChange := features(Context{Regime: "suspected_change", NowMS: now})
+	if xStable[dim-1] == xChange[dim-1] {
+		t.Fatal("regime ordinal feature must differ between regimes")
 	}
 }
 
@@ -337,6 +348,57 @@ func TestRestoreLegacySnapshot(t *testing.T) {
 	}
 	if l := b2.Snapshot().Lin[testArms()[0].ID()]; l == nil || l.A[0][0] != ridge {
 		t.Fatalf("legacy restore must rebuild ridge prior, got %+v", l)
+	}
+}
+
+func TestRestoreDimMigration(t *testing.T) {
+	// A 2.15 snapshot carried 7×7 Lin state. After the 2.16 upgrade to
+	// 16 dims, restore must KEEP the learned stats but rebuild the ridge
+	// prior (the old matrices are the wrong shape, not garbage to reuse).
+	b := New(1.0, 1, testArms())
+	now := int64(0)
+	for i := 0; i < 8; i++ {
+		now += 10
+		b.Observe(testArms()[0], Outcome{OK: true, Throughput: 2 * 1000 * 1000, RTTMS: 90}, cleanCtx(now), now)
+	}
+	snap := b.Snapshot()
+	// Forge the snapshot into the old 7-dim shape.
+	seven := 7
+	for k := range snap.Lin {
+		ls := snap.Lin[k]
+		na := make([][]float64, seven)
+		for i := 0; i < seven; i++ {
+			na[i] = append([]float64{}, ls.A[i][:seven]...)
+		}
+		ls.A = na
+		ls.B = append([]float64{}, ls.B[:seven]...)
+	}
+	snap.Dim = seven
+	b2 := New(1.0, 0, testArms())
+	if err := b2.Restore(snap); err != nil {
+		t.Fatal(err)
+	}
+	s1 := b.Snapshot().Stats[testArms()[0].ID()]
+	s2 := b2.Snapshot().Stats[testArms()[0].ID()]
+	if s1.Pulls != s2.Pulls || math.Abs(s1.TotalReward-s2.TotalReward) > 1e-9 {
+		t.Fatalf("dim migration must keep stats: %+v vs %+v", s1, s2)
+	}
+	l2 := b2.Snapshot().Lin[testArms()[0].ID()]
+	if l2 == nil || len(l2.A) != dim || l2.A[0][0] != ridge || l2.A[5][5] != ridge {
+		t.Fatalf("dim migration must rebuild the 16x16 ridge prior, got %+v", l2)
+	}
+	// A current-dim snapshot must still restore Lin exactly.
+	snapOK := b.Snapshot()
+	b3 := New(1.0, 0, testArms())
+	if err := b3.Restore(snapOK); err != nil {
+		t.Fatal(err)
+	}
+	l1 := b.Snapshot().Lin[testArms()[0].ID()]
+	l3 := b3.Snapshot().Lin[testArms()[0].ID()]
+	for i := 0; i < dim; i++ {
+		if l1.A[i][0] != l3.A[i][0] || l1.B[i] != l3.B[i] {
+			t.Fatalf("same-dim restore lost Lin state at row %d", i)
+		}
 	}
 }
 

@@ -38,6 +38,7 @@ beforeAll(async () => {
           DNS_UPSTREAMS: 'https://doh.test/dns-query',
           DNS64_ENABLED: 'true',
           CLEAN_EDGE_IPS: '203.0.113.10, 203.0.113.11, 999.1.1.1',
+          FRONTING_RELAY_HOST: 'relay.example-iran.net',
         },
         serviceBindings: { TELEGRAM_API: 'telegram-mock', DNS_UPSTREAM: 'dns-mock' },
       },
@@ -290,7 +291,7 @@ describe('Cloudflare Worker + D1 integration', () => {
       entries: Array<Record<string, unknown>>;
       reconnect: { probe_interval_ms: number };
     };
-    expect(manifest.schema).toBe('gozargah-axr-manifest/v1');
+    expect(manifest.schema).toBe('gozargah-axr-manifest/v3');
     expect(manifest.host).toBe('gozargah.test');
     expect(typeof manifest.ws_path_base).toBe('string');
     expect(manifest.fingerprint.neutral_set).toContain('chrome');
@@ -346,5 +347,75 @@ describe('Cloudflare Worker + D1 integration', () => {
     expect(manifest.flow_profile.mode).toBe('web');
     // invalid entry (999.1.1.1) must be filtered out by cleanIpHints
     expect(manifest.clean_ip_hints).toEqual(['203.0.113.10', '203.0.113.11']);
+  });
+
+  it('signs the manifest v3 with a verifiable HMAC keyed by the sub token (2.16)', async () => {
+    const { createHmac } = await import('node:crypto');
+    const token = await subTokenFor('gozargah.test', axrV2User!.uuid);
+    const response = await mf.dispatchFetch(`https://gozargah.test/sub/${token}/axr-manifest`);
+    expect(response.status).toBe(200);
+    const m = (await response.json()) as Record<string, any>;
+    expect(m.schema).toBe('gozargah-axr-manifest/v3');
+    expect(typeof m.manifest_sig).toBe('string');
+    expect(m.manifest_sig).toMatch(/^[0-9a-f]{64}$/);
+    // Recompute the canonical string EXACTLY as the Go client does and verify.
+    const canonical = [
+      String(m.schema), String(m.version), String(m.host), String(m.ws_path_base),
+      String(m.path_rotation_minutes), (m.transports as string[]).join(','),
+      (m.entries as Array<Record<string, string>>).map((e) => e.host + ':' + e.role).sort().join(','),
+      (m.clean_ip_hints as string[]).join(','), m.fronting_hint ?? '',
+      String(m.flow_profile.mode), String(m.reconnect.probe_interval_ms),
+    ].join('|');
+    const expected = createHmac('sha256', token).update(canonical, 'utf8').digest('hex');
+    expect(m.manifest_sig).toBe(expected);
+    // A one-field tamper must break the signature (client-side rejection path).
+    const tampered = canonical.replace('gozargah.test|/primary', 'gozargah.test|/primary').replace(/web\|90000$/, 'chat|90000');
+    const tamperedSig = createHmac('sha256', token).update(tampered, 'utf8').digest('hex');
+    expect(tamperedSig).not.toBe(m.manifest_sig);
+  });
+
+  it('publishes the FRONTING_RELAY_HOST env as a validated fronting_hint (2.16)', async () => {
+    const token = await subTokenFor('gozargah.test', axrV2User!.uuid);
+    const response = await mf.dispatchFetch(`https://gozargah.test/sub/${token}/axr-manifest`);
+    const m = (await response.json()) as Record<string, any>;
+    expect(m.fronting_hint).toBe('relay.example-iran.net');
+  });
+
+  it('ingests client-scan clean IPs via the harvest endpoint and unions them into the manifest (2.16)', async () => {
+    const token = await subTokenFor('gozargah.test', axrV2User!.uuid);
+    const endpoint = 'https://gozargah.test/gozargah/api/network/harvest';
+    // Bad token is rejected with 401.
+    const bad = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'not-a-real-token', ips: ['203.0.113.99'] }),
+    });
+    expect(bad.status).toBe(401);
+    // Valid token: invalid/duplicate entries are filtered; survivors persist.
+    const ok = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        token, source: 'client-scan',
+        ips: ['203.0.113.99', '203.0.113.100', '203.0.113.99', '999.1.1.1', '203.0.113.10'],
+      }),
+    });
+    expect(ok.status).toBe(200);
+    const body = (await ok.json()) as Record<string, any>;
+    expect(body.ok).toBe(true);
+    // dedup + invalid (999.1.1.1) dropped; .99/.100/.10 are all new to the (empty) harvest set
+    expect(body.accepted).toBe(3);
+    // The manifest now serves env ∪ D1 harvest (dedup, env order first).
+    const feed = await mf.dispatchFetch(`https://gozargah.test/sub/${token}/axr-manifest`);
+    const m = (await feed.json()) as Record<string, any>;
+    expect(m.clean_ip_hints).toEqual(['203.0.113.10', '203.0.113.11', '203.0.113.99', '203.0.113.100']);
+    // The sig still verifies after the union (structural fields changed coherently).
+    const { createHmac } = await import('node:crypto');
+    const canonical = [
+      String(m.schema), String(m.version), String(m.host), String(m.ws_path_base),
+      String(m.path_rotation_minutes), (m.transports as string[]).join(','),
+      (m.entries as Array<Record<string, string>>).map((e) => e.host + ':' + e.role).sort().join(','),
+      (m.clean_ip_hints as string[]).join(','), m.fronting_hint ?? '',
+      String(m.flow_profile.mode), String(m.reconnect.probe_interval_ms),
+    ].join('|');
+    expect(m.manifest_sig).toBe(createHmac('sha256', token).update(canonical, 'utf8').digest('hex'));
   });
 });

@@ -52,6 +52,16 @@ func (r *recorder) count() int {
 	return len(r.writes)
 }
 
+func (r *recorder) sizes() []int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]int, len(r.writes))
+	for i, w := range r.writes {
+		out[i] = len(w)
+	}
+	return out
+}
+
 // waitUntil polls cond until true or timeout.
 func (r *recorder) waitUntil(t *testing.T, cond func() bool) {
 	t.Helper()
@@ -193,5 +203,100 @@ func TestDefaultGapBounds(t *testing.T) {
 		if g < 20*time.Millisecond || g > 120*time.Millisecond {
 			t.Fatalf("gap %v outside [20ms, 120ms]", g)
 		}
+	}
+}
+
+// ---- 2.16 — multi-segment ClientHello surgery ----
+
+func TestPlanCutsBounds(t *testing.T) {
+	n := 2000
+	rng := fakeRng(7)
+	pts := PlanCuts(n, 2, sniLo, sniHi, rng)
+	if pts == nil {
+		t.Fatal("2 cuts in a 2KB record must be feasible")
+	}
+	if len(pts) != 2 || pts[0] >= pts[1] {
+		t.Fatalf("cuts must be ascending: %v", pts)
+	}
+	loB, hiB := int(float64(n)*sniLo), int(float64(n)*sniHi)
+	for _, p := range pts {
+		if p < loB || p > hiB {
+			t.Fatalf("cut %d outside [%d, %d]", p, loB, hiB)
+		}
+		if p < minSegBytes || p > n-minSegBytes {
+			t.Fatalf("cut %d leaves a runt segment", p)
+		}
+	}
+	if pts[1]-pts[0] < minSegBytes {
+		t.Fatalf("cuts too close: %v", pts)
+	}
+	// Deterministic for a fixed rng seed.
+	pts2 := PlanCuts(n, 2, sniLo, sniHi, fakeRng(7))
+	if len(pts2) != len(pts) || pts2[0] != pts[0] || pts2[1] != pts[1] {
+		t.Fatalf("PlanCuts must be deterministic: %v vs %v", pts, pts2)
+	}
+	// Too-small records are infeasible.
+	if PlanCuts(20, 2, sniLo, sniHi, fakeRng(1)) != nil {
+		t.Fatal("20-byte record cannot carry 2 cuts")
+	}
+	if PlanCuts(0, 1, 0.5, 0.6, fakeRng(1)) != nil {
+		t.Fatal("empty record must be infeasible")
+	}
+	if PlanCuts(n, 1, 0.5, 0.5, fakeRng(1)) == nil {
+		// degenerate window (lo==hi) is widened by one step and feasible
+		t.Fatal("degenerate window should self-widen and be feasible")
+	}
+}
+
+func TestMultiSplitConnSplitsFirstWrite(t *testing.T) {
+	rec := &recorder{}
+	conn := rec.start()
+	defer conn.Close()
+	m := NewMultiSplitConn(conn, 2, sniLo, sniHi, 0, 0, fakeRng(3))
+	payload := make([]byte, 2200)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	n, err := m.Write(payload)
+	if err != nil || n != len(payload) {
+		t.Fatalf("Write: n=%d err=%v", n, err)
+	}
+	rec.waitUntil(t, func() bool { return rec.total() == len(payload) })
+	if rec.count() != 3 {
+		t.Fatalf("2 cuts must produce 3 segments, got %d (sizes=%v)", rec.count(), rec.sizes())
+	}
+	// Reassembly must be byte-exact.
+	got := make([]byte, 0, len(payload))
+	rec.mu.Lock()
+	for _, w := range rec.writes {
+		got = append(got, w...)
+	}
+	rec.mu.Unlock()
+	if !reflect.DeepEqual(got, payload) {
+		t.Fatal("reassembled segments differ from payload")
+	}
+	// Second write passes through unsplit.
+	before := rec.count()
+	if _, err := m.Write([]byte{1, 2, 3, 4}); err != nil {
+		t.Fatal(err)
+	}
+	rec.waitUntil(t, func() bool { return rec.count() >= before+1 })
+	if rec.count() != before+1 {
+		t.Fatalf("second write must not be split: %d", rec.count())
+	}
+}
+
+func TestMultiSplitConnSmallWritePassthrough(t *testing.T) {
+	rec := &recorder{}
+	conn := rec.start()
+	defer conn.Close()
+	m := NewMultiSplitConn(conn, 3, sniLo, sniHi, 0, 0, fakeRng(1))
+	// 20 bytes cannot carry 3 cuts+1 segments of >=8 bytes -> passthrough.
+	if _, err := m.Write(make([]byte, 20)); err != nil {
+		t.Fatal(err)
+	}
+	rec.waitUntil(t, func() bool { return rec.total() == 20 })
+	if rec.count() != 1 {
+		t.Fatalf("tiny write must stay whole, got %d segments", rec.count())
 	}
 }

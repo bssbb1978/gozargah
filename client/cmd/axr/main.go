@@ -74,13 +74,30 @@ type Config struct {
 	CacheDir string `json:"cache_dir,omitempty"`
 	// Surgery toggles ClientHello split + post-handshake chunking (default on).
 	Surgery *bool `json:"surgery,omitempty"`
-	// SplitGapMS bounds the randomized inter-segment gap in ms.
+	// SplitGapMS bounds the randomized inter-segment gap in ms (used when
+	// the ClientHello is cut once).
 	SplitGapMS [2]int `json:"split_gap_ms,omitempty"`
 	// Probes cadence in ms (0 = defaults: 90s normal / 30s aggressive).
 	Probes struct {
 		NormalMS     int `json:"normal_ms"`
 		AggressiveMS int `json:"aggressive_ms"`
 	} `json:"probes,omitempty"`
+	// ---- 2.16 — AXR-v3 fields ----
+	// FragCuts is the [min,max] range of ClientHello split points per
+	// connection (default [2,3]: the fragA/fragB multi-segment shape).
+	// 0 0 keeps the legacy single cut with SplitGapMS.
+	FragCuts [2]int `json:"frag_cuts,omitempty"`
+	// FragWindow is the cut window as percent-of-record bounds (default
+	// [40,90] = the SNI extension region).
+	FragWindow [2]int `json:"frag_window,omitempty"`
+	// FragMicroGapMS bounds the inter-segment micro-gap in ms for
+	// multi-cut splits (default [1,8]).
+	FragMicroGapMS [2]int `json:"frag_micro_gap_ms,omitempty"`
+	// HarvestURL is the Worker clean-IP harvest endpoint (default derived
+	// from ManifestURL: https://<host>/gozargah/api/network/harvest).
+	HarvestURL string `json:"harvest_url,omitempty"`
+	// HarvestToken for `axr scan -upload` (default: the manifest URL token).
+	HarvestToken string `json:"harvest_token,omitempty"`
 }
 
 // Entry is one candidate entry path.
@@ -101,6 +118,12 @@ type options struct {
 }
 
 func main() {
+	// 2.16 — subcommands (parsed before the default server flagset).
+	if len(os.Args) > 1 && os.Args[1] == "scan" {
+		runScan(os.Args[2:])
+		return
+	}
+
 	var opt options
 	flag.StringVar(&opt.configPath, "config", "", "path to axr.json config")
 	flag.StringVar(&opt.socksAddr, "socks", "127.0.0.1:1080", "SOCKS5 TCP listen address")
@@ -176,6 +199,19 @@ type server struct {
 	pathBase string                       // rotated ws path base from the manifest
 	probeInt [2]time.Duration             // [normal, aggressive]
 
+	// 2.16 — AXR-v3 state.
+	startedAt time.Time // session-age feature
+	sigWarned bool      // one-time "manifest unverified" note
+
+	// churnMu guards the last-good dial-address pair (entry-churn feature).
+	churnMu      sync.Mutex
+	prevGoodDial string
+	lastGoodDial string
+
+	// frameMu guards the outflow frame-size histogram (flow-KL feature).
+	frameMu  sync.Mutex
+	frameHist []int // counts per flowprofile.FrameBucketEdges bucket
+
 	warmMu sync.Mutex
 	warm   *warmSession
 }
@@ -244,15 +280,22 @@ func newServer(cfg Config, l *logger, timeout time.Duration) (*server, error) {
 		l.logf("harvested %d clean edge IP(s) from entry A records", n)
 	}
 	hcancel()
+	// 2.16 — merge the local `axr scan` clean-IP pool (probe survivors from
+	// this exact network — the strongest local evidence available).
+	if n := mergeCleanIPsFile(fo, cfg.CacheDir+"/clean-ips.json"); n > 0 {
+		l.logf("merged %d local scan clean IP(s) into the entry ladder", n)
+	}
 
 	s := &server{
-		cfg:      cfg,
-		log:      l,
-		timeout:  timeout,
-		bandit:   b,
-		failover: fo,
-		trackers: make(map[string]*measure.Tracker),
-		probeInt: [2]time.Duration{90 * time.Second, 30 * time.Second},
+		cfg:       cfg,
+		log:       l,
+		timeout:   timeout,
+		bandit:    b,
+		failover:  fo,
+		trackers:  make(map[string]*measure.Tracker),
+		probeInt:  [2]time.Duration{90 * time.Second, 30 * time.Second},
+		startedAt: time.Now(),
+		frameHist: make([]int, len(flowprofile.FrameBucketEdges)-1),
 	}
 	if p := cfg.Probes; p.NormalMS > 0 {
 		s.probeInt[0] = time.Duration(p.NormalMS) * time.Millisecond
@@ -295,20 +338,33 @@ func (s *server) refreshManifest() {
 		s.log.logf("manifest HTTP %d", resp.StatusCode)
 		return
 	}
-	var m struct {
-		WSPathBase  string `json:"ws_path_base"`
-		Fingerprint struct {
-			Current string `json:"current"`
-		} `json:"fingerprint"`
-		Entries []struct {
-			Host string `json:"host"`
-			Role string `json:"role"`
-		} `json:"entries"`
-		CleanIPHints []string `json:"clean_ip_hints"`
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		s.log.logf("manifest read failed: %v", err)
+		return
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&m); err != nil {
+	var m manifestV3
+	if err := json.Unmarshal(body, &m); err != nil {
 		s.log.logf("manifest decode failed: %v", err)
 		return
+	}
+	// 2.16 — manifest v3 integrity: verify the HMAC before trusting ANY
+	// field. A tampered/altered manifest is rejected outright and the core
+	// keeps its last-known-good state (already in memory; the last-good raw
+	// JSON is persisted for audit). An absent signature (older worker)
+	// degrades to unverified mode with a one-time note.
+	if valid, present := verifyManifestSig(&m, subTokenFromURL(s.cfg.ManifestURL)); !valid {
+		if present {
+			s.log.logf("manifest REJECTED: manifest_sig mismatch (keeping last-known-good state)")
+			return
+		}
+		if !s.sigWarned {
+			s.sigWarned = true
+			s.log.logf("note: manifest carries no signature (pre-2.16 worker); running unverified")
+		}
+	}
+	if err := os.WriteFile(s.cfg.CacheDir+"/manifest-lastgood.json", body, 0o600); err != nil {
+		s.log.logf("last-good manifest persist failed: %v", err)
 	}
 	if m.WSPathBase != "" {
 		s.pathBase = m.WSPathBase
@@ -317,8 +373,8 @@ func (s *server) refreshManifest() {
 	if fp == "" {
 		fp = "chrome"
 	}
-	// 2.15 — clean IP hints from the operator's env (validated on the
-	// worker): merge into every entry's IP set (dedup + cap, best effort).
+	// 2.15 — clean IP hints (worker: env ∪ D1 harvest, validated there):
+	// merge into every entry's IP set (dedup + cap, best effort).
 	// AddEntry replaces the same (host, transport) row, so this is a clean
 	// in-place IP-set upgrade.
 	if len(m.CleanIPHints) > 0 {
@@ -331,6 +387,16 @@ func (s *server) refreshManifest() {
 		}
 		s.log.logf("manifest applied %d clean IP hint(s)", len(m.CleanIPHints))
 	}
+	// 2.16 — domestic-CDN fronting hint: the same Worker deployed to a
+	// domestic CDN domain. Merged as a high-priority backup (before
+	// ordinary backups, after the primary config entries).
+	if m.FrontingHint != "" && !s.hasEntry(m.FrontingHint) {
+		for _, tr := range transportsPerEntry {
+			s.failover.AddEntry(failover.Endpoint{Host: m.FrontingHint, Transport: tr, FP: fp, Priority: 50})
+			s.bandit.AddArm(bandit.Arm{Host: m.FrontingHint, Transport: tr, FP: fp})
+		}
+		s.log.logf("manifest added fronting entry %s", m.FrontingHint)
+	}
 	for _, e := range m.Entries {
 		if e.Role == "backup" && !s.hasEntry(e.Host) {
 			for _, tr := range transportsPerEntry {
@@ -340,7 +406,7 @@ func (s *server) refreshManifest() {
 			s.log.logf("manifest added backup entry %s", e.Host)
 		}
 	}
-	s.log.logf("manifest loaded (path_base=%s fp=%s)", m.WSPathBase, fp)
+	s.log.logf("manifest loaded (path_base=%s fp=%s sig=%v)", m.WSPathBase, fp, m.ManifestSig != "")
 }
 
 func (s *server) hasEntry(host string) bool {
@@ -350,6 +416,112 @@ func (s *server) hasEntry(host string) bool {
 		}
 	}
 	return false
+}
+
+// mergeCleanIPsFile merges the local `axr scan` pool (clean-ips.json) into
+// every entry's IP set. Pools older than 30 days are ignored (edge IPs
+// churn; stale hints only add failing dials to the ladder).
+func mergeCleanIPsFile(fo *failover.Engine, path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	var f cleanIPsFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return 0
+	}
+	if len(f.IPs) == 0 {
+		return 0
+	}
+	if f.GeneratedAtMS > 0 && time.Since(time.UnixMilli(f.GeneratedAtMS)) > 30*24*time.Hour {
+		return 0
+	}
+	added := 0
+	for _, ep := range fo.Entries() {
+		merged := failover.HarvestedIPs(context.Background(),
+			append(append([]string{}, ep.IPs...), f.IPs...), "", nil)
+		added = len(merged) - len(ep.IPs)
+		up := ep
+		up.IPs = merged
+		fo.AddEntry(up)
+	}
+	return added
+}
+
+// fragParams returns the per-connection ClientHello surgery parameters:
+// the randomized cut count, cut window (SNI region), and micro-gap bounds.
+func (s *server) fragParams() (cuts int, lo, hi float64, gapMin, gapMax time.Duration) {
+	cuts = 1
+	gapMin, gapMax = 20*time.Millisecond, 120*time.Millisecond
+	if g := s.cfg.SplitGapMS; g[0] > 0 && g[1] > g[0] {
+		gapMin, gapMax = time.Duration(g[0])*time.Millisecond, time.Duration(g[1])*time.Millisecond
+	}
+	if f := s.cfg.FragCuts; f[0] > 0 && f[1] >= f[0] {
+		cuts = f[0] + int(randFloat()*float64(f[1]-f[0]+1))
+		gMin, gMax := 1, 8
+		if g := s.cfg.FragMicroGapMS; g[0] > 0 && g[1] > g[0] {
+			gMin, gMax = g[0], g[1]
+		}
+		gapMin, gapMax = time.Duration(gMin)*time.Millisecond, time.Duration(gMax)*time.Millisecond
+	}
+	wLo, wHi := 40, 90 // SNI extension region (percent of record)
+	if w := s.cfg.FragWindow; w[0] > 0 && w[1] > w[0] {
+		wLo, wHi = w[0], w[1]
+	}
+	return cuts, float64(wLo) / 100, float64(wHi) / 100, gapMin, gapMax
+}
+
+// observeFrameSize records one outflow WS frame size into the shared
+// histogram (feeds the flow-KL self-monitoring feature).
+func (s *server) observeFrameSize(n int) {
+	if n < 0 {
+		return
+	}
+	s.frameMu.Lock()
+	s.frameHist[flowprofile.BucketIndex(n)]++
+	s.frameMu.Unlock()
+}
+
+// flowKLDiv is KL(empirical outflow || target profile) in nats, or 0 before
+// enough frames have been observed to form a distribution.
+func (s *server) flowKLDiv(profile flowprofile.ProfileID) float64 {
+	s.frameMu.Lock()
+	counts := append([]int{}, s.frameHist...)
+	s.frameMu.Unlock()
+	total := 0
+	for _, c := range counts {
+		total += c
+	}
+	if total < 64 { // not enough outflow to compare honestly
+		return 0
+	}
+	emp := make([]float64, len(counts))
+	for i, c := range counts {
+		emp[i] = float64(c) / float64(total)
+	}
+	return flowprofile.KLDiv(emp, flowprofile.TargetBins(flowprofile.Get(profile)))
+}
+
+// entryChurn is the BGP-flap/anyshift proxy: 1 when the last two successful
+// tunnels used different dial addresses (the route under our feet moved).
+func (s *server) entryChurn() float64 {
+	s.churnMu.Lock()
+	defer s.churnMu.Unlock()
+	if s.prevGoodDial != "" && s.lastGoodDial != "" && s.prevGoodDial != s.lastGoodDial {
+		return 1
+	}
+	return 0
+}
+
+// noteGoodDial records a successful tunnel's dial address (churn feature).
+func (s *server) noteGoodDial(addr string) {
+	if addr == "" {
+		return
+	}
+	s.churnMu.Lock()
+	s.prevGoodDial = s.lastGoodDial
+	s.lastGoodDial = addr
+	s.churnMu.Unlock()
 }
 
 // wsPath is the full WebSocket request target. With a manifest, the token
@@ -516,7 +688,10 @@ func socksReply(conn net.Conn, code byte) {
 // ---- tunnel ----
 
 // banditContext maps the measured state vector to the LinUCB context.
-func banditContext(v measure.Vector, now int64) bandit.Context {
+// The 2.16 v3 extensions (throughput, loss velocity, TLS error rate, entry
+// churn, flow KL, session age) come from the server's local measurements;
+// time-of-day and regime ordinal are derived by features() itself.
+func (s *server) banditContext(v measure.Vector, now int64, profile flowprofile.ProfileID) bandit.Context {
 	anom := 0.0
 	if v.LastAnomaly != 0 {
 		anom = 1
@@ -531,6 +706,12 @@ func banditContext(v measure.Vector, now int64) bandit.Context {
 		TLSDrop:          v.TimeoutRate,
 		LossStep:         v.StepDelta,
 		HTTPAnom:         anom,
+		ThroughputBPS:    v.ThroughputBPS,
+		LossVel:          v.LossVel,
+		TLSErrRate:       v.TLSErrRate,
+		EntryChurn:       s.entryChurn(),
+		FlowKLDiv:        s.flowKLDiv(profile),
+		SessionAgeH:      time.Since(s.startedAt).Hours(),
 	}
 }
 
@@ -551,8 +732,8 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 
 	now := time.Now()
 	vec := s.globalVector()
-	bctx := banditContext(vec, now.UnixMilli())
 	profile := flowprofile.ForRegime(vec.Regime)
+	bctx := s.banditContext(vec, now.UnixMilli(), profile)
 
 	// 2.15 — session reuse: adopt the previous tunnel for the SAME
 	// destination if it is still open and within warmTTL. No new dial/TLS/
@@ -652,12 +833,16 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 	}, bctx, time.Now().UnixMilli())
 	if last.entry.Host != "" {
 		s.trackerFor(last.entry.Host).Feed(measure.Sample{
-			OK:        last.ok,
-			RTTMS:     last.rttMS,
-			ErrClass:  classErr(last.reason),
-			Transport: last.entry.Transport,
-			UnixMS:    time.Now().UnixMilli(),
+			OK:         last.ok,
+			RTTMS:      last.rttMS,
+			Throughput: last.through,
+			ErrClass:   classErr(last.reason),
+			Transport:  last.entry.Transport,
+			UnixMS:     time.Now().UnixMilli(),
 		})
+		if last.ok {
+			s.noteGoodDial(last.dialAddr) // entry-churn (flap proxy) feature
+		}
 		s.failover.Observe(last.entry, last.dialAddr, last.ok, last.rttMS, last.reason, time.Now())
 		_ = s.failover.SaveCache(s.cfg.CacheDir + "/routing.json")
 	}
@@ -704,11 +889,10 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 
 	inner := raw
 	if s.surgeryOn() {
-		gapMin, gapMax := 20*time.Millisecond, 120*time.Millisecond
-		if g := s.cfg.SplitGapMS; g[0] > 0 && g[1] > g[0] {
-			gapMin, gapMax = time.Duration(g[0])*time.Millisecond, time.Duration(g[1])*time.Millisecond
-		}
-		inner = surgery.NewSplitConn(raw, gapMin, gapMax, s.rngFloat)
+		// 2.16 — multi-segment ClientHello surgery (fragA/fragB style):
+		// randomized 1-3 cuts in the SNI region, 1-8 ms micro-gaps.
+		cuts, lo, hi, gapMin, gapMax := s.fragParams()
+		inner = surgery.NewMultiSplitConn(raw, cuts, lo, hi, gapMin, gapMax, s.rngFloat)
 	}
 	surg := s.surgeryOn()
 	ws, err := vlessws.DialConn(ctx, inner, vlessws.DialOptions{
@@ -745,11 +929,11 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 		arm:     bandit.Arm{Host: cand.Endpoint.Host, Transport: cand.Endpoint.Transport, FP: cand.Endpoint.FP},
 		profile: profile, dstHost: dstHost, dstPort: dstPort,
 	}
-	_ = s.pumpTunnel(ws, client, true, meta)
+	pr := s.pumpTunnel(ws, client, true, meta)
 	client.Close()
 	res.ok = true
 	res.reason = "ok"
-	res.through = 0 // per-frame throughput accounting is a v2 item
+	res.through = pr.through // 2.16 — measured bytes/sec of the stream
 	return res
 }
 
@@ -764,8 +948,9 @@ type warmMeta struct {
 
 // pumpResult is the outcome of a two-direction pump.
 type pumpResult struct {
-	clean  bool   // ended without a transport error (clean local EOF or clean close)
-	reason string // "" when clean, else the error text
+	clean   bool    // ended without a transport error (clean local EOF or clean close)
+	reason  string  // "" when clean, else the error text
+	through float64 // 2.16 — measured average bytes/sec (0 for warm-kept streams)
 }
 
 // pumpTunnel moves data both directions over an open WS tunnel until one side
@@ -790,6 +975,10 @@ func (s *server) pumpTunnel(ws *vlessws.Client, client net.Conn, allowWarm bool,
 			firstErr = err
 		}
 	}
+	// 2.16 — throughput + outflow shape accounting. Each counter is written
+	// by exactly one goroutine and read only after wg.Wait().
+	var upBytes, downBytes int64
+	start := time.Now()
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
@@ -797,6 +986,8 @@ func (s *server) pumpTunnel(ws *vlessws.Client, client net.Conn, allowWarm bool,
 		for {
 			n, rerr := client.Read(buf)
 			if n > 0 {
+				s.observeFrameSize(n) // flow-KL self-monitoring histogram
+				upBytes += int64(n)
 				if serr := ws.SendBinary(buf[:n]); serr != nil {
 					announce(false, serr)
 					break
@@ -814,6 +1005,7 @@ func (s *server) pumpTunnel(ws *vlessws.Client, client net.Conn, allowWarm bool,
 		for {
 			msg, rerr := ws.RecvBinary()
 			if len(msg) > 0 {
+				downBytes += int64(len(msg))
 				if _, werr := client.Write(msg); werr != nil {
 					announce(false, werr)
 					break
@@ -842,16 +1034,22 @@ func (s *server) pumpTunnel(ws *vlessws.Client, client net.Conn, allowWarm bool,
 		wg.Wait()
 		_ = ws.Conn().SetReadDeadline(time.Time{})
 		s.keepWarm(ws, meta)
+		// The stream is still open (adoptable): no final throughput number
+		// yet — an adoption re-serves it and accounts separately.
 		return pumpResult{clean: true}
 	}
 
 	// Any other ending: tear the WS down (client is the caller's to close).
 	ws.Close()
 	wg.Wait()
-	if pumpErr != nil {
-		return pumpResult{clean: false, reason: firstReason(pumpErr.Error())}
+	through := 0.0
+	if elapsed := time.Since(start).Seconds(); elapsed > 0 {
+		through = float64(upBytes+downBytes) / elapsed
 	}
-	return pumpResult{clean: true}
+	if pumpErr != nil {
+		return pumpResult{clean: false, reason: firstReason(pumpErr.Error()), through: through}
+	}
+	return pumpResult{clean: true, through: through}
 }
 
 func firstReason(r string) string {

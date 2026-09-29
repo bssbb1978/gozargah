@@ -213,3 +213,130 @@ func (s *Slicer) Next(remaining int) (int, time.Duration) {
 	}
 	return size, SampleIPD(s.p, s.rng)
 }
+
+// ---- 2.16 — self-monitoring: KL divergence vs the target profile ----
+//
+// The core's honest self-check: how close does the ACTUAL outflow frame-size
+// distribution sit to the TARGET application-class distribution? A large KL
+// divergence means the morphing is drifting (e.g. the app really is sending
+// video-sized frames while posing as web) and the bandit context carries
+// that number so the learner can condition on it.
+
+// FrameBucketEdges are the shared histogram edges (bytes) used both for the
+// empirical outflow histogram and for projecting a profile's target
+// distribution. Monotonic, from 0 to the top.
+var FrameBucketEdges = []int{0, 128, 256, 512, 768, 1024, 1400, 2048, 4096, 8192, 16384, 32768, 1 << 30}
+
+// BucketIndex returns the bucket for a frame size (len(Edges)-1 for the
+// top-open bucket).
+func BucketIndex(size int) int {
+	if size < 0 {
+		size = 0
+	}
+	for i := 1; i < len(FrameBucketEdges); i++ {
+		if size < FrameBucketEdges[i] {
+			return i - 1
+		}
+	}
+	return len(FrameBucketEdges) - 2
+}
+
+// TargetBins projects a profile's chunk-length histogram onto the shared
+// frame buckets and normalizes to a probability vector (length
+// len(FrameBucketEdges)-1). A bin's weight is distributed over buckets in
+// proportion to the byte overlap. Returns an all-zero vector on bad input.
+func TargetBins(p Profile) []float64 {
+	nb := len(FrameBucketEdges) - 1
+	out := make([]float64, nb)
+	total := 0.0
+	for _, b := range p.Bins {
+		total += b.w
+	}
+	if total <= 0 {
+		return out
+	}
+	for _, b := range p.Bins {
+		// Byte-overlap of [b.lo, b.hi) with each frame bucket.
+		lo, hi := b.lo, b.hi
+		if hi <= lo {
+			continue
+		}
+		for i := 0; i < nb; i++ {
+			ble, bhe := FrameBucketEdges[i], FrameBucketEdges[i+1]
+			ovLo, ovHi := maxInt(lo, ble), minInt(hi, bhe)
+			if ovHi <= ovLo {
+				continue
+			}
+			share := float64(ovHi-ovLo) / float64(hi-lo)
+			out[i] += (b.w / total) * share
+		}
+	}
+	// Renormalize (rounding + partial overlap must not lose mass).
+	s := 0.0
+	for _, v := range out {
+		s += v
+	}
+	if s <= 0 {
+		return out
+	}
+	for i := range out {
+		out[i] /= s
+	}
+	return out
+}
+
+// KLDiv is KL(p||q) in nats between two non-negative distributions. Both
+// are normalized first; q gets an epsilon floor so zero target mass never
+// produces an infinite divergence. Returns 0 for empty/invalid inputs.
+// This is the client's self-monitoring signal, not a DPI tool: it measures
+// the core's own output against its own target.
+func KLDiv(p, q []float64) float64 {
+	if len(p) == 0 || len(p) != len(q) {
+		return 0
+	}
+	const eps = 1e-6
+	var ps, qs float64
+	for _, v := range p {
+		if v > 0 {
+			ps += v
+		}
+	}
+	for _, v := range q {
+		if v > 0 {
+			qs += v
+		}
+	}
+	if ps <= 0 || qs <= 0 {
+		return 0
+	}
+	k := 0.0
+	for i := range p {
+		pi := p[i] / ps
+		qi := q[i] / qs
+		if pi <= 0 {
+			continue
+		}
+		if qi < eps {
+			qi = eps
+		}
+		k += pi * math.Log(pi/qi)
+	}
+	if k < 0 {
+		k = 0 // numeric noise guard (KL is never negative)
+	}
+	return k
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

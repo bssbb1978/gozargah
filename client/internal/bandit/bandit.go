@@ -7,13 +7,31 @@
 // 2.15 upgrade: UCB1 -> LinUCB
 //   - UCB1 scores an arm by a single mean reward plus a pull-count bonus.
 //     It cannot express "arm A is good on a clean pipe but terrible when RSTs
-//     spike". LinUCB scores each arm as a linear function of a 7-dim context
+//     spike". LinUCB scores each arm as a linear function of a context
 //     vector (see Context / features), so the same entry can be preferred or
 //     avoided as the measured conditions change. That is the whole point for
 //     a network whose behaviour is non-stationary.
+//
+// 2.16 upgrade: 7-dim -> 16-dim context (AXR-v3). The v3 additions and their
+// honest data sources (all LOCAL client measurements — nothing else):
+//   - f7  throughput level     EWMA of measured tunnel bytes/sec
+//   - f8  loss velocity        recent (8-obs) drop rate minus window drop rate
+//   - f9  TLS error rate       window fraction failing at the TLS handshake
+//   - f10 entry churn          0/1 proxy: the best dial address changed since
+//                              the last success (a BGP-flap/anyshift proxy —
+//                              the client cannot see routing tables)
+//   - f11 flow-profile KL      KL(empirical outflow frame-size histogram ||
+//                              target profile) — the core's self-monitoring
+//   - f12 time-of-day sin      derived from NowMS
+//   - f13 time-of-day cos      derived from NowMS
+//   - f14 session longevity    core uptime in hours (24h = max)
+//   - f15 regime ordinal       derived from the regime label (a NOVEL regime
+//                              widens the confidence interval on purpose:
+//                              unexplored conditions deserve exploration)
+//
 //   - Per arm we keep the ridge-regularised normal-equation state
-//         A_a = λI + Σ x xᵀ      (7×7, symmetric positive definite)
-//         b_a = Σ r x            (7)
+//         A_a = λI + Σ x xᵀ      (16×16, symmetric positive definite)
+//         b_a = Σ r x            (16)
 //     with θ_a = A_a⁻¹ b_a, and score an arm at context x by
 //         xᵀθ_a + α · √(x A_a⁻¹ x)
 //     (exploitation + width of the confidence interval). A is inverted with a
@@ -57,9 +75,11 @@ const (
 	successThroughputTarget = 2.0 * 1000 * 1000 // 2 MB/s saturates the bonus
 )
 
-// dim is the context-vector width: bias, rtt-level, rtt-variance, rst-rate,
-// tls-drop, loss-step, http-anomaly.
-const dim = 7
+// dim is the context-vector width (2.16): bias, rtt-level, rtt-variance,
+// rst-rate, tls-drop, loss-step, http-anomaly, throughput, loss-velocity,
+// tls-error-rate, entry-churn, flow-KL, tod-sin, tod-cos, session-age,
+// regime-ordinal.
+const dim = 16
 
 // Arm is one selectable path: entry host × transport × TLS fingerprint.
 type Arm struct {
@@ -112,6 +132,13 @@ type Context struct {
 	TLSDrop          float64 `json:"tls_drop"`
 	LossStep         float64 `json:"loss_step"`
 	HTTPAnom         float64 `json:"http_anom"`
+	// 2.16 — AXR-v3 extensions (see the package doc for sources).
+	ThroughputBPS float64 `json:"throughput_bps"` // measured tunnel bytes/sec EWMA
+	LossVel       float64 `json:"loss_vel"`       // -1..1 (negative = improving)
+	TLSErrRate    float64 `json:"tls_err_rate"`   // 0..1 window fraction
+	EntryChurn    float64 `json:"entry_churn"`    // 0 or 1: best dial addr changed
+	FlowKLDiv     float64 `json:"flow_kl_div"`    // nats, self-monitoring
+	SessionAgeH   float64 `json:"session_age_h"`  // core uptime, hours
 }
 
 // Outcome is one connection result fed back to the bandit.
@@ -172,7 +199,51 @@ func features(ctx Context) vec {
 	f[4] = clamp01(ctx.TLSDrop)        // TLS drop rate (0..1)
 	f[5] = clamp01(ctx.LossStep / 6)   // loss step (CUSUM cap ~6)
 	f[6] = clamp01(ctx.HTTPAnom)       // 0 or 1
+	// ---- 2.16 — AXR-v3 extensions ----
+	f[7] = clamp01(ctx.ThroughputBPS / 10_000_000) // 10 MB/s = saturated
+	f[8] = clamp01((ctx.LossVel + 1) / 2)          // -1..1 -> 0..1
+	f[9] = clamp01(ctx.TLSErrRate)                 // 0..1
+	f[10] = clamp01(ctx.EntryChurn)                // 0 or 1
+	f[11] = clamp01(ctx.FlowKLDiv / 4)             // 4 nats = saturated
+	f[12] = (timeOfDaySin(ctx.NowMS) + 1) / 2      // 0..1
+	f[13] = (timeOfDayCos(ctx.NowMS) + 1) / 2      // 0..1
+	f[14] = clamp01(ctx.SessionAgeH / 24)          // 24h = max
+	f[15] = regimeOrdinal(ctx.Regime)
 	return f
+}
+
+// timeOfDaySin/Cos map the clock time to a smooth periodic pair (24h period)
+// so "00:00" and "24:00" are adjacent instead of opposite. Negative or
+// non-finite NowMS degrades to the midnight phase (0,1).
+func timeOfDayPhase(nowMS int64) float64 {
+	hours := float64(nowMS) / 3_600_000
+	if math.IsNaN(hours) || math.IsInf(hours, 0) {
+		return 0
+	}
+	phase := math.Mod(hours, 24) / 24 * 2 * math.Pi
+	if phase < 0 {
+		phase += 2 * math.Pi
+	}
+	return phase
+}
+
+func timeOfDaySin(nowMS int64) float64 { return math.Sin(timeOfDayPhase(nowMS)) }
+func timeOfDayCos(nowMS int64) float64 { return math.Cos(timeOfDayPhase(nowMS)) }
+
+// regimeOrdinal ranks regimes for the context vector. A novel/worse regime
+// is a different condition, and LinUCB widens its interval there until the
+// core accumulates observations under it (deliberate exploration).
+func regimeOrdinal(regime string) float64 {
+	switch regime {
+	case "stable":
+		return 0
+	case "watch", "recovering":
+		return 0.35
+	case "suspected_change":
+		return 0.7
+	default:
+		return 0.1
+	}
 }
 
 // mat / vec are the fixed-width linear-algebra types for the dim×dim state.
@@ -578,19 +649,26 @@ func (b *Bandit) Arms() []Arm {
 	return out
 }
 
-// LinState is the persistable per-arm LinUCB state.
+// LinState is the persistable per-arm LinUCB state. A/B are flexible
+// (slice-of-slices) so an OLDER dim's snapshot still UNMARSHALS: Restore
+// then validates the shape and rebuilds the ridge prior when the dim has
+// changed (2.15 was 7, 2.16 is 16) — the learned arm STATS survive the
+// upgrade either way.
 type LinState struct {
-	A mat `json:"a"`
-	B vec `json:"b"`
+	A [][]float64 `json:"a"`
+	B []float64   `json:"b"`
 }
 
 // Snapshot is the JSON-persistable state (arm set + stats + lin + config).
 type Snapshot struct {
-	C     float64             `json:"c"`
-	Seed  uint64              `json:"seed"`
-	Arms  []Arm               `json:"arms"`
-	Stats map[string]*Stats   `json:"stats"`
+	C     float64              `json:"c"`
+	Seed  uint64               `json:"seed"`
+	Arms  []Arm                `json:"arms"`
+	Stats map[string]*Stats    `json:"stats"`
 	Lin   map[string]*LinState `json:"lin,omitempty"`
+	// Dim is the feature width this snapshot's Lin state was learned under
+	// (0 in pre-2.16 snapshots).
+	Dim int `json:"dim,omitempty"`
 }
 
 // Snapshot exports state for persistence.
@@ -604,16 +682,42 @@ func (b *Bandit) Snapshot() Snapshot {
 	}
 	lin := make(map[string]*LinState, len(b.lin))
 	for k, v := range b.lin {
-		lin[k] = &LinState{A: v.A, B: v.b}
+		A := make([][]float64, dim)
+		for i := 0; i < dim; i++ {
+			A[i] = make([]float64, dim)
+			copy(A[i], v.A[i][:])
+		}
+		B := make([]float64, dim)
+		copy(B, v.b[:])
+		lin[k] = &LinState{A: A, B: B}
 	}
 	arms := make([]Arm, len(b.arms))
 	copy(arms, b.arms)
-	return Snapshot{C: b.C, Seed: b.seed, Arms: arms, Stats: stats, Lin: lin}
+	return Snapshot{C: b.C, Seed: b.seed, Arms: arms, Stats: stats, Lin: lin, Dim: dim}
+}
+
+// validLin reports whether ls is a complete dim×dim Lin state for the
+// CURRENT feature width.
+func validLin(ls *LinState) bool {
+	if ls == nil || ls.A == nil || ls.B == nil {
+		return false
+	}
+	if len(ls.A) != dim || len(ls.B) != dim {
+		return false
+	}
+	for _, row := range ls.A {
+		if len(row) != dim {
+			return false
+		}
+	}
+	return true
 }
 
 // Restore loads persisted state. Unknown arms in old snapshots are ignored;
-// missing arms get fresh stats. Arms missing Lin state get a fresh λI so the
-// learner starts from the ridge prior for those arms.
+// missing arms get fresh stats. Arms missing Lin state — or carrying Lin
+// state learned under a DIFFERENT feature width (2.15's 7-dim) — get a
+// fresh λI so the learner starts from the ridge prior for those arms while
+// keeping their accumulated Stats.
 func (b *Bandit) Restore(s Snapshot) error {
 	if len(s.Arms) == 0 {
 		return fmt.Errorf("bandit: empty snapshot")
@@ -623,6 +727,11 @@ func (b *Bandit) Restore(s Snapshot) error {
 	if s.C > 0 {
 		b.C = s.C
 	}
+	// A snapshot written under another feature width is structurally
+	// incompatible: its Lin matrices are the wrong shape. The per-arm
+	// validLin check below would drop them one by one; short-circuit the
+	// intent explicitly so the behaviour is documented in one place.
+	dimChanged := s.Dim > 0 && s.Dim != dim
 	b.arms = nil
 	b.stats = make(map[string]*Stats, len(s.Arms))
 	b.lin = make(map[string]*armLin, len(s.Arms))
@@ -644,8 +753,14 @@ func (b *Bandit) Restore(s Snapshot) error {
 		} else {
 			b.stats[id] = &Stats{}
 		}
-		if ls, ok := s.Lin[id]; ok {
-			l := &armLin{A: ls.A, b: ls.B}
+		if ls, ok := s.Lin[id]; ok && !dimChanged && validLin(ls) {
+			l := &armLin{}
+			for i := 0; i < dim; i++ {
+				for j := 0; j < dim; j++ {
+					l.A[i][j] = ls.A[i][j]
+				}
+				l.b[i] = ls.B[i]
+			}
 			b.lin[id] = l
 		} else {
 			b.lin[id] = newArmLin()

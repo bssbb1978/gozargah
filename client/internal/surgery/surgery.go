@@ -190,3 +190,168 @@ func (k *ChunkConn) RemoteAddr() net.Addr                { return k.inner.Remote
 func (k *ChunkConn) SetDeadline(t time.Time) error       { return k.inner.SetDeadline(t) }
 func (k *ChunkConn) SetReadDeadline(t time.Time) error   { return k.inner.SetReadDeadline(t) }
 func (k *ChunkConn) SetWriteDeadline(t time.Time) error  { return k.inner.SetWriteDeadline(t) }
+
+// ---- 2.16 — multi-segment ClientHello surgery (fragA/fragB style) ----
+//
+// The reference sing-box Serverless-v51 tlshello configs split the
+// ClientHello into multiple masked segments with specific offset profiles
+// (e.g. [6,98,1] / [0,104,1]). AXR generalizes that: the first write is cut
+// into 2-4 segments at randomized offsets biased toward the SNI region of
+// the record (extensions block: roughly 40-90% of a typical ClientHello),
+// separated by randomized 1-8 ms micro-gaps. The kernel emits >=3 TCP
+// segments for one logical ClientHello with per-connection offset/timing
+// jitter — the "single clean segment carrying SNI" shape gets no match.
+//
+// Honest boundary (unchanged): TCP-level segmentation of bytes the TLS
+// stack already produced. No record padding, no extension rewriting.
+
+const (
+	// sniLo/sniHi is the default cut window: where the SNI extension lives
+	// in a typical 1.5-2.5 KB ClientHello (after session_id/ciphers,
+	// before server_name + ALPN tail).
+	sniLo = 0.40
+	sniHi = 0.90
+	// minSegBytes: the smallest segment worth keeping (a TLS record header
+	// plus a few bytes).
+	minSegBytes = 8
+)
+
+// PlanCuts returns `cuts` strictly increasing cut offsets inside a record of
+// length n, each within [n*lo, n*hi], at least minSegBytes apart, or nil
+// when infeasible (record too small, window too narrow, or the random draws
+// keep colliding). Deterministic for a given (n, cuts, lo, hi, rng)
+// sequence.
+func PlanCuts(n, cuts int, lo, hi float64, rng Rng) []int {
+	if cuts < 1 || rng == nil || n < minSegBytes*(cuts+1) {
+		return nil
+	}
+	if lo < 0.02 {
+		lo = 0.02
+	}
+	if hi > 0.98 {
+		hi = 0.98
+	}
+	if hi <= lo {
+		hi = lo + 0.1
+	}
+	loB := int(float64(n) * lo)
+	hiB := int(float64(n) * hi)
+	if loB < minSegBytes || hiB > n-minSegBytes {
+		return nil
+	}
+	span := hiB - loB
+	if span < minSegBytes*(cuts-1) {
+		return nil
+	}
+	abs := func(a, b int) int {
+		if a > b {
+			return a - b
+		}
+		return b - a
+	}
+	for attempt := 0; attempt < 64; attempt++ {
+		pts := make([]int, 0, cuts)
+		ok := true
+		for i := 0; i < cuts; i++ {
+			p := loB + int(rng()*float64(span+1))
+			if p < minSegBytes || p > n-minSegBytes {
+				ok = false
+				break
+			}
+			for _, q := range pts {
+				if abs(p-q) < minSegBytes {
+					ok = false
+					break
+				}
+			}
+			if !ok {
+				break
+			}
+			pts = append(pts, p)
+		}
+		if ok {
+			// stable ascending order
+			for i := 1; i < len(pts); i++ {
+				for j := i; j > 0 && pts[j] < pts[j-1]; j-- {
+					pts[j], pts[j-1] = pts[j-1], pts[j]
+				}
+			}
+			return pts
+		}
+	}
+	return nil
+}
+
+// MultiSplitConn splits only the first write (the ClientHello) into
+// cuts+1 segments with randomized micro-gaps between them. All subsequent
+// writes pass through untouched. It implements net.Conn.
+type MultiSplitConn struct {
+	inner  net.Conn
+	done   bool
+	cuts   int
+	lo     float64
+	hi     float64
+	gapMin time.Duration
+	gapMax time.Duration
+	rng    Rng
+}
+
+// NewMultiSplitConn wraps c. cuts is the number of split points (1 => two
+// segments, 2 => three, ...). lo/hi bound the cut window as a fraction of
+// the record (use sniLo/sniHi for the SNI region). gapMin/gapMax bound the
+// randomized micro-gap between segments (typical: 1ms and 8ms).
+func NewMultiSplitConn(c net.Conn, cuts int, lo, hi float64, gapMin, gapMax time.Duration, rng Rng) *MultiSplitConn {
+	if lo <= 0 {
+		lo, hi = sniLo, sniHi
+	}
+	if gapMin < 0 {
+		gapMin = 0
+	}
+	if gapMax < gapMin {
+		gapMax = gapMin
+	}
+	if cuts < 1 {
+		cuts = 1
+	}
+	return &MultiSplitConn{inner: c, cuts: cuts, lo: lo, hi: hi, gapMin: gapMin, gapMax: gapMax, rng: rng}
+}
+
+func (m *MultiSplitConn) Read(b []byte) (int, error) { return m.inner.Read(b) }
+
+// Write splits the first write at PlanCuts offsets, honoring one randomized
+// gap before each subsequent segment. The returned count is the full write
+// length (contract of net.Conn); a mid-write error is returned with the
+// bytes already pushed.
+func (m *MultiSplitConn) Write(b []byte) (int, error) {
+	if !m.done {
+		m.done = true // only the very first write is ever split
+		if pts := PlanCuts(len(b), m.cuts, m.lo, m.hi, m.rng); pts != nil {
+			bounds := make([]int, 0, len(pts)+2)
+			bounds = append(bounds, 0)
+			bounds = append(bounds, pts...)
+			bounds = append(bounds, len(b))
+			total := 0
+			for i := 1; i < len(bounds); i++ {
+				if i > 1 {
+					if gap := DefaultGap(m.rng, m.gapMin, m.gapMax); gap > 0 {
+						time.Sleep(gap)
+					}
+				}
+				n, err := m.inner.Write(b[bounds[i-1]:bounds[i]])
+				total += n
+				if err != nil {
+					return total, err
+				}
+			}
+			return total, nil
+		}
+	}
+	return m.inner.Write(b)
+}
+
+func (m *MultiSplitConn) Close() error                                   { return m.inner.Close() }
+func (m *MultiSplitConn) LocalAddr() net.Addr                            { return m.inner.LocalAddr() }
+func (m *MultiSplitConn) RemoteAddr() net.Addr                           { return m.inner.RemoteAddr() }
+func (m *MultiSplitConn) SetDeadline(t time.Time) error                  { return m.inner.SetDeadline(t) }
+func (m *MultiSplitConn) SetReadDeadline(t time.Time) error              { return m.inner.SetReadDeadline(t) }
+func (m *MultiSplitConn) SetWriteDeadline(t time.Time) error             { return m.inner.SetWriteDeadline(t) }

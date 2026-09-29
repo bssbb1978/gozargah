@@ -1,6 +1,6 @@
 {
   "name": "gozargah",
-  "version": "2.15.0",
+  "version": "2.16.0",
   "private": true,
   "description": "Gozargah - adaptive multi-protocol Cloudflare Worker panel with D1, VLESS/Trojan/Shadowsocks AEAD, DNS-over-HTTPS/DNS64, local online learning, adaptive policy and bounded recovery",
   "main": "src/index.ts",

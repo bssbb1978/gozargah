@@ -1,4 +1,30 @@
-# Gozargah 2.15.0 — AXR-v2 Enterprise Core: LinUCB + Flow Morphing + Scanner Decoy
+# Gozargah 2.16.0 — AXR-v3 Hyper-Resilience: Clean-IP Loop + Manifest Integrity + 16-dim Bandit
+
+## 2.16.0 — AXR-v3 Hyper-Resilience (advanced increment)
+
+### Highlights
+- **Fully-automatic clean-IP loop (Worker + Go client)** — the CFScanner capability set from the production Rust scouting scripts is now first-class and *swapped into the platform, with no capability deleted*: new `client/internal/cfscan` (Cloudflare API CIDRs with offline snapshot fallback, operator priority /24 ranges, blocked-range exclusion, SNI-anchored TLS probes ×3 with **real cert verification**, median RTT + loss, `/cdn-cgi/trace` **colo validation**, top-N ranking, JSON+CSV reports) and a new Worker endpoint `POST /{panelPath}/api/network/harvest` (token-gated: any valid subscription token or `HARVEST_TOKEN`; IPv4 validate → dedup → cap 32 → D1-persist). `axr scan [-upload]` probes from the local network, refreshes `~/.axr/clean-ips.json` (auto-merged into the failover ladder at startup, 30-day freshness guard), and publishes the survivors to the Worker; the manifest then serves `clean_ip_hints = env ∪ D1` to **every** client. Cron-ready, zero human in the loop.
+- **Manifest v3 with HMAC integrity** — `manifest_sig` = HMAC-SHA256 over a canonical 11-field string, keyed by the user's subscription token (shared pinned test vector in both test suites + [docs/AXR-V3-HYPER-RESILIENCE](docs/AXR-V3-HYPER-RESILIENCE.md) §5). The Go client verifies in constant time: tampered manifest → **rejected**, last-known-good state kept + raw JSON persisted for audit; absent signature (older workers) → documented unverified mode.
+- **Domestic-CDN fronting hint** — operator env `FRONTING_RELAY_HOST` (validated hostname) is published as `fronting_hint` and joined by every client as a priority-50 ladder entry (ws + ws-alt arms) — deploy the same Worker to a domestic CDN domain and it becomes a reachable second entry automatically.
+- **16-dim LinUCB context (was 7)** — measured, not assumed: real tunnel **throughput** (bytes/sec EWMA from pump accounting), **loss velocity** (recent-vs-baseline drop rate), **TLS error rate**, **entry churn** (dial-address change = BGP-flap/anyshift proxy), **time-of-day sin/cos**, **session longevity**, **regime ordinal**, and the **flow-profile KL divergence** below. Per-arm 16×16 ridge state; 2.15 snapshots restore stats with the ridge prior rebuilt (dim migration unit-tested).
+- **KL-divergence self-monitoring** — new `flowprofile.KLDiv` + `TargetBins` + shared frame buckets: the pump buckets every outflow WS frame live, and the core continuously measures `KL(empirical outflow ‖ target app-class profile)` feeding bandit feature f11 — the client *knows* when its morph is drifting from its own target.
+- **Multi-segment ClientHello surgery (fragA/fragB style)** — `surgery.MultiSplitConn`: the first write is cut at randomized **2–3 split points** inside the **SNI region** (40–90 % window) with **1–8 ms micro-gaps** (per-connection randomization; deterministic seeded tests). Same honest boundary: TCP-level segmentation of TLS-produced bytes — no record padding, no extension rewriting.
+- **Version** — Worker `VERSION 2.16.0` / `SCHEMA_VERSION 16`; client core updated; decoy layer and 0-RTT early data (2.15) retained unchanged.
+
+### Honest platform boundary (restated)
+eBPF/TC/XDP, UDP-noise, DoH/ICMP steganography are **not shipped** (root+Linux/raw-socket deployment cost; socket-level segmentation already produces the same on-wire TCP effect for this client) — documented with the v3.1 roadmap in [AXR-v3 Hyper-Resilience](docs/AXR-V3-HYPER-RESILIENCE.md) §1/§10. Nothing here is DPI detection; a probe success is "this edge IP answers the relay's TLS handshake from *your* network now"; a fully cut route cannot be created from the client and is reported, not looped.
+
+### Verification status
+Worker side: `npm run typecheck`, `npm run test:engine` (36 checks incl. new `manifest-integrity` vector suite) and `npm run test:integration` (20 tests incl. new HMAC-verify, fronting-hint, harvest-ingest suites) all pass. Go core: complete source + unit tests (cfscan pure logic, 16-dim LinUCB incl. dim-migration, KLDiv/TargetBins, PlanCuts/MultiSplitConn, manifest HMAC vector), **not compiled in the authoring sandbox** (no Go toolchain) — deploy gate `go vet && go build && go test ./...` per [AXR-DEPLOY](docs/AXR-DEPLOY.md).
+
+### Engineering documents
+- [AXR-v3 Hyper-Resilience (2.16) — spec mapping, wire contracts, roadmap](docs/AXR-V3-HYPER-RESILIENCE.md)
+- [AXR-v2 Enterprise Core — Advanced Features (2.15)](docs/AXR-V2-ADVANCED.md)
+- [AXR Protocol Specification](docs/AXR-SPEC.md)
+- [AXR Cross-Compile & Deploy Guide](docs/AXR-DEPLOY.md)
+- [Client Core README](client/README.md)
+- [Test Report 2.16.0](TEST-REPORT-2.16.0.md)
+- [Persian Upgrade Report 2.16.0](UPGRADE-REPORT-FA-2.16.0.md)
 
 ## 2.15.0 — AXR-v2 Enterprise Core (advanced increment)
 

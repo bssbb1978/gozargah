@@ -508,15 +508,58 @@ export async function loadLatestPathSamples(db: D1Database, subjectIds: string[]
   }));
 }
 
-export interface PredictiveStateRow { kind:'path'|'profile'|'regime'; subjectId:string; stateJson:string; updatedAt:number; }
+export interface PredictiveStateRow { kind:'path'|'profile'|'regime'|'harvest'; subjectId:string; stateJson:string; updatedAt:number; }
 export async function savePredictiveState(db:D1Database,row:PredictiveStateRow):Promise<void>{
   await ensureSchema(db);
   await db.prepare('INSERT INTO predictive_state(kind,subject_id,state_json,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(kind,subject_id) DO UPDATE SET state_json=?3, updated_at=?4').bind(row.kind,row.subjectId,row.stateJson,row.updatedAt).run();
 }
-export async function loadPredictiveStates(db:D1Database, kind:'path'|'profile'|'regime'):Promise<Array<{subjectId:string;stateJson:string;updatedAt:number}>>{
+export async function loadPredictiveStates(db:D1Database, kind:'path'|'profile'|'regime'|'harvest'):Promise<Array<{subjectId:string;stateJson:string;updatedAt:number}>>{
   await ensureSchema(db);
   const res=await db.prepare('SELECT subject_id,state_json,updated_at FROM predictive_state WHERE kind=?1 ORDER BY updated_at DESC LIMIT 64').bind(kind).all<{subject_id:string;state_json:string;updated_at:number}>();
   return (res.results ?? []).map(r=>({subjectId:r.subject_id,stateJson:r.state_json,updatedAt:r.updated_at}));
+}
+
+/**
+ * 2.16 — clean-IP harvest store. The AXR client `scan` runner probes real
+ * Cloudflare edge addresses from the local network and POSTs the survivors
+ * to the Worker; they are persisted here (capped) and unioned into the
+ * `clean_ip_hints` manifest field. One row: kind='harvest', subject_id
+ * ='clean_ips'. The JSON payload is `{ips: string[], updatedAt: number,
+ * sources: Record<string, number>}`.
+ */
+export interface CleanIPHarvestRow { ips: string[]; updatedAt: number; sources: Record<string, number>; }
+
+export async function loadCleanIPHarvest(db: D1Database): Promise<CleanIPHarvestRow | null> {
+  const rows = await loadPredictiveStates(db, 'harvest');
+  const row = rows.find((r) => r.subjectId === 'clean_ips');
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.stateJson) as CleanIPHarvestRow;
+    if (!Array.isArray(parsed.ips)) return null;
+    parsed.ips = parsed.ips.filter((x) => typeof x === 'string' && isIPv4ish(x));
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveCleanIPHarvest(db: D1Database, row: CleanIPHarvestRow): Promise<void> {
+  const ips = row.ips.filter((x) => isIPv4ish(x)).slice(0, 32);
+  const sources: Record<string, number> = {};
+  for (const [k, v] of Object.entries(row.sources ?? {})) {
+    if (typeof k === 'string' && k.length <= 48 && Number.isFinite(v)) sources[k] = v;
+  }
+  await savePredictiveState(db, {
+    kind: 'harvest',
+    subjectId: 'clean_ips',
+    stateJson: JSON.stringify({ ips, updatedAt: row.updatedAt, sources } satisfies CleanIPHarvestRow),
+    updatedAt: row.updatedAt,
+  });
+}
+
+function isIPv4ish(s: string): boolean {
+  if (!/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(s)) return false;
+  return s.split('.').every((o) => Number(o) <= 255);
 }
 
 export interface NetworkStateRow {

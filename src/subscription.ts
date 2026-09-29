@@ -11,7 +11,7 @@
 
 import { toBase64 } from './utils/crypto';
 import { GzUser, listUsers } from './db/users';
-import { loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadPolicySignalState, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState } from './db/store';
+import { loadAdaptiveGuardState, loadAdaptiveModel, loadCleanIPHarvest, loadNetworkState, loadPathHealth, loadPolicySignalState, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState } from './db/store';
 import { decideResilience, type PathObservation } from './ai/resilience';
 import { buildAdaptiveProtocolPlan } from './ai/protocol-controller';
 import { nextAdaptiveGuardState, reconcileAdaptivePlan } from './ai/adaptive-guard';
@@ -94,12 +94,24 @@ function originTemplates(capabilities: ProtocolCapability[], transports: readonl
  * bootstraps from. Aggregate server-side intelligence (regime, strategy,
  * probe mode, measured entry health, rotation windows) in one small JSON.
  * Authenticated by the same subscription bearer token; no payload data.
+ *
+ * 2.16 — v3: integrity + resilience fields
+ *   - `manifest_sig`: HMAC-SHA256 over a canonical string of the structural
+ *     fields, keyed by the user's subscription token. The client core
+ *     recomputes it and rejects a tampered/altered manifest (falling back to
+ *     its last-known-good copy). The shared test vector lives in
+ *     docs/AXR-V3-HYPER-RESILIENCE.md and in both test suites.
+ *   - `clean_ip_hints`: union of the operator's CLEAN_EDGE_IPS env and the
+ *     D1-persisted harvest (fed by the client `scan` runner via the
+ *     /api/network/harvest endpoint), capped at 16.
+ *   - `fronting_hint`: optional domestic-CDN relay host (FRONTING_RELAY_HOST
+ *     env) the client merges into its entry ladder.
  */
-export async function buildAxrManifest(host: string, user: { uuid: string }, env?: Env): Promise<string> {
+export async function buildAxrManifest(host: string, user: { uuid: string }, env?: Env, token?: string): Promise<string> {
   const db = env?.GZ_DB;
   const now = Date.now();
   const out: Record<string, unknown> = {
-    schema: 'gozargah-axr-manifest/v1',
+    schema: 'gozargah-axr-manifest/v3',
     version: VERSION,
     generated_at: now,
     host,
@@ -130,12 +142,13 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
   };
   if (db) {
     try {
-      const [ns, regimeRows, signal, settings, pathRows] = await Promise.all([
+      const [ns, regimeRows, signal, settings, pathRows, harvest] = await Promise.all([
         loadNetworkState(db),
         loadPredictiveStates(db, 'regime'),
         loadPolicySignalState(db),
         loadSettings(db),
         loadPathHealth(db),
+        loadCleanIPHarvest(db),
       ]);
       const regimeRow = regimeRows.find((r) => r.subjectId === 'global');
       if (regimeRow) {
@@ -171,7 +184,21 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
           { host: bh, role: 'backup', status: row ? (row.ok ? 'measured_ok' : 'measured_failed') : 'unmeasured', latency_ms: row?.latencyMs ?? null },
         ];
       }
+      // 2.16 — union operator env hints with D1-persisted harvested IPs.
+      if (harvest && harvest.ips.length > 0) {
+        const merged = [...cleanIpHints(env?.CLEAN_EDGE_IPS), ...harvest.ips.filter((ip) => !(out.clean_ip_hints as string[]).includes(ip))];
+        out.clean_ip_hints = merged.slice(0, 16);
+      }
     } catch { /* manifest stays minimal when D1 reads fail */ }
+  }
+  // 2.16 — domestic-CDN fronting hint (validated hostname only).
+  const fronting = frontingHint(env?.FRONTING_RELAY_HOST);
+  if (fronting) out.fronting_hint = fronting;
+  // 2.16 — manifest integrity: HMAC-SHA256 keyed by the subscription token.
+  if (token) {
+    try {
+      out.manifest_sig = await manifestSign(manifestCanonical(out), token);
+    } catch { /* signature is best-effort; the client treats absence as "v2, unverified" */ }
   }
   return JSON.stringify(out, null, 2);
 }
@@ -189,6 +216,58 @@ export function cleanIpHints(raw: string | undefined): string[] {
     if (out.length >= 8) break;
   }
   return out;
+}
+
+/** Validate FRONTING_RELAY_HOST into a bare lowercase hostname (or ''). */
+export function frontingHint(raw: string | undefined): string {
+  const h = (raw ?? '').trim().toLowerCase().replace(/^https?:\/\//, '').split('/')[0];
+  return /^[a-z0-9][a-z0-9.-]{2,252}$/.test(h) && h.includes('.') ? h : '';
+}
+
+/**
+ * Canonical string of the structural manifest fields, in a FIXED order,
+ * joined by '|'. The client core must build the same string from the
+ * parsed JSON before recomputing the HMAC. Fields covered: schema,
+ * version, host, ws_path_base, path_rotation_minutes, transports,
+ * entries (host:role, sorted), clean_ip_hints, fronting_hint,
+ * flow_profile.mode, reconnect.probe_interval_ms. Deliberately NOT
+ * covered: generated_at (time-dependent), honest_limit (display text),
+ * regime/network_state (server intelligence the client only observes).
+ */
+export function manifestCanonical(out: Record<string, unknown>): string {
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+  const num = (v: unknown): string => (typeof v === 'number' && Number.isFinite(v) ? String(v) : '');
+  const entries = Array.isArray(out.entries) ? (out.entries as Array<Record<string, unknown>>) : [];
+  const entryKeys = entries
+    .filter((e) => typeof e?.host === 'string' && typeof e?.role === 'string')
+    .map((e) => e.host as string + ':' + e.role as string)
+    .sort();
+  const transports = Array.isArray(out.transports) ? (out.transports as string[]) : [];
+  const hints = Array.isArray(out.clean_ip_hints) ? (out.clean_ip_hints as string[]) : [];
+  const flow = (typeof out.flow_profile === 'object' && out.flow_profile !== null ? out.flow_profile : {}) as Record<string, unknown>;
+  const reconnect = (typeof out.reconnect === 'object' && out.reconnect !== null ? out.reconnect : {}) as Record<string, unknown>;
+  return [
+    str(out.schema),
+    str(out.version),
+    str(out.host),
+    str(out.ws_path_base),
+    num(out.path_rotation_minutes),
+    transports.join(','),
+    entryKeys.join(','),
+    hints.join(','),
+    str(out.fronting_hint),
+    str(flow.mode),
+    num(reconnect.probe_interval_ms),
+  ].join('|');
+}
+
+/** HMAC-SHA256 hex over a UTF-8 canonical string, keyed by token. */
+export async function manifestSign(canonical: string, token: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(token), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(canonical));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 export function buildAdaptiveClientBundle(host: string, user: { uuid: string; trojanPass: string; name: string }, opts: BuildOpts | null | undefined, env?: Env, dnsUrl?: string): string {
