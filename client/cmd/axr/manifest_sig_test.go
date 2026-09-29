@@ -36,7 +36,10 @@ func TestCanonicalFromManifestMatchesVector(t *testing.T) {
 		},
 		CleanIPHints: []string{"104.16.13.37", "172.67.0.1"},
 		FlowProfile:  struct{ Mode string `json:"mode"` }{Mode: "web"},
-		Reconnect:    struct{ ProbeIntervalMS float64 `json:"probe_interval_ms"` }{ProbeIntervalMS: 90000},
+		Reconnect:    struct {
+			ProbeIntervalMS float64 `json:"probe_interval_ms"`
+			ProbeJitterMS   float64 `json:"probe_jitter_ms"`
+		}{ProbeIntervalMS: 90000},
 	}
 	if got := canonicalFromManifest(m); got != vectorCanonical {
 		t.Fatalf("canonical mismatch:\n got %q\n want %q", got, vectorCanonical)
@@ -60,7 +63,10 @@ func TestVerifyManifestSig(t *testing.T) {
 		},
 		CleanIPHints:    []string{"104.16.13.37", "172.67.0.1"},
 		FlowProfile:     struct{ Mode string `json:"mode"` }{Mode: "web"},
-		Reconnect:       struct{ ProbeIntervalMS float64 `json:"probe_interval_ms"` }{ProbeIntervalMS: 90000},
+		Reconnect: struct {
+			ProbeIntervalMS float64 `json:"probe_interval_ms"`
+			ProbeJitterMS   float64 `json:"probe_jitter_ms"`
+		}{ProbeIntervalMS: 90000},
 		ManifestSig:     vectorSig,
 	}
 	if valid, present := verifyManifestSig(m, vectorToken); !valid || !present {

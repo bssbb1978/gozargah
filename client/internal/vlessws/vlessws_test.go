@@ -41,11 +41,11 @@ func TestBuildVLESSHeaderIPv4(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h[28] != 0x01 {
-		t.Fatalf("atyp should be 1 for IPv4, got %d", h[28])
+	if h[21] != 0x01 {
+		t.Fatalf("atyp should be 1 for IPv4, got %d", h[21])
 	}
-	if !bytes.Equal(h[29:33], []byte{203, 0, 113, 7}) {
-		t.Fatalf("ipv4 addr mismatch: %x", h[29:33])
+	if !bytes.Equal(h[22:26], []byte{203, 0, 113, 7}) {
+		t.Fatalf("ipv4 addr mismatch: %x", h[22:26])
 	}
 }
 
@@ -54,8 +54,8 @@ func TestBuildVLESSHeaderIPv6(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h[28] != 0x03 {
-		t.Fatalf("atyp should be 3 for IPv6, got %d", h[28])
+	if h[21] != 0x03 {
+		t.Fatalf("atyp should be 3 for IPv6, got %d", h[21])
 	}
 	if len(h) != 1+16+1+1+2+1+16 {
 		t.Fatalf("ipv6 header length = %d", len(h))

@@ -73,7 +73,15 @@ func DefaultGap(rng Rng, min, max time.Duration) time.Duration {
 // occasional longer one); a uniform draw spreads mass evenly and is
 // statistically distinguishable. Deterministic for a given (rng) sequence.
 func SkewGap(rng Rng, min, max time.Duration) time.Duration {
-	if rng == nil || max <= min {
+	if rng == nil {
+		return min
+	}
+	// Degenerate/reversed bounds collapse to the smaller bound: a gap must
+	// never exceed the intended max even if a caller passes them swapped.
+	if max <= min {
+		if max < min {
+			return max
+		}
 		return min
 	}
 	u := rng()

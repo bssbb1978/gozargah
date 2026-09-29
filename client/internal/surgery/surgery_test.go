@@ -1,6 +1,7 @@
 package surgery
 
 import (
+	"io"
 	"math/rand"
 	"net"
 	"reflect"
@@ -9,31 +10,59 @@ import (
 	"time"
 )
 
-// recorder collects the write calls the server side sees.
+// recorder collects the write calls the fake server side sees,
+// SYNCHRONOUSLY: each Write() call on the returned conn is one recorded
+// segment — the same unit the TCP kernel would emit for a gapped burst
+// write. Synchronous recording keeps segment-count assertions deterministic
+// (no pipe coalescing, no async-reader races).
 type recorder struct {
 	mu     sync.Mutex
 	writes [][]byte
+	closed chan struct{}
+	once   sync.Once
 }
 
+// recConn is the fake net.Conn handed to the code under test.
+type recConn struct{ r *recorder }
+
+type fakeNetAddr string
+
+func (a fakeNetAddr) Network() string { return "pipe" }
+func (a fakeNetAddr) String() string  { return string(a) }
+
+func (c *recConn) Read(b []byte) (int, error) {
+	<-c.r.closed
+	return 0, io.EOF
+}
+
+func (c *recConn) Write(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	c.r.mu.Lock()
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	c.r.writes = append(c.r.writes, cp)
+	c.r.mu.Unlock()
+	return len(b), nil
+}
+
+func (c *recConn) Close() error {
+	c.r.once.Do(func() { close(c.r.closed) })
+	return nil
+}
+
+func (c *recConn) LocalAddr() net.Addr  { return fakeNetAddr("rec-local") }
+func (c *recConn) RemoteAddr() net.Addr { return fakeNetAddr("rec-remote") }
+func (c *recConn) SetDeadline(time.Time) error {
+	return nil
+}
+func (c *recConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *recConn) SetWriteDeadline(time.Time) error { return nil }
+
 func (r *recorder) start() net.Conn {
-	a, b := net.Pipe()
-	go func() {
-		buf := make([]byte, 65536)
-		for {
-			n, err := b.Read(buf)
-			if n > 0 {
-				r.mu.Lock()
-				cp := make([]byte, n)
-				copy(cp, buf[:n])
-				r.writes = append(r.writes, cp)
-				r.mu.Unlock()
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-	return a
+	r.closed = make(chan struct{})
+	return &recConn{r: r}
 }
 
 func (r *recorder) total() int {
@@ -429,8 +458,9 @@ func TestMultiSplitV2SmallWriteKeepsBudget(t *testing.T) {
 	if n, err := m.Write(big); err != nil || n != 1500 {
 		t.Fatalf("big write: n=%d err=%v", n, err)
 	}
-	if r.count() != 2 {
-		t.Fatalf("big write must still split (budget kept), got %d total writes", r.count())
+	// small (1 passthrough write) + big (cuts=1 => 2 segments) = 3 writes.
+	if r.count() != 3 {
+		t.Fatalf("small(1)+big(2 segments)=3 writes expected, got %d total", r.count())
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -159,11 +160,14 @@ func TestReports(t *testing.T) {
 // fakeProber lets the orchestration run network-free.
 type fakeProber struct {
 	good map[string]bool
+	mu   sync.Mutex // ProbeIP is called concurrently by Run's goroutines
 	seen []string
 }
 
 func (f *fakeProber) ProbeIP(_ context.Context, ip string, opts Options) ProbeResult {
+	f.mu.Lock()
 	f.seen = append(f.seen, ip)
+	f.mu.Unlock()
 	res := ProbeResult{IP: ip, Attempts: opts.Attempts}
 	if f.good[ip] {
 		res.OK = true
