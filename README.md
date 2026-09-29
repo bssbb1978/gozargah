@@ -1,4 +1,28 @@
-# Gozargah 2.13.0 — Hardened Dynamic Layer: Fingerprint Rotation, In-Tunnel Shaping & Aggressive Probing
+# Gozargah 2.14.0 — AXR Protocol Framework: Native Client Core + Machine Feed
+
+## 2.14.0 — AXR Protocol Framework
+
+### Highlights
+- **AXR native client core (Go, `client/`)** — a production SOCKS5 TCP inbound that tunnels every stream over a **bandit-selected VLESS-over-WebSocket** path. All TLS-identity morphing and ClientHello surgery is **client-side** (TLS terminates at the Cloudflare edge — the Worker never sees the ClientHello).
+  - **M1 decision core** (`internal/bandit` + `internal/measure`): a zero-dependency contextual **UCB1** learner over (host, transport, fingerprint) arms with throughput-stability + RTT reward shaping, quarantine backoff, and **auto-prune** of degraded arms (always ≥ 2 live). A deterministic state vector — RTT/jitter EWMA, RST & TLS-timeout rates, CUSUM step-change, HTTP anomaly codes — drives a regime label (`stable|watch|suspected_change|recovering`) that boosts exploration ×1.8 during suspected change.
+  - **M2 low-level surgery** (`internal/surgery`): the TLS **ClientHello is split into two TCP segments** at a randomized offset (25–85 % of the record, bias crossing the SNI extensions block) with a randomized 20–120 ms gap; post-handshake writes are **TCP-chunked** in randomized 512–1400 B pieces. uTLS identity rotation (`chrome/firefox/safari/randomized`) via the single pinned dependency `refraction-networking/utls v1.6.7`, opt-in with `-tags axr_utls` (default build is 100 % stdlib).
+  - **M3 national-intranet failover** (`internal/failover`): an endpoint matrix (host × clean-IP × transport × fp) with a **persistent routing cache** and live per-IP health, a `normal⇄aggressive` probe state machine (2 all-fail rounds → aggressive cadence), and instant zero-control-plane failover ordered by bandit score then IP health.
+  - **M4 Worker edge relay** (existing): zero-copy WS/chunked streaming, multi-domain routing, 0-RTT VLESS early data, dynamic fallback responses — now plus a new machine feed (below).
+- **AXR machine feed (Worker, 2.14 new)** — `GET /{subPath}/{token}/axr-manifest` returns `gozargah-axr-manifest/v1`: rotated WS path base, fingerprint window, regime/strategy/probe mode, network state, measured entry ladder (primary + backups), reconnect cadence (30 s in recovery), and an explicit `honest_limit`. Aggregate intelligence only; authenticated by the subscription token; unknown tokens fall through to the stealth landing.
+- **Native VLESS-WS tunnel** (`internal/vlessws`): VLESS v1 header byte-compatible with the Worker parser; 0-RTT early data via `Sec-WebSocket-Protocol` (the mechanism the Worker already consumes); full RFC 6455 client codec (mask, ping→pong, close, fragmentation).
+
+### Honest platform boundary (unchanged, restated)
+The client core is transport obfuscation and adaptive path selection — **not** payload inspection, **not** a DPI "detector", and **not** a bypass guarantee: its regime labels describe the client's own delivery quality. Post-handshake fragmentation is **TCP-level chunking**, not TLS record padding. The core is TCP-only (SOCKS5 CONNECT; UDP rejected, matching the no-UDP-relay boundary). And a fully cut route — no path from the user's network to any entry — cannot be created by client or Worker code; the core reports `no healthy candidate` instead of looping.
+
+### Verification status
+Worker side: `npm run typecheck`, `npm test` (36 engine checks + 9 pure-logic suites + 16 integration tests), and `npm run build` all pass (504.35 KiB / 131.51 KiB gzip). Go core: complete source + unit tests with a pinned `go.mod`, **not compiled in the authoring sandbox** (no Go toolchain) — the deploy gate is `go vet && go build && go test` per [AXR-DEPLOY](docs/AXR-DEPLOY.md).
+
+### Engineering documents
+- [AXR Protocol Specification](docs/AXR-SPEC.md)
+- [AXR Cross-Compile & Deploy Guide](docs/AXR-DEPLOY.md)
+- [Client Core README](client/README.md)
+- [Test Report 2.14.0](TEST-REPORT-2.14.0.md)
+- [Persian Upgrade Report 2.14.0](UPGRADE-REPORT-FA-2.14.0.md)
 
 ## 2.13.0 — Hardened dynamic layer
 

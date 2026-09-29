@@ -1,0 +1,485 @@
+// Package failover is the AXR national-intranet failover engine:
+//
+//   - a client-side endpoint matrix (host × explicit clean-IP × transport × fp)
+//   - a persistent local routing cache with live per-IP health (atomic JSON)
+//   - a probing state machine (normal | aggressive) that mirrors the worker's
+//     probe cadence but runs CLIENT-side, because only the client knows which
+//     IP its own network can actually reach
+//   - a deterministic failover order: bandit-score first, health-score tiebreak
+//
+// Honest boundary: probe outcomes are connectivity/latency measurements made
+// by the client on its own network. A probe success proves "this IP is
+// reachable from here right now"; it is not a statement about what any
+// middlebox is doing. If no candidate is reachable, the engine says so
+// instead of pretending.
+package failover
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"math"
+	"net"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"time"
+)
+
+// Endpoint is one candidate entry path.
+type Endpoint struct {
+	Host      string   `json:"host"`
+	IPs       []string `json:"ips,omitempty"` // explicit clean edge IPs (operator list)
+	Transport string   `json:"transport"`
+	FP        string   `json:"fp"`
+	Priority  int      `json:"priority"` // lower = preferred
+}
+
+// IPHealth is the live health record for one (endpoint, dial-address).
+type IPHealth struct {
+	DialAddr     string  `json:"dial_addr"` // ip:443 or host:443
+	RTTMS        float64 `json:"rtt_ms"`
+	Score        float64 `json:"score"`    // 0..1 composite health
+	ConsecFail   int     `json:"consec_fail"`
+	ConsecOK     int     `json:"consec_ok"`
+	LastOKMS     int64   `json:"last_ok_ms"`
+	LastErr      string  `json:"last_err"`
+}
+
+// Cache is the persistable routing cache.
+type Cache struct {
+	UpdatedAtMS int64                 `json:"updated_at_ms"`
+	Health      map[string]*IPHealth  `json:"health"` // key: host|dialaddr
+}
+
+// ProbeFunc performs one connectivity probe and reports latency.
+// Implementations must respect the given deadline.
+type ProbeFunc func(endpoint Endpoint, dialAddr string, timeout time.Duration) (ok bool, rttMS float64, errClass string)
+
+// Engine is the failover state machine. Safe for concurrent use.
+type Engine struct {
+	mu      sync.Mutex
+	entries []Endpoint
+	cache   *Cache
+	probe   ProbeFunc
+	state   string // "normal" | "aggressive"
+	// failure streak that triggers aggressive mode
+	streak int
+}
+
+const (
+	StateNormal    = "normal"
+	StateAggressive = "aggressive"
+
+	// Aggressive mode triggers after this many consecutive engine-level
+	// failures (every candidate in a round failed).
+	aggressiveStreak = 2
+	// In aggressive mode the probe timeout is relaxed (deep-packet paths
+	// answer slowly) and the candidate cap is raised.
+	normalProbeTimeout  = 3 * time.Second
+	aggressiveTimeout   = 5 * time.Second
+	normalCandidateCap  = 3
+	aggressiveCandidateCap = 6
+
+	// health scoring
+	healthOKBase   = 1.0
+	healthDecay    = 0.6 // per consecutive failure
+	healthRTTFloor = 0.25 // 400ms+ RTT starts costing score
+	healthRTTMax   = 400.0
+)
+
+// New builds an engine. probe may be nil (then the built-in TCP+TLS-dial
+// probe is used by ProbeAll).
+func New(entries []Endpoint, probe ProbeFunc) *Engine {
+	if len(entries) == 0 {
+		panic("failover.New: no entries")
+	}
+	e := &Engine{
+		entries: entries,
+		cache:   &Cache{Health: map[string]*IPHealth{}},
+		probe:   probe,
+		state:   StateNormal,
+	}
+	// Sort by priority, then host, for deterministic baseline order.
+	sort.SliceStable(e.entries, func(i, j int) bool {
+		if e.entries[i].Priority != e.entries[j].Priority {
+			return e.entries[i].Priority < e.entries[j].Priority
+		}
+		return e.entries[i].Host < e.entries[j].Host
+	})
+	return e
+}
+
+// LoadCache restores a persisted routing cache.
+func (e *Engine) LoadCache(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var c Cache
+	if err := json.Unmarshal(data, &c); err != nil {
+		return err
+	}
+	if c.Health == nil {
+		c.Health = map[string]*IPHealth{}
+	}
+	e.mu.Lock()
+	e.cache = &c
+	e.mu.Unlock()
+	return nil
+}
+
+// SaveCache persists the routing cache atomically.
+func (e *Engine) SaveCache(path string) error {
+	e.mu.Lock()
+	c := *e.cache
+	c.Health = make(map[string]*IPHealth, len(e.cache.Health))
+	for k, v := range e.cache.Health {
+		cp := *v
+		c.Health[k] = &cp
+	}
+	c.UpdatedAtMS = time.Now().UnixMilli()
+	e.mu.Unlock()
+	data, err := json.MarshalIndent(&c, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".axr-cache-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
+}
+
+// AddEntry registers a new endpoint (e.g. from a refreshed manifest).
+func (e *Engine) AddEntry(ep Endpoint) {
+	if ep.Transport == "" {
+		ep.Transport = "ws"
+	}
+	if ep.FP == "" {
+		ep.FP = "chrome"
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i, cur := range e.entries {
+		if cur.Host == ep.Host && cur.Transport == ep.Transport {
+			e.entries[i] = ep
+			return
+		}
+	}
+	e.entries = append(e.entries, ep)
+}
+
+// Entries returns a copy of the matrix.
+func (e *Engine) Entries() []Endpoint {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]Endpoint, len(e.entries))
+	copy(out, e.entries)
+	return out
+}
+
+// State is the probe state-machine mode.
+func (e *Engine) State() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.state
+}
+
+// CandidatesFor returns the dial-address candidates for an endpoint, best
+// health first: explicit IPs first (health order), then the bare hostname.
+// Unknown health (fresh) scores 0.5, so it ranks below healthy but above
+// known-dead.
+func (e *Engine) CandidatesFor(ep Endpoint) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cs := e.candidatesForLocked(ep)
+	addrs := make([]string, len(cs))
+	for i, c := range cs {
+		addrs[i] = c.addr
+	}
+	return addrs
+}
+
+// Candidate is one (endpoint, dial-address) pair ordered for failover.
+type Candidate struct {
+	Endpoint Endpoint
+	DialAddr string
+	Score    float64
+}
+
+// FailoverOrder returns the global ordered candidate list, capped per mode.
+// orderFn (usually the bandit score for the arm) ranks endpoints; within an
+// endpoint, health ranks dial addresses.
+func (e *Engine) FailoverOrder(orderFn func(Arm) float64) []Candidate {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cap := normalCandidateCap
+	if e.state == StateAggressive {
+		cap = aggressiveCandidateCap
+	}
+	type epRank struct {
+		ep    Endpoint
+		score float64
+	}
+	var ranks []epRank
+	for _, ep := range e.entries {
+		var s float64
+		if orderFn != nil {
+			s = orderFn(Arm{Host: ep.Host, Transport: ep.Transport, FP: ep.FP})
+		} else {
+			s = float64(-ep.Priority)
+		}
+		ranks = append(ranks, epRank{ep: ep, score: s})
+	}
+	sort.SliceStable(ranks, func(i, j int) bool {
+		if ranks[i].score != ranks[j].score {
+			return ranks[i].score > ranks[j].score
+		}
+		return ranks[i].ep.Host < ranks[j].ep.Host
+	})
+	var out []Candidate
+	for _, r := range ranks {
+		addrs := e.candidatesForLocked(r.ep)
+		for _, a := range addrs {
+			if len(out) >= cap {
+				return out
+			}
+			out = append(out, Candidate{Endpoint: r.ep, DialAddr: a.addr, Score: a.score})
+		}
+	}
+	return out
+}
+
+type cand struct {
+	addr  string
+	score float64
+}
+
+func (e *Engine) candidatesForLocked(ep Endpoint) []cand {
+	var out []cand
+	add := func(addr string) {
+		h, ok := e.cache.Health[ep.Host+"|"+addr]
+		if !ok {
+			out = append(out, cand{addr: addr, score: 0.5})
+			return
+		}
+		out = append(out, cand{addr: addr, score: h.Score})
+	}
+	for _, ip := range ep.IPs {
+		add(ip + ":443")
+	}
+	add(ep.Host + ":443")
+	sort.SliceStable(out, func(i, j int) bool { return out[i].score > out[j].score })
+	return out
+}
+
+// Arm is the minimal arm shape FailoverOrder orders on (avoids importing
+// the bandit package; structurally compatible).
+type Arm struct {
+	Host      string
+	Transport string
+	FP        string
+}
+
+// ProbeRound runs one probe sweep over the current failover order and
+// records health. Returns the candidates that came back healthy, in order.
+func (e *Engine) ProbeRound(now time.Time) []Candidate {
+	e.mu.Lock()
+	state := e.state
+	e.mu.Unlock()
+	timeout := normalProbeTimeout
+	if state == StateAggressive {
+		timeout = aggressiveTimeout
+	}
+	probe := e.probe
+	if probe == nil {
+		probe = DefaultProbe
+	}
+	order := e.FailoverOrder(nil)
+	var healthy []Candidate
+	anyOK := false
+	for _, c := range order {
+		ok, rtt, errClass := probe(c.Endpoint, c.DialAddr, timeout)
+		e.observe(c.Endpoint, c.DialAddr, ok, rtt, errClass, now)
+		if ok {
+			anyOK = true
+			healthy = append(healthy, c)
+			break // one healthy candidate per round is enough for routing
+		}
+	}
+	e.stepRound(anyOK)
+	return healthy
+}
+
+// Observe feeds a real traffic outcome (not just probes) into the cache and
+// the state machine.
+func (e *Engine) Observe(ep Endpoint, dialAddr string, ok bool, rttMS float64, errClass string, now time.Time) {
+	e.observe(ep, dialAddr, ok, rttMS, errClass, now)
+	e.stepRound(ok)
+}
+
+func (e *Engine) observe(ep Endpoint, dialAddr string, ok bool, rttMS float64, errClass string, now time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	key := ep.Host + "|" + dialAddr
+	h, exists := e.cache.Health[key]
+	if !exists {
+		h = &IPHealth{DialAddr: dialAddr}
+		e.cache.Health[key] = h
+	}
+	if ok {
+		h.ConsecOK++
+		h.ConsecFail = 0
+		h.LastOKMS = now.UnixMilli()
+		h.LastErr = ""
+		if rttMS > 0 {
+			if h.RTTMS == 0 {
+				h.RTTMS = rttMS
+			} else {
+				h.RTTMS = 0.7*h.RTTMS + 0.3*rttMS
+			}
+		}
+		score := healthOKBase
+		if h.RTTMS > healthRTTMax {
+			pen := (h.RTTMS - healthRTTMax) / healthRTTMax
+			if pen > 1 {
+				pen = 1
+			}
+			score -= healthRTTFloor * pen
+		}
+		h.Score = math.Min(1.0, math.Max(0, score))
+	} else {
+		h.ConsecFail++
+		h.ConsecOK = 0
+		h.LastErr = errClass
+		h.Score *= healthDecay
+		if h.Score < 0.001 {
+			h.Score = 0
+		}
+	}
+	e.cache.UpdatedAtMS = now.UnixMilli()
+}
+
+// stepRound updates the probe state machine after a candidate-level outcome.
+func (e *Engine) stepRound(ok bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if ok {
+		e.streak = 0
+		if e.state == StateAggressive {
+			e.state = StateNormal
+		}
+		return
+	}
+	e.streak++
+	if e.streak >= aggressiveStreak && e.state == StateNormal {
+		e.state = StateAggressive
+	}
+}
+
+// Health exports a copy of the cache (for the local decision view/tests).
+func (e *Engine) Health() map[string]IPHealth {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[string]IPHealth, len(e.cache.Health))
+	for k, v := range e.cache.Health {
+		out[k] = *v
+	}
+	return out
+}
+
+// DefaultProbe does a TCP dial + TLS handshake to dialAddr with ServerName
+// set to the endpoint host, and reports the handshake RTT. It never sends
+// application data.
+func DefaultProbe(ep Endpoint, dialAddr string, timeout time.Duration) (bool, float64, string) {
+	start := time.Now()
+	d, err := net.DialTimeout("tcp", dialAddr, timeout)
+	if err != nil {
+		return false, 0, classifyErr(err)
+	}
+	_ = d.SetDeadline(time.Now().Add(timeout))
+	conn, err := tlsDial(d, ep.Host, timeout-time.Since(start))
+	if err != nil {
+		d.Close()
+		return false, 0, classifyErr(err)
+	}
+	rtt := time.Since(start).Seconds() * 1000
+	conn.Close()
+	return true, rtt, ""
+}
+
+// tlsDial completes a TLS handshake over the already-dialed conn, verifying
+// the certificate against the endpoint hostname (even when dialing an
+// explicit IP). It is probe-only: no application data is exchanged.
+func tlsDial(conn net.Conn, host string, remaining time.Duration) (net.Conn, error) {
+	if remaining <= 0 {
+		remaining = time.Second
+	}
+	cfg := &tls.Config{
+		ServerName:         host,
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: false,
+	}
+	tc := tls.Client(conn, cfg)
+	deadline := time.Now().Add(remaining)
+	_ = tc.SetDeadline(deadline)
+	if err := tc.HandshakeContext(context.Background()); err != nil {
+		return nil, err
+	}
+	_ = tc.SetDeadline(time.Time{})
+	return tc, nil
+}
+
+func classifyErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	msg := err.Error()
+	if len(msg) > 64 {
+		msg = msg[:64]
+	}
+	return "dial_error:" + msg
+}
+
+// ErrNoHealthy is returned when a probe round found nothing reachable.
+var ErrNoHealthy = errors.New("failover: no healthy candidate")
+
+// Best returns the single best candidate right now (cache-driven), without
+// probing.
+func (e *Engine) Best(orderFn func(Arm) float64) (Candidate, error) {
+	order := e.FailoverOrder(orderFn)
+	for _, c := range order {
+		if c.Score > 0.05 {
+			return c, nil
+		}
+	}
+	if len(order) > 0 {
+		// Nothing known-healthy: still return the top so the caller can try.
+		return order[0], nil
+	}
+	return Candidate{}, ErrNoHealthy
+}

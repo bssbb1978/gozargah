@@ -268,4 +268,34 @@ describe('Cloudflare Worker + D1 integration', () => {
     });
     expect(response.status).toBe(401);
   });
+
+  it('serves the AXR machine feed with bootstrap fields for a known token', async () => {
+    const user = await createUser(db, { name: 'AXR manifest', quotaBytes: 0, expiryAt: 0 });
+    const token = await subTokenFor('gozargah.test', user.uuid);
+    const endpoint = `https://gozargah.test/sub/${token}/axr-manifest`;
+    const response = await mf.dispatchFetch(endpoint);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('json');
+    const manifest = (await response.json()) as {
+      schema: string;
+      host: string;
+      ws_path_base: string;
+      fingerprint: { neutral_set: string[] };
+      entries: Array<Record<string, unknown>>;
+      reconnect: { probe_interval_ms: number };
+    };
+    expect(manifest.schema).toBe('gozargah-axr-manifest/v1');
+    expect(manifest.host).toBe('gozargah.test');
+    expect(typeof manifest.ws_path_base).toBe('string');
+    expect(manifest.fingerprint.neutral_set).toContain('chrome');
+    expect(Array.isArray(manifest.entries)).toBe(true);
+    expect(manifest.entries[0]).toMatchObject({ host: 'gozargah.test', role: 'primary' });
+    expect(typeof manifest.reconnect.probe_interval_ms).toBe('number');
+  });
+
+  it('returns the stealth landing for an unknown token on the AXR feed path', async () => {
+    const response = await mf.dispatchFetch('https://gozargah.test/sub/unknown-token-abc/axr-manifest');
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/html');
+  });
 });

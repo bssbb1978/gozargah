@@ -11,7 +11,7 @@
 
 import { toBase64 } from './utils/crypto';
 import { GzUser, listUsers } from './db/users';
-import { loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState } from './db/store';
+import { loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadPolicySignalState, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState } from './db/store';
 import { decideResilience, type PathObservation } from './ai/resilience';
 import { buildAdaptiveProtocolPlan } from './ai/protocol-controller';
 import { nextAdaptiveGuardState, reconcileAdaptivePlan } from './ai/adaptive-guard';
@@ -87,6 +87,80 @@ function originTemplates(capabilities: ProtocolCapability[], transports: readonl
   if (canGenerate('vless', 'grpc')) templates.vless_grpc = { protocol: 'vless', transport: 'grpc', server: host, port, id: uuid, tls, alpn: ['h2'], service_name: 'g' };
   if (canGenerate('vless', 'httpupgrade')) templates.vless_httpupgrade = { protocol: 'vless', transport: 'httpupgrade', server: host, port, id: uuid, tls, alpn: ['http/1.1'], path };
   return templates;
+}
+
+/**
+ * 2.14 — AXR client manifest: the machine-readable feed the native AXR core
+ * bootstraps from. Aggregate server-side intelligence (regime, strategy,
+ * probe mode, measured entry health, rotation windows) in one small JSON.
+ * Authenticated by the same subscription bearer token; no payload data.
+ */
+export async function buildAxrManifest(host: string, user: { uuid: string }, env?: Env): Promise<string> {
+  const db = env?.GZ_DB;
+  const now = Date.now();
+  const out: Record<string, unknown> = {
+    schema: 'gozargah-axr-manifest/v1',
+    version: VERSION,
+    generated_at: now,
+    host,
+    ws_path_base: rotatedPathBase(user.uuid),
+    path_rotation_minutes: PATH_ROTATION_WINDOW_MS / 60_000,
+    fingerprint: {
+      rotation_minutes: 360,
+      current: fpFor({}, user.uuid),
+      neutral_set: [...NEUTRAL_FINGERPRINTS],
+      note: 'Client-side uTLS identity the generated identity window selects; TLS terminates at the edge.',
+    },
+    traffic_shape: { mode: shapeModeFor(env?.TRAFFIC_SHAPE) },
+    reconnect: {
+      strategy: 'observe_and_failover',
+      probe_interval_ms: 90_000,
+      backoff_ms: [1000, 2000, 5000, 15000, 30000],
+      on_route_reopen: 'immediate_resume',
+    },
+    entries: [{ host, role: 'primary', status: 'primary', latency_ms: null }],
+    honest_limit: {
+      en: 'Aggregate server-side statistics only. Not DPI detection; no bypass guaranteed; a fully cut route cannot be restored from inside the Worker.',
+      fa: 'فقط آمار تجمیعی سمت Worker است؛ تشخیص DPI نیست، عبور تضمین‌شده نیست و در قطع کامل مسیر، از راه دور قابل‌رفع نیست.',
+    },
+  };
+  if (db) {
+    try {
+      const [ns, regimeRows, signal, settings, pathRows] = await Promise.all([
+        loadNetworkState(db),
+        loadPredictiveStates(db, 'regime'),
+        loadPolicySignalState(db),
+        loadSettings(db),
+        loadPathHealth(db),
+      ]);
+      const regimeRow = regimeRows.find((r) => r.subjectId === 'global');
+      if (regimeRow) {
+        const parsed = JSON.parse(regimeRow.stateJson) as RegimeAssessment;
+        out.regime = { state: parsed.state, confidence: parsed.confidence, recent_success: parsed.recentSuccess, baseline_success: parsed.baselineSuccess };
+      }
+      if (ns) {
+        out.network_state = { state: ns.state, updated_at: ns.updatedAt };
+        if (ns.state === 'recovery' || ns.state === 'no_healthy_path') {
+          (out.reconnect as Record<string, unknown>).probe_interval_ms = 30_000;
+        }
+      }
+      if (signal) {
+        try {
+          const sig = JSON.parse(signal.stateJson) as Record<string, unknown>;
+          if (typeof sig.strategy === 'string') out.strategy = sig.strategy;
+          if (sig.probeMode === 'aggressive') out.probe_mode = 'aggressive';
+        } catch { /* optional */ }
+      }
+      for (const bh of (settings?.backupEntryHosts ?? []).slice(0, 4)) {
+        const row = pathRows.find((r) => r.pathId === 'entry:' + bh);
+        out.entries = [
+          ...(out.entries as Array<Record<string, unknown>>),
+          { host: bh, role: 'backup', status: row ? (row.ok ? 'measured_ok' : 'measured_failed') : 'unmeasured', latency_ms: row?.latencyMs ?? null },
+        ];
+      }
+    } catch { /* manifest stays minimal when D1 reads fail */ }
+  }
+  return JSON.stringify(out, null, 2);
 }
 
 export function buildAdaptiveClientBundle(host: string, user: { uuid: string; trojanPass: string; name: string }, opts: BuildOpts | null | undefined, env?: Env, dnsUrl?: string): string {
