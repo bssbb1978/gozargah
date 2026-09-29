@@ -8,7 +8,7 @@ import { Env, GzError, VERSION } from '../config';
 import { EffectiveSettings } from '../settings';
 import {
   addEvent, recentEvents, saveSettings, SettingsBlob, loadSettings, invalidateCache,
-  consumeAiDiagnosticQuota, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState,
+  consumeAiDiagnosticQuota, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState, saveHealthSample, loadLatestPathSamples,
 } from '../db/store';
 import {
   createUser, deleteUser, GzUser, invalidateUsers, listUsers, updateUser, flushUsage,
@@ -27,6 +27,7 @@ import { decideAdaptiveProfile } from '../ai/edge-brain';
 import { buildAdaptiveProtocolPlan } from '../ai/protocol-controller';
 import { assessHealth } from '../ai/predictive-mesh';
 import { defaultEdgeLearner, learnerConfidence } from '../ai/edge-learner';
+import { classifyFailureDomain, classifyNetworkCondition, normalizeFetchFailure } from '../ai/network-intelligence';
 
 const JSON_CT = 'application/json; charset=utf-8';
 
@@ -111,8 +112,56 @@ export async function handlePanelApi(
 
     if (action === 'network/state' && method === 'GET') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
-      const state = await loadNetworkState(db);
-      return json({ ok: true, state, source: 'configured-path telemetry only', internationalOutageProven: false, dpiProven: false, interpretation: 'observational-signal-only' });
+      const [state, paths, settings] = await Promise.all([loadNetworkState(db), loadPathHealth(db), loadSettings(db)]);
+      const configuredPaths = settings?.proxyIPs ?? eff.proxyIPs;
+      const samples = await loadLatestPathSamples(db, configuredPaths);
+      const pathById = new Map(paths.map((row) => [row.pathId, row]));
+      const sourceByKind = {
+        path_tcp: 'WORKER_TCP',
+        path_dial: 'WORKER_SOCKET_DIAL',
+        path_https: 'WORKER_HTTPS_HEAD',
+        path: 'WORKER_LEGACY_UNSPECIFIED',
+      } as const;
+      const observations = samples.map((sample) => {
+        const row = pathById.get(sample.subjectId);
+        return {
+          pathId: sample.subjectId,
+          source: sourceByKind[sample.kind],
+          ok: sample.ok,
+          checkedAt: sample.ts,
+          latencyMs: sample.latencyMs,
+          failures: row?.failures ?? 0,
+          successes: row?.successes ?? 0,
+          consecutiveFailures: row?.consecutiveFailures ?? 0,
+          lastError: row?.checkedAt === sample.ts ? row.lastError : '',
+        };
+      });
+      const sampledPaths = new Set(observations.map((row) => row.pathId));
+      for (const row of paths) {
+        if (configuredPaths.includes(row.pathId) && !sampledPaths.has(row.pathId) && row.checkedAt > 0) {
+          observations.push({
+            pathId: row.pathId,
+            source: 'WORKER_LEGACY_UNSPECIFIED',
+            ok: row.ok,
+            checkedAt: row.checkedAt,
+            latencyMs: row.latencyMs,
+            failures: row.failures,
+            successes: row.successes,
+            consecutiveFailures: row.consecutiveFailures ?? 0,
+            lastError: row.lastError ?? '',
+          });
+        }
+      }
+      const condition = classifyNetworkCondition(configuredPaths, observations);
+      return json({
+        ok: true,
+        state,
+        condition,
+        source: 'configured Worker-egress path telemetry only',
+        physicalUpstreamDisconnectionProven: false,
+        dpiProven: false,
+        interpretation: 'observational-signal-only',
+      });
     }
 
     if (action === 'network/brain' && method === 'GET') {
@@ -230,17 +279,26 @@ export async function handlePanelApi(
       if (!allowed.has(parsed.hostname)) throw new GzError('probe target is not configured', 'validation');
       const started = Date.now();
       let ok = false;
+      let lastError = '';
+      let httpStatus: number | null = null;
       try {
-        const r = await fetch(parsed.toString(), { method:'HEAD', redirect:'error', signal:AbortSignal.timeout(5000) });
-        ok = r.ok;
-      } catch { ok = false; }
+        const response = await fetch(parsed.toString(), { method:'HEAD', redirect:'error', signal:AbortSignal.timeout(5000) });
+        ok = response.ok;
+        httpStatus = response.status;
+        if (!ok) lastError = 'http_failure:' + response.status;
+      } catch (error) {
+        lastError = normalizeFetchFailure(error);
+      }
       const latencyMs = Date.now() - started;
       const previous = (await loadPathHealth(db)).find(r => r.pathId === parsed.hostname);
-      const next = updateObservation(previous ? { id:previous.pathId, latencyMs:previous.latencyMs, ok:previous.ok, checkedAt:previous.checkedAt, failures:previous.failures, successes:previous.successes, quarantineUntil:previous.quarantineUntil, consecutiveFailures:previous.consecutiveFailures, consecutiveSuccesses:previous.consecutiveSuccesses, lastError:previous.lastError } : undefined, ok, latencyMs);
+      const next = updateObservation(previous ? { id:previous.pathId, latencyMs:previous.latencyMs, ok:previous.ok, checkedAt:previous.checkedAt, failures:previous.failures, successes:previous.successes, quarantineUntil:previous.quarantineUntil, consecutiveFailures:previous.consecutiveFailures, consecutiveSuccesses:previous.consecutiveSuccesses, lastError:previous.lastError } : undefined, ok, latencyMs, Date.now(), lastError);
       next.id = parsed.hostname;
-      await savePathHealth(db, { pathId:next.id, latencyMs:next.latencyMs, ok:next.ok, failures:next.failures, successes:next.successes, quarantineUntil:next.quarantineUntil, checkedAt:next.checkedAt, consecutiveFailures:next.consecutiveFailures, consecutiveSuccesses:next.consecutiveSuccesses, lastError: ok ? '' : 'probe_failed' });
+      await saveHealthSample(db, { kind: 'path_https', subjectId: next.id, ts: next.checkedAt, ok, latencyMs });
+      await savePathHealth(db, { pathId:next.id, latencyMs:next.latencyMs, ok:next.ok, failures:next.failures, successes:next.successes, quarantineUntil:next.quarantineUntil, checkedAt:next.checkedAt, consecutiveFailures:next.consecutiveFailures, consecutiveSuccesses:next.consecutiveSuccesses, lastError: ok ? '' : lastError });
       const decision = decideResilience(await loadPathHealth(db).then(rows => rows.map(r => ({ id:r.pathId, latencyMs:r.latencyMs, ok:r.ok, checkedAt:r.checkedAt, failures:r.failures, successes:r.successes, quarantineUntil:r.quarantineUntil, consecutiveFailures:r.consecutiveFailures, consecutiveSuccesses:r.consecutiveSuccesses, lastError:r.lastError }))));
-      return json({ ok, latencyMs, decision });
+      const failureDomain = ok ? null : classifyFailureDomain(lastError);
+      await addEvent(db, 'network_probe', JSON.stringify({ host: parsed.hostname, ok, latencyMs, httpStatus, failureDomain }).slice(0, 1000));
+      return json({ ok, latencyMs, httpStatus, failureDomain, decision, probeScope: 'HTTPS_HEAD_FROM_WORKER_EGRESS' });
     }
 
     if (action === 'ai/diagnostics' && method === 'POST') {

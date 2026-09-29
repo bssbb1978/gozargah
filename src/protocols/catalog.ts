@@ -1,9 +1,10 @@
 /**
- * Gozargah — protocol/transport capability catalog.
+ * Conservative protocol/transport capability registry.
  *
- * The Worker is the HTTP/WebSocket control/data-plane edge. Protocols that
- * require native UDP (for example WireGuard/Hysteria2) are advertised as
- * origin-engine capabilities until an actual UDP-capable engine is configured.
+ * A row is generatable only when this repository has a matching profile
+ * template. Merely setting ORIGIN_ENGINE_HOST is not a health check: origin
+ * rows remain explicitly marked declared-but-unverified. UDP-only protocols
+ * are unsupported here until a real UDP adapter and generator are installed.
  */
 
 export type ProxyProtocol =
@@ -17,6 +18,7 @@ export type ProxyProtocol =
 
 export type Transport =
   | 'tcp'
+  | 'udp'
   | 'kcp'
   | 'ws'
   | 'httpupgrade'
@@ -27,13 +29,29 @@ export type Transport =
   | 'h3';
 
 export type CapabilityMode = 'native-edge' | 'origin-engine' | 'unsupported';
+export type CapabilityBoundary = 'WORKER_NATIVE' | 'ORIGIN_ENGINE_REQUIRED' | 'UNSUPPORTED';
+export type CapabilityStatus = CapabilityBoundary | 'DISABLED' | 'EXPERIMENTAL';
+export type CapabilityRisk = 'LOW' | 'MEDIUM' | 'HIGH';
+export type SecurityMode = 'tls' | 'reality' | 'none';
 
 export interface ProtocolCapability {
   protocol: ProxyProtocol;
   transport: Transport;
   alpn: string[];
+  security: SecurityMode[];
   mode: CapabilityMode;
+  boundary: CapabilityBoundary;
+  status: CapabilityStatus;
+  layer: 'worker' | 'origin';
+  generatorAvailable: boolean;
+  liveVerificationAvailable: boolean;
+  clientSupportRequired: boolean;
+  requirements: string[];
+  incompatibilities: string[];
+  riskClass: CapabilityRisk;
+  /** True means this repository can generate the configured profile, not that a remote engine was probed. */
   ready: boolean;
+  deploymentValidation: 'not-required' | 'declared-not-tested' | 'unsupported';
   reason: string;
 }
 
@@ -46,75 +64,102 @@ export const ALPN_PROFILES: string[][] = [
   ['h3', 'h2', 'http/1.1'],
 ];
 
-const HTTP12 = ['h2', 'http/1.1'];
+export const DEFAULT_ORIGIN_TRANSPORTS: Transport[] = ['xhttp', 'grpc', 'httpupgrade', 'ws'];
+const SUPPORTED_ORIGIN_PAIRS = new Set<string>([
+  'vless:xhttp',
+  'vless:grpc',
+  'vless:httpupgrade',
+  'trojan:xhttp',
+  'vmess:ws',
+]);
+const PROTOCOLS: ProxyProtocol[] = ['vless', 'vmess', 'shadowsocks', 'http', 'trojan', 'wireguard', 'hysteria2'];
+const TRANSPORTS: Transport[] = ['tcp', 'udp', 'kcp', 'ws', 'httpupgrade', 'xhttp', 'grpc', 'h2', 'http/1.1', 'h3'];
+const TRANSPORT_SET = new Set<string>(TRANSPORTS);
+
+export function parseOriginTransports(value?: string): Transport[] {
+  if (value == null || value.trim() === '') return [...DEFAULT_ORIGIN_TRANSPORTS];
+  return [...new Set(value.split(',').map((item) => item.trim().toLowerCase()).filter((item): item is Transport => TRANSPORT_SET.has(item)))]
+    .filter((transport) => DEFAULT_ORIGIN_TRANSPORTS.includes(transport));
+}
+
+function unsupportedReason(protocol: ProxyProtocol, transport: Transport): string {
+  if (protocol === 'wireguard' || protocol === 'hysteria2' || transport === 'udp' || transport === 'kcp' || transport === 'h3') {
+    return 'UNSUPPORTED: this Worker has no UDP-capable data plane or configured UDP origin adapter.';
+  }
+  return 'UNSUPPORTED: no validated profile generator exists for this protocol/transport pair.';
+}
 
 /**
- * Native edge capabilities are intentionally conservative. Cloudflare Workers
- * currently accepts HTTP/WebSocket traffic; inbound raw TCP is not generally
- * exposed to Workers, so raw UDP/TCP protocols are origin-engine profiles.
+ * Return a complete explicit matrix. `enabledOriginTransports` is a declaration
+ * of which configured transports the operator permits this generator to emit;
+ * it does not prove that Xray/sing-box is healthy or listening.
  */
-export function protocolCatalog(originEngineConfigured: boolean): ProtocolCapability[] {
-  const native = (protocol: ProxyProtocol, transport: Transport, alpn: string[] = ['http/1.1']): ProtocolCapability => ({
-    protocol, transport, alpn, mode: 'native-edge', ready: true, reason: 'Handled by the Worker HTTP/WebSocket data plane.',
-  });
-  const origin = (protocol: ProxyProtocol, transport: Transport, alpn: string[] = HTTP12, reason = 'Requires a compatible Xray/sing-box origin engine.'): ProtocolCapability => ({
-    protocol, transport, alpn, mode: originEngineConfigured ? 'origin-engine' : 'unsupported',
-    ready: originEngineConfigured,
-    reason: originEngineConfigured ? reason : 'Origin engine host is not configured; profile generation is disabled.',
-  });
+export function protocolCatalog(
+  originEngineConfigured: boolean,
+  enabledOriginTransports: readonly Transport[] = DEFAULT_ORIGIN_TRANSPORTS,
+): ProtocolCapability[] {
+  const enabled = new Set(enabledOriginTransports);
+  const knownPairs = new Set(['vless:ws', 'trojan:ws', ...SUPPORTED_ORIGIN_PAIRS]);
+  const out: ProtocolCapability[] = [];
 
-  const out: ProtocolCapability[] = [
-    native('vless', 'ws'),
-    native('trojan', 'ws'),
-    // HTTP-oriented transports are valid capability targets for an origin engine.
-    origin('vless', 'tcp', HTTP12),
-    origin('vless', 'xhttp', HTTP12),
-    origin('vless', 'grpc', ['h2']),
-    origin('vless', 'httpupgrade', ['http/1.1']),
-    origin('vless', 'kcp', ['']),
-    origin('vless', 'h2', ['h2']),
-    origin('vless', 'http/1.1', ['http/1.1']),
-    origin('vless', 'h3', ['h3']),
-    origin('vmess', 'tcp', HTTP12),
-    origin('vmess', 'ws', ['http/1.1']),
-    origin('vmess', 'xhttp', HTTP12),
-    origin('vmess', 'grpc', ['h2']),
-    origin('vmess', 'httpupgrade', ['http/1.1']),
-    origin('vmess', 'kcp', ['']),
-    origin('vmess', 'h2', ['h2']),
-    origin('vmess', 'http/1.1', ['http/1.1']),
-    origin('vmess', 'h3', ['h3']),
-    origin('shadowsocks', 'tcp', []),
-    origin('shadowsocks', 'ws', ['http/1.1']),
-    origin('shadowsocks', 'xhttp', HTTP12),
-    origin('shadowsocks', 'grpc', ['h2']),
-    origin('shadowsocks', 'httpupgrade', ['http/1.1']),
-    origin('http', 'tcp', HTTP12),
-    origin('http', 'h2', ['h2']),
-    origin('http', 'http/1.1', ['http/1.1']),
-    origin('http', 'h3', ['h3']),
-    origin('trojan', 'tcp', HTTP12),
-    origin('trojan', 'ws', ['http/1.1']),
-    origin('trojan', 'xhttp', HTTP12),
-    origin('trojan', 'grpc', ['h2']),
-    origin('trojan', 'httpupgrade', ['http/1.1']),
-    origin('trojan', 'kcp', ['']),
-    origin('trojan', 'h2', ['h2']),
-    origin('trojan', 'http/1.1', ['http/1.1']),
-    origin('trojan', 'h3', ['h3']),
-    origin('wireguard', 'h3', ['h3'], 'Requires a UDP-capable WireGuard engine; HTTP/3 is metadata only.'),
-    origin('hysteria2', 'h3', ['h3'], 'Requires a UDP-capable Hysteria2 engine.'),
-  ];
+  for (const protocol of PROTOCOLS) {
+    for (const transport of TRANSPORTS) {
+      const key = protocol + ':' + transport;
+      if (!knownPairs.has(key)) {
+        const reason = unsupportedReason(protocol, transport);
+        out.push({
+          protocol, transport, alpn: [], security: [], mode: 'unsupported', boundary: 'UNSUPPORTED',
+          status: 'UNSUPPORTED', layer: 'origin', generatorAvailable: false, liveVerificationAvailable: false,
+          clientSupportRequired: false, requirements: [], incompatibilities: [reason], riskClass: 'HIGH',
+          ready: false, deploymentValidation: 'unsupported', reason,
+        });
+        continue;
+      }
+
+      if (transport === 'ws' && (protocol === 'vless' || protocol === 'trojan')) {
+        out.push({
+          protocol, transport, alpn: ['http/1.1'], security: ['tls'], mode: 'native-edge',
+          boundary: 'WORKER_NATIVE', status: 'WORKER_NATIVE', layer: 'worker',
+          generatorAvailable: true, liveVerificationAvailable: false, clientSupportRequired: true,
+          requirements: ['Cloudflare Worker WebSocket ingress', 'TLS at the configured Worker hostname', 'compatible VLESS/Trojan client'],
+          incompatibilities: [], riskClass: 'LOW', ready: true, deploymentValidation: 'not-required',
+          reason: 'Implemented by the Worker WebSocket data plane; client-to-Worker TLS is provided by the deployment. No live end-to-end probe is available.',
+        });
+        continue;
+      }
+
+      const transportEnabled = enabled.has(transport);
+      const ready = originEngineConfigured && transportEnabled;
+      const status: CapabilityStatus = !originEngineConfigured
+        ? 'ORIGIN_ENGINE_REQUIRED'
+        : !transportEnabled ? 'DISABLED' : 'ORIGIN_ENGINE_REQUIRED';
+      const reason = !originEngineConfigured
+        ? 'ORIGIN_ENGINE_REQUIRED: configure an origin host and transport; Worker-native generation is unavailable.'
+        : !transportEnabled
+          ? 'DISABLED: compatible pair, but this transport is not enabled in ORIGIN_ENGINE_TRANSPORTS.'
+          : 'ORIGIN_ENGINE_REQUIRED: a matching client template can be generated, but remote engine compatibility and health have not been tested.';
+      out.push({
+        protocol, transport,
+        alpn: transport === 'grpc' ? ['h2'] : transport === 'httpupgrade' || transport === 'ws' ? ['http/1.1'] : ['h2', 'http/1.1'],
+        security: ['tls'],
+        mode: 'origin-engine', boundary: 'ORIGIN_ENGINE_REQUIRED', status, layer: 'origin',
+        generatorAvailable: true, liveVerificationAvailable: false, clientSupportRequired: true,
+        requirements: ['ORIGIN_ENGINE_HOST', 'ORIGIN_ENGINE_TRANSPORTS includes ' + transport, 'compatible deployed Xray/sing-box listener', 'matching client implementation'],
+        incompatibilities: transportEnabled ? [] : ['origin_transport_not_enabled'],
+        riskClass: 'MEDIUM', ready, deploymentValidation: ready ? 'declared-not-tested' : 'unsupported', reason,
+      });
+    }
+  }
   return out;
 }
 
-export function bestAvailableCapabilities(originEngineConfigured: boolean): ProtocolCapability[] {
-  return protocolCatalog(originEngineConfigured).filter((c) => c.ready);
+export function bestAvailableCapabilities(originEngineConfigured: boolean, enabledOriginTransports?: readonly Transport[]): ProtocolCapability[] {
+  return protocolCatalog(originEngineConfigured, enabledOriginTransports).filter((c) => c.ready);
 }
 
-/** Preferred order is conservative: native WebSocket first, then HTTP-origin profiles. */
-export function adaptiveProtocolOrder(originEngineConfigured: boolean): Array<{ protocol: ProxyProtocol; transport: Transport; score: number }> {
-  return bestAvailableCapabilities(originEngineConfigured)
+/** Preferred order is conservative: native WebSocket first, then declared origin profiles. */
+export function adaptiveProtocolOrder(originEngineConfigured: boolean, enabledOriginTransports?: readonly Transport[]): Array<{ protocol: ProxyProtocol; transport: Transport; score: number }> {
+  return bestAvailableCapabilities(originEngineConfigured, enabledOriginTransports)
     .map((c) => {
       let score = 50;
       if (c.mode === 'native-edge') score += 35;
@@ -123,8 +168,6 @@ export function adaptiveProtocolOrder(originEngineConfigured: boolean): Array<{ 
       if (c.transport === 'grpc') score += 5;
       if (c.protocol === 'vless') score += 4;
       if (c.protocol === 'trojan') score += 3;
-      if (c.transport === 'kcp') score -= 8;
-      if (c.protocol === 'wireguard' || c.protocol === 'hysteria2') score -= 10;
       return { protocol: c.protocol, transport: c.transport, score };
     })
     .sort((a, b) => b.score - a.score);

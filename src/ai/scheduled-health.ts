@@ -7,8 +7,9 @@
 
 import { connect } from 'cloudflare:sockets';
 import { Env } from '../config';
-import { addEvent, loadAdaptiveGuardState, loadAdaptiveModel, loadPathHealth, loadProfileHealth, loadSettings, saveAdaptiveGuardState, saveNetworkState, savePathHealth, saveProtocolPolicyState, loadHealthSamples, saveHealthSample, savePredictiveState, savePolicySignalState } from '../db/store';
+import { addEvent, loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadProfileHealth, loadSettings, saveAdaptiveGuardState, saveNetworkState, savePathHealth, saveProtocolPolicyState, loadHealthSamples, saveHealthSample, savePredictiveState, savePolicySignalState } from '../db/store';
 import { classifyNetworkState } from './network-state';
+import { classifyNetworkCondition, normalizeSocketFailure } from './network-intelligence';
 import { updateObservation } from './resilience';
 import { buildAdaptiveProtocolPlan } from './protocol-controller';
 import { assessHealth } from './predictive-mesh';
@@ -38,7 +39,7 @@ async function probeEndpoint(host: string, port: number): Promise<{ ok: boolean;
     ]);
     return { ok: true, latencyMs: Date.now() - started };
   } catch (e) {
-    return { ok: false, latencyMs: Date.now() - started, error: e instanceof Error ? e.message.slice(0, 160) : String(e).slice(0, 160) };
+    return { ok: false, latencyMs: Date.now() - started, error: normalizeSocketFailure(e) };
   } finally {
     try { socket?.close(); } catch { /* ignore */ }
   }
@@ -85,7 +86,7 @@ export async function runScheduledHealth(env: Env): Promise<void> {
       consecutiveFailures: next.consecutiveFailures,
       consecutiveSuccesses: next.consecutiveSuccesses,
     });
-    await saveHealthSample(env.GZ_DB, { kind: 'path', subjectId: endpoint, ts: next.checkedAt, ok: next.ok, latencyMs: next.latencyMs });
+    await saveHealthSample(env.GZ_DB, { kind: 'path_tcp', subjectId: endpoint, ts: next.checkedAt, ok: next.ok, latencyMs: next.latencyMs });
     const pathSamples = await loadHealthSamples(env.GZ_DB, 'path', endpoint, 24);
     const pathPredictive = assessHealth(pathSamples, next.checkedAt);
     await savePathHealth(env.GZ_DB, {
@@ -109,17 +110,42 @@ export async function runScheduledHealth(env: Env): Promise<void> {
     consecutiveFailures: r.consecutiveFailures, consecutiveSuccesses: r.consecutiveSuccesses,
     lastError: r.lastError,
   })));
+  const condition = classifyNetworkCondition(endpoints, [...byId.values()].map((row) => ({
+    pathId: row.pathId,
+    source: 'WORKER_TCP' as const,
+    ok: row.ok,
+    checkedAt: row.checkedAt,
+    latencyMs: row.latencyMs,
+    failures: row.failures,
+    successes: row.successes,
+    consecutiveFailures: row.consecutiveFailures,
+    lastError: row.lastError,
+  })), state.generatedAt);
+  const conditionCode = 'condition_' + condition.state.toLowerCase();
+  const previousNetworkState = await loadNetworkState(env.GZ_DB);
+  const previousConditionCode = previousNetworkState?.reasonCodes.find((code) => code.startsWith('condition_'));
   await saveNetworkState(env.GZ_DB, {
     state: state.state,
     quorum: state.quorum,
     failureRate: state.failureRate,
     selectedPath: state.selectedPath ?? '',
-    reasonCodes: state.reasonCodes,
+    reasonCodes: [...state.reasonCodes.filter((code) => !code.startsWith('condition_')), conditionCode],
     confidence: state.confidence,
     anomalyScore: state.anomalyScore,
     signalClass: state.signalClass,
     updatedAt: state.generatedAt,
   });
+  if (previousConditionCode !== conditionCode) {
+    await addEvent(env.GZ_DB, 'network_condition_changed', JSON.stringify({
+      previous: previousConditionCode?.slice('condition_'.length) ?? null,
+      current: condition.state,
+      confidence: condition.confidence,
+      freshPaths: condition.freshPathCount,
+      failedPaths: condition.failedPathCount,
+      evidence: condition.evidence.slice(0, 5),
+      scope: condition.scope,
+    }).slice(0, 1400));
+  }
 
   // Refresh the live protocol policy at the same cadence. This keeps the D1
   // fallback ladder warm even when no client is actively requesting a manifest.

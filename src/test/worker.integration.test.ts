@@ -4,7 +4,7 @@ import { Miniflare } from 'miniflare';
 import type { D1Database } from '@cloudflare/workers-types';
 import { VERSION } from '../config';
 import { getUserByIdFresh, recordUsageDelta } from '../db/users';
-import { consumeAiDiagnosticQuota } from '../db/store';
+import { consumeAiDiagnosticQuota, loadHealthSamples, loadLatestPathSamples, saveHealthSample } from '../db/store';
 import { createDiagnostics, getAiModelCandidates, rankCatalogModels } from '../ai/diagnostics';
 
 let mf: Miniflare;
@@ -110,6 +110,21 @@ describe('Cloudflare Worker + D1 integration', () => {
     await post(301, '1');
     const admin = await db.prepare('SELECT enabled FROM users WHERE id = 1').first<{ enabled: number }>();
     expect(admin?.enabled).toBe(1);
+  });
+
+  it('keeps probe-source telemetry bounded and loads latest samples per source without schema migration', async () => {
+    const subjectId = 'telemetry-test.example';
+    await saveHealthSample(db, { kind: 'path_tcp', subjectId, ts: 1_800_000_000_001, ok: false, latencyMs: 900 });
+    await saveHealthSample(db, { kind: 'path_tcp', subjectId, ts: 1_800_000_000_002, ok: true, latencyMs: 80 });
+    await saveHealthSample(db, { kind: 'path_https', subjectId, ts: 1_800_000_000_003, ok: false, latencyMs: 120 });
+    const latest = await loadLatestPathSamples(db, [subjectId]);
+    expect(latest).toHaveLength(2);
+    expect(latest.find((row) => row.kind === 'path_tcp')).toMatchObject({ ts: 1_800_000_000_002, ok: true, latencyMs: 80 });
+    expect(latest.find((row) => row.kind === 'path_https')).toMatchObject({ ts: 1_800_000_000_003, ok: false });
+    const history = await loadHealthSamples(db, 'path', subjectId, 10);
+    expect(history).toHaveLength(3);
+    expect(history.map((row) => row.ts)).toEqual([1_800_000_000_001, 1_800_000_000_002, 1_800_000_000_003]);
+    expect(await loadLatestPathSamples(db, [])).toEqual([]);
   });
 
   it('falls back to an on-Worker deterministic advisor when AI is not bound', async () => {

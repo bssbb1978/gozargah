@@ -184,7 +184,7 @@ async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, 
           consecutiveSuccesses: previous.consecutiveSuccesses, lastError: previous.lastError,
         } : undefined, attempt.ok, attempt.latencyMs, Date.now(), attempt.error);
         next.id = attempt.pathId;
-        await saveHealthSample(env.GZ_DB!, { kind:'path', subjectId:next.id, ts:next.checkedAt, ok:next.ok, latencyMs:next.latencyMs });
+        await saveHealthSample(env.GZ_DB!, { kind:'path_dial', subjectId:next.id, ts:next.checkedAt, ok:next.ok, latencyMs:next.latencyMs });
         const pathSamples = await loadHealthSamples(env.GZ_DB!, 'path', next.id, 24);
         const pathPredictive = assessHealth(pathSamples, next.checkedAt);
         await savePredictiveState(env.GZ_DB!, { kind:'path', subjectId:next.id, stateJson:JSON.stringify(pathPredictive), updatedAt:next.checkedAt });

@@ -7,9 +7,9 @@
  * remains the responsibility of the client/origin engine observatory.
  */
 
-import type { ProtocolCapability, ProxyProtocol, Transport } from './catalog';
+import type { ProtocolCapability, ProxyProtocol, Transport, SecurityMode } from './catalog';
 
-export type SecurityMode = 'tls' | 'reality' | 'none';
+export type { SecurityMode } from './catalog';
 
 export interface AdaptiveProtocolProfile {
   id: string;
@@ -18,23 +18,21 @@ export interface AdaptiveProtocolProfile {
   security: SecurityMode;
   alpn: string[];
   mode: ProtocolCapability['mode'];
+  boundary: ProtocolCapability['boundary'];
+  status: ProtocolCapability['status'];
+  layer: ProtocolCapability['layer'];
+  generatorAvailable: boolean;
+  liveVerificationAvailable: boolean;
+  clientSupportRequired: boolean;
+  requirements: string[];
+  incompatibilities: string[];
+  riskClass: ProtocolCapability['riskClass'];
+  deploymentValidation: ProtocolCapability['deploymentValidation'];
   ready: boolean;
   udp: boolean;
   score: number;
   rationale: string[];
 }
-
-const SECURITY_DEFAULTS: Record<Transport, SecurityMode[]> = {
-  tcp: ['tls', 'reality'],
-  kcp: ['tls'],
-  ws: ['tls'],
-  httpupgrade: ['tls'],
-  xhttp: ['tls', 'reality'],
-  grpc: ['tls', 'reality'],
-  h2: ['tls'],
-  'http/1.1': ['tls'],
-  h3: ['tls'],
-};
 
 const UDP_PROTOCOLS = new Set<ProxyProtocol>(['wireguard', 'hysteria2']);
 
@@ -62,9 +60,7 @@ function score(c: ProtocolCapability, security: SecurityMode): { value: number; 
 export function buildAdaptiveProtocolPolicy(capabilities: ProtocolCapability[]): AdaptiveProtocolProfile[] {
   const out: AdaptiveProtocolProfile[] = [];
   for (const c of capabilities) {
-    for (const security of SECURITY_DEFAULTS[c.transport]) {
-      // REALITY is valid only for current Xray transports that explicitly support it.
-      if (security === 'reality' && !['tcp', 'xhttp', 'grpc'].includes(c.transport)) continue;
+    for (const security of c.security) {
       const scored = score(c, security);
       const id = [c.protocol, c.transport, security].join(':');
       out.push({
@@ -74,6 +70,16 @@ export function buildAdaptiveProtocolPolicy(capabilities: ProtocolCapability[]):
         security,
         alpn: c.alpn.filter(Boolean),
         mode: c.mode,
+        boundary: c.boundary,
+        status: c.status,
+        layer: c.layer,
+        generatorAvailable: c.generatorAvailable,
+        liveVerificationAvailable: c.liveVerificationAvailable,
+        clientSupportRequired: c.clientSupportRequired,
+        requirements: c.requirements,
+        incompatibilities: c.incompatibilities,
+        riskClass: c.riskClass,
+        deploymentValidation: c.deploymentValidation,
         ready: c.ready,
         udp: UDP_PROTOCOLS.has(c.protocol),
         score: scored.value,

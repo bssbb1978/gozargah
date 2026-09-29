@@ -17,7 +17,7 @@ import { buildAdaptiveProtocolPlan } from './ai/protocol-controller';
 import { nextAdaptiveGuardState, reconcileAdaptivePlan } from './ai/adaptive-guard';
 import { EffectiveSettings } from './settings';
 import { DEFAULT_FP, FragPreset, adaptiveProfiles, fpFor, opBranding, resolveOp, SubOpts, AdaptiveProfile } from './sub/operators';
-import { ALPN_PROFILES, protocolCatalog, adaptiveProtocolOrder } from './protocols/catalog';
+import { ALPN_PROFILES, protocolCatalog, adaptiveProtocolOrder, parseOriginTransports, type ProtocolCapability } from './protocols/catalog';
 import { buildAdaptiveProtocolPolicy, choosePreferredProfiles, policySummary } from './protocols/policy';
 import { Env } from './config';
 
@@ -30,7 +30,7 @@ export interface ClientLinks {
 export interface ProtocolMatrixBundle {
   version: string;
   edge: { host: string; nativeProtocols: Array<{ protocol: string; transport: string; ready: boolean }> };
-  origin: { configured: boolean; host?: string; port?: number };
+  origin: { configured: boolean; host?: string; port?: number; validation: 'not_configured' | 'invalid_port' | 'declared_not_tested' };
   capabilities: ReturnType<typeof protocolCatalog>;
   preferredOrder: ReturnType<typeof adaptiveProtocolOrder>;
   alpnProfiles: string[][];
@@ -38,26 +38,54 @@ export interface ProtocolMatrixBundle {
   adaptivePolicy: { profiles: ReturnType<typeof buildAdaptiveProtocolPolicy>; preferred: ReturnType<typeof choosePreferredProfiles>; summary: ReturnType<typeof policySummary> };
 }
 
+function parseOriginEnginePort(value?: string): number | null {
+  if (value == null || value.trim() === '') return 443;
+  const port = Number(value);
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+}
+
 export function buildProtocolMatrix(env: Env | undefined, host: string): ProtocolMatrixBundle {
   const originHost = env?.ORIGIN_ENGINE_HOST?.trim() || '';
-  const originPort = Number(env?.ORIGIN_ENGINE_PORT || 443);
-  const configured = !!originHost;
-  const all = protocolCatalog(configured);
+  const originPort = parseOriginEnginePort(env?.ORIGIN_ENGINE_PORT);
+  const configured = !!originHost && originPort !== null;
+  const originTransports = parseOriginTransports(env?.ORIGIN_ENGINE_TRANSPORTS);
+  const all = protocolCatalog(configured, originTransports);
   const adaptiveProfiles = buildAdaptiveProtocolPolicy(all);
   return {
-    version: '2.8.0',
+    version: '2.10.0',
     edge: { host, nativeProtocols: all.filter((c) => c.mode === 'native-edge').map((c) => ({ protocol: c.protocol, transport: c.transport, ready: c.ready })) },
-    origin: configured ? { configured: true, host: originHost, port: Number.isFinite(originPort) && originPort > 0 ? originPort : 443 } : { configured: false },
+    origin: configured
+      ? { configured: true, host: originHost, port: originPort!, validation: 'declared_not_tested' }
+      : { configured: false, validation: originHost ? 'invalid_port' : 'not_configured' },
     capabilities: all,
-    preferredOrder: adaptiveProtocolOrder(configured),
+    preferredOrder: adaptiveProtocolOrder(configured, originTransports),
     alpnProfiles: ALPN_PROFILES,
     generatedAt: Date.now(),
     adaptivePolicy: { profiles: adaptiveProfiles, preferred: choosePreferredProfiles(adaptiveProfiles, 14), summary: policySummary(adaptiveProfiles) },
   };
 }
 
+function originTemplates(capabilities: ProtocolCapability[], transports: readonly string[], host: string, port: number, uuid: string, password: string): Record<string, unknown> {
+  const allowed = new Set(transports);
+  const canGenerate = (protocol: string, transport: string): boolean =>
+    allowed.has(transport) && capabilities.some((cap) => cap.protocol === protocol && cap.transport === transport && cap.generatorAvailable && cap.ready);
+  const templates: Record<string, unknown> = {};
+  const path = '/' + uuid;
+  const tls = { enabled: true, allow_insecure: false };
+  if (canGenerate('vmess', 'ws')) templates.vmess_ws = { protocol: 'vmess', transport: 'ws', server: host, port, id: uuid, tls, alpn: ['http/1.1'] };
+  // Trojan/WebSocket has a real Worker-native generator and also an existing
+  // direct-origin Xray outbound; the capability row gates that shared pair.
+  if (canGenerate('trojan', 'ws')) templates.trojan_ws = { protocol: 'trojan', transport: 'ws', server: host, port, password, tls, alpn: ['http/1.1'] };
+  if (canGenerate('vless', 'xhttp')) templates.vless_xhttp = { protocol: 'vless', transport: 'xhttp', server: host, port, id: uuid, tls, path };
+  if (canGenerate('trojan', 'xhttp')) templates.trojan_xhttp = { protocol: 'trojan', transport: 'xhttp', server: host, port, password, tls, path };
+  if (canGenerate('vless', 'grpc')) templates.vless_grpc = { protocol: 'vless', transport: 'grpc', server: host, port, id: uuid, tls, alpn: ['h2'], service_name: 'g' };
+  if (canGenerate('vless', 'httpupgrade')) templates.vless_httpupgrade = { protocol: 'vless', transport: 'httpupgrade', server: host, port, id: uuid, tls, alpn: ['http/1.1'], path };
+  return templates;
+}
+
 export function buildAdaptiveClientBundle(host: string, user: { uuid: string; trojanPass: string; name: string }, opts: BuildOpts | null | undefined, env?: Env): string {
   const matrix = buildProtocolMatrix(env, host);
+  const originTransports = parseOriginTransports(env?.ORIGIN_ENGINE_TRANSPORTS);
   const out: Record<string, unknown> = {
     schema: 'gozargah-adaptive-profiles/v4',
     generated_at: matrix.generatedAt,
@@ -77,17 +105,8 @@ export function buildAdaptiveClientBundle(host: string, user: { uuid: string; tr
       host: oh,
       port: op,
       note: 'Origin-engine profiles require a compatible Xray/sing-box listener. The Worker does not terminate native UDP protocols.',
-      protocol_templates: {
-        vmess_ws: { protocol: 'vmess', transport: 'ws', server: oh, port: op, id: user.uuid, tls: true },
-        vless_xhttp: { protocol: 'vless', transport: 'xhttp', server: oh, port: op, id: user.uuid, tls: true },
-        vless_grpc: { protocol: 'vless', transport: 'grpc', server: oh, port: op, id: user.uuid, tls: true, alpn: ['h2'] },
-        vless_httpupgrade: { protocol: 'vless', transport: 'httpupgrade', server: oh, port: op, id: user.uuid, tls: true, alpn: ['http/1.1'] },
-        trojan_xhttp: { protocol: 'trojan', transport: 'xhttp', server: oh, port: op, password: user.trojanPass, tls: true },
-        shadowsocks_tcp: { protocol: 'shadowsocks', transport: 'tcp', server: oh, port: op, password: user.trojanPass },
-        http_tls: { protocol: 'http', transport: 'http/1.1', server: oh, port: op, tls: true },
-        wireguard: { protocol: 'wireguard', transport: 'h3', server: oh, port: op, requires_udp_engine: true },
-        hysteria2: { protocol: 'hysteria2', transport: 'h3', server: oh, port: op, requires_udp_engine: true },
-      },
+      engine_validation: 'declared_not_tested',
+      protocol_templates: originTemplates(matrix.capabilities, originTransports, oh, op, user.uuid, user.trojanPass),
     };
   }
   return JSON.stringify(out, null, 2);
@@ -453,12 +472,16 @@ export function buildXrayJson(
   // current Xray transport primitives. The Worker itself still terminates only
   // its native HTTP/WebSocket profiles; these outbounds are client->origin.
   const originHost = env?.ORIGIN_ENGINE_HOST?.trim() || '';
-  const originPort = Number(env?.ORIGIN_ENGINE_PORT || 443);
-  if (originHost) {
+  const originPort = parseOriginEnginePort(env?.ORIGIN_ENGINE_PORT);
+  if (originHost && originPort !== null) {
     const originSni = (env?.ORIGIN_ENGINE_SNI || originHost).trim();
     const originPath = (env?.ORIGIN_ENGINE_PATH || '/' + user.uuid).trim() || '/';
     const grpcService = (env?.ORIGIN_ENGINE_GRPC_SERVICE || 'g').trim() || 'g';
-    const allowed = new Set((env?.ORIGIN_ENGINE_TRANSPORTS || 'xhttp,grpc,httpupgrade,ws').split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
+    const allowed = new Set(parseOriginTransports(env?.ORIGIN_ENGINE_TRANSPORTS));
+    const originCapabilities = buildProtocolMatrix(env, host).capabilities;
+    const canGenerateOrigin = (protocol: string, transport: ReturnType<typeof parseOriginTransports>[number]): boolean =>
+      allowed.has(transport) &&
+      originCapabilities.some((capability) => capability.protocol === protocol && capability.transport === transport && capability.generatorAvailable && capability.ready);
     const originTags: string[] = [];
     const addOrigin = (tag: string, protocol: string, transport: string, streamSettings: Record<string, unknown>, settings: Record<string, unknown>): void => {
       outbounds.push({ tag, protocol, settings, streamSettings });
@@ -469,23 +492,23 @@ export function buildXrayJson(
       allowInsecure: false,
       fingerprint: 'chrome',
     };
-    if (allowed.has('xhttp')) {
+    if (canGenerateOrigin('vless', 'xhttp') && canGenerateOrigin('trojan', 'xhttp')) {
       const stream = { network: 'xhttp', security: 'tls', tlsSettings, xhttpSettings: { path: originPath } };
-      addOrigin('origin-vless-xhttp', 'vless', 'xhttp', stream, { vnext: [{ address: originHost, port: Number.isFinite(originPort) ? originPort : 443, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] });
-      addOrigin('origin-trojan-xhttp', 'trojan', 'xhttp', stream, { servers: [{ address: originHost, port: Number.isFinite(originPort) ? originPort : 443, password: user.trojanPass, level: 0 }] });
+      addOrigin('origin-vless-xhttp', 'vless', 'xhttp', stream, { vnext: [{ address: originHost, port: originPort, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] });
+      addOrigin('origin-trojan-xhttp', 'trojan', 'xhttp', stream, { servers: [{ address: originHost, port: originPort, password: user.trojanPass, level: 0 }] });
     }
-    if (allowed.has('grpc')) {
+    if (canGenerateOrigin('vless', 'grpc')) {
       const stream = { network: 'grpc', security: 'tls', tlsSettings, grpcSettings: { serviceName: grpcService, multiMode: true } };
-      addOrigin('origin-vless-grpc', 'vless', 'grpc', stream, { vnext: [{ address: originHost, port: Number.isFinite(originPort) ? originPort : 443, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] });
+      addOrigin('origin-vless-grpc', 'vless', 'grpc', stream, { vnext: [{ address: originHost, port: originPort, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] });
     }
-    if (allowed.has('httpupgrade')) {
+    if (canGenerateOrigin('vless', 'httpupgrade')) {
       const stream = { network: 'httpupgrade', security: 'tls', tlsSettings, httpupgradeSettings: { path: originPath, host: originSni } };
-      addOrigin('origin-vless-httpupgrade', 'vless', 'httpupgrade', stream, { vnext: [{ address: originHost, port: Number.isFinite(originPort) ? originPort : 443, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] });
+      addOrigin('origin-vless-httpupgrade', 'vless', 'httpupgrade', stream, { vnext: [{ address: originHost, port: originPort, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] });
     }
-    if (allowed.has('ws')) {
+    if (canGenerateOrigin('vmess', 'ws') && canGenerateOrigin('trojan', 'ws')) {
       const stream = { network: 'ws', security: 'tls', tlsSettings, wsSettings: { path: originPath, headers: { Host: originSni } } };
-      addOrigin('origin-vmess-ws', 'vmess', 'ws', stream, { vnext: [{ address: originHost, port: Number.isFinite(originPort) ? originPort : 443, users: [{ id: user.uuid, alterId: 0, security: 'auto' }] }] });
-      addOrigin('origin-trojan-ws', 'trojan', 'ws', stream, { servers: [{ address: originHost, port: Number.isFinite(originPort) ? originPort : 443, password: user.trojanPass, level: 0 }] });
+      addOrigin('origin-vmess-ws', 'vmess', 'ws', stream, { vnext: [{ address: originHost, port: originPort, users: [{ id: user.uuid, alterId: 0, security: 'auto' }] }] });
+      addOrigin('origin-trojan-ws', 'trojan', 'ws', stream, { servers: [{ address: originHost, port: originPort, password: user.trojanPass, level: 0 }] });
     }
     appTags.push(...originTags);
   }

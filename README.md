@@ -1,8 +1,16 @@
 
-# Gozargah 2.8.0 — Consensus Resilience Mesh
+# Gozargah 2.10.0 — Evidence-Scoped Network Intelligence
 
-## 2.8.0 — Consensus Resilience Mesh
-### 2.8.0 highlights
+## 2.10.0 — Evidence-Scoped Network Intelligence
+### 2.10.0 highlights
+- `/api/network/state` now adds a conservative condition classification (`HEALTHY`, `DEGRADED`, `SEVERELY_DEGRADED`, `PARTIALLY_UNREACHABLE`, `UPSTREAM_UNAVAILABLE`, `UNKNOWN`) scoped to configured Worker-egress paths.
+- TCP socket, live dial, and manual HTTPS HEAD observations are kept as distinct bounded D1 sample kinds in the existing health-sample table; no schema migration is needed.
+- Error causes are classified only from recognizable stage evidence. Opaque timeouts stay `UNKNOWN`; all-path failure never proves a physical international outage or DPI.
+- Local deterministic selection remains primary; Workers AI remains optional and cannot override capability checks.
+- The full capability descriptor assigns each protocol/transport pair one of `WORKER_NATIVE`, `ORIGIN_ENGINE_REQUIRED`, `UNSUPPORTED`, `DISABLED`, or `EXPERIMENTAL` (no experimental profiles are currently generated).
+- Profiles without a real generator are never advertised as ready; UDP-only WireGuard/Hysteria2 are explicitly unsupported by this Worker data plane.
+- Origin profiles are emitted only for the configured transport allowlist and are labeled declared-but-not-tested; setting a hostname is not treated as an engine health check.
+- Security and ALPN metadata are tied to the actual profile templates; unsupported combinations are excluded from adaptive policy.
 - Multi-signal policy gating combines measured health, forecast, local learner, and network confidence before promotion.
 - D1 persists consensus/agreement/switch-risk state; `/{panelPath}/api/network/fusion` exposes it for observability.
 - Adaptive Guard blocks low-consensus/high-switch-risk promotions and falls back to staged/recovery behavior.
@@ -23,6 +31,16 @@
 - audit events for adaptive policy promotions/staging/rollback
 - local deterministic learner remains the final policy guard; Workers AI remains optional
 
+### 2.10.0 engineering documents
+
+- [Capability Matrix](CAPABILITY-MATRIX.md)
+- [Adaptive Engine](ADAPTIVE-ENGINE.md)
+- [AI Engine and limits](AI-ENGINE.md)
+- [Failure Domains](FAILURE-DOMAINS.md)
+- [Recovery Model](RECOVERY-MODEL.md)
+- [2.10.0 Test Report](TEST-REPORT-2.10.0.md)
+- [Persian Upgrade Report](UPGRADE-REPORT-FA-2.10.0.md)
+
 2.5 continues the live protocol controller from 2.4 and adds a guard layer that
 stages small policy changes before promotion, rolls back on active-profile failure,
 and keeps a persistent previous/staged plan in D1.
@@ -35,8 +53,9 @@ New endpoints:
 
 The scheduled health loop refreshes health and policy every five minutes, so the
 D1 state remains warm even without an active subscriber. Raw TCP/UDP inbound is
-still not a Worker-native capability; UDP-native protocols remain origin-engine
-features, as documented by Cloudflare.
+not available in this Worker data plane. This release advertises only profile
+pairs with a real generator; UDP-native protocols remain `UNSUPPORTED` until a
+real UDP-capable adapter is implemented and validated.
 
 This release adds deterministic multi-signal path scoring, circuit-breaker recovery, connection-outcome telemetry, stable per-user ordering, and AI-model cooldown/failover. It does not claim to defeat a complete upstream international outage and does not fingerprint or rewrite protocol bytes.
 
@@ -353,9 +372,9 @@ MIT — آزاد برای استفاده، تغییر و توسعه. جزئیا�
 - The classifier is observational and does not claim to prove DPI or an international outage.
 
 
-## Protocol capability matrix (2.3.0)
+## Protocol capability matrix (current: 2.10.0)
 
-The Worker natively serves the HTTP/WebSocket edge profiles. Full VMess, VLESS, Shadowsocks, HTTP, Trojan, WireGuard, Hysteria2 and extended Xray transports are exposed as adaptive capability profiles when a compatible Xray/sing-box origin engine is configured with `ORIGIN_ENGINE_HOST` (and optionally `ORIGIN_ENGINE_PORT`). UDP-native protocols are never advertised as Worker-native.
+Every protocol/transport pair is returned with an explicit boundary: `WORKER_NATIVE`, `ORIGIN_ENGINE_REQUIRED`, or `UNSUPPORTED`. The matrix is conservative: a profile is `ready` only if this repository has a matching generator and the configured origin-transport allowlist permits it. `ORIGIN_ENGINE_HOST` is a declaration, not a remote validation or health check. UDP-only WireGuard/Hysteria2, Shadowsocks, generic HTTP proxying, and unimplemented transports remain `UNSUPPORTED`; no metadata-only template is emitted as a usable profile.
 
 
 ### 2.3.0 capability endpoints
@@ -363,7 +382,7 @@ The Worker natively serves the HTTP/WebSocket edge profiles. Full VMess, VLESS, 
 - `GET /<sub>/<token>/profiles` — adaptive profile manifest.
 - `GET /<sub>/<token>/capabilities` — public capability metadata for the current subscription token.
 
-Optional env: `ORIGIN_ENGINE_HOST` and `ORIGIN_ENGINE_PORT` enable origin-engine profiles (VMess, extended VLESS/Trojan/SS/HTTP transports, WireGuard and Hysteria2). Without an origin engine, only the Worker-native VLESS/Trojan WebSocket data plane is marked ready.
+Optional env: `ORIGIN_ENGINE_HOST`, `ORIGIN_ENGINE_PORT`, and `ORIGIN_ENGINE_TRANSPORTS` enable template generation for the supported subset (VMess/WebSocket, VLESS/gRPC/XHTTP/HTTPUpgrade, and Trojan/XHTTP as allowed by the transport list). These entries are marked `declared-not-tested` because the Worker has no origin-engine validation adapter. Without an origin engine, only Worker-native VLESS/Trojan over WebSocket is marked ready. WireGuard and Hysteria2 are explicitly unsupported until a real UDP-capable adapter and profile generator exist.
 
 ## Gozargah 2.3.0 — Adaptive Protocol Orchestrator
 
