@@ -10,6 +10,7 @@ import { createDiagnostics, getAiModelCandidates, rankCatalogModels } from '../a
 
 let mf: Miniflare;
 let db: D1Database;
+let axrV2User: { uuid: string } | null = null;
 const SECRET = 'test-webhook-secret-should-not-be-used-in-production';
 function makeDnsAaaaQuery(): Uint8Array {
   const name = [7, ...new TextEncoder().encode('example'), 3, ...new TextEncoder().encode('com'), 0];
@@ -36,6 +37,8 @@ beforeAll(async () => {
           TELEGRAM_ADMIN_IDS: '42',
           DNS_UPSTREAMS: 'https://doh.test/dns-query',
           DNS64_ENABLED: 'true',
+          CLEAN_EDGE_IPS: '203.0.113.10, 203.0.113.11, 999.1.1.1',
+          FRONTING_RELAY_HOST: 'relay.example-iran.net',
         },
         serviceBindings: { TELEGRAM_API: 'telegram-mock', DNS_UPSTREAM: 'dns-mock' },
       },
@@ -64,6 +67,10 @@ beforeAll(async () => {
     ],
   });
   db = await mf.getD1Database('GZ_DB', 'gozargah-test');
+  // Created up-front (not in the test body) so it is present in the Worker's
+  // first users-list read; the Worker bundles its own module copy with a
+  // short user-list cache, so users created after that read can be stale.
+  axrV2User = await createUser(db, { name: 'AXR v2 manifest', quotaBytes: 0, expiryAt: 0 });
 });
 
 afterAll(async () => { await mf?.dispose(); });
@@ -114,6 +121,11 @@ describe('Cloudflare Worker + D1 integration', () => {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
     });
     expect(response.status).toBe(404);
+  });
+
+  it('exposes the internal decision view behind panel auth (2.13)', async () => {
+    const response = await mf.dispatchFetch('https://gozargah.test/gozargah/api/network/decision');
+    expect(response.status).toBe(401);
   });
 
   it('persists FSM state and applies allowlisted per-user disable in D1', async () => {
@@ -262,5 +274,214 @@ describe('Cloudflare Worker + D1 integration', () => {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ language: 'fa' }),
     });
     expect(response.status).toBe(401);
+  });
+
+  it('serves the AXR machine feed with bootstrap fields for a known token', async () => {
+    const user = await createUser(db, { name: 'AXR manifest', quotaBytes: 0, expiryAt: 0 });
+    const token = await subTokenFor('gozargah.test', user.uuid);
+    const endpoint = `https://gozargah.test/sub/${token}/axr-manifest`;
+    const response = await mf.dispatchFetch(endpoint);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('json');
+    const manifest = (await response.json()) as {
+      schema: string;
+      host: string;
+      ws_path_base: string;
+      fingerprint: { neutral_set: string[] };
+      entries: Array<Record<string, unknown>>;
+      reconnect: { probe_interval_ms: number };
+    };
+    expect(manifest.schema).toBe('gozargah-axr-manifest/v3');
+    expect(manifest.host).toBe('gozargah.test');
+    expect(typeof manifest.ws_path_base).toBe('string');
+    expect(manifest.fingerprint.neutral_set).toContain('chrome');
+    expect(Array.isArray(manifest.entries)).toBe(true);
+    expect(manifest.entries[0]).toMatchObject({ host: 'gozargah.test', role: 'primary' });
+    expect(typeof manifest.reconnect.probe_interval_ms).toBe('number');
+  });
+
+  it('returns a benign decoy for unknown-token AXR probes and scanner paths', async () => {
+    // Scanner path shape → benign HTML product page (200, not an error).
+    const scan = await mf.dispatchFetch('https://gozargah.test/.env');
+    expect(scan.status).toBe(200);
+    expect(scan.headers.get('content-type')).toContain('text/html');
+    const scanBody = await scan.text();
+    expect(scanBody).toContain('<title>');
+
+    // JSON-typed API probe → benign JSON API.
+    const api = await mf.dispatchFetch('https://gozargah.test/api/status', {
+      headers: { accept: 'application/json' },
+    });
+    expect(api.status).toBe(200);
+    expect(api.headers.get('content-type')).toContain('application/json');
+    const apiJson = (await api.json()) as Record<string, unknown>;
+    expect(Object.keys(apiJson).length).toBeGreaterThanOrEqual(3);
+
+    // Unknown token + JSON accept on the machine feed → benign JSON (no user enumeration).
+    const feed = await mf.dispatchFetch('https://gozargah.test/sub/unknown-token-abc/axr-manifest', {
+      headers: { accept: 'application/json' },
+    });
+    expect(feed.status).toBe(200);
+    expect(feed.headers.get('content-type')).toContain('application/json');
+
+    // Ordinary unknown paths still get the stealth landing.
+    const landing = await mf.dispatchFetch('https://gozargah.test/some/ordinary/path');
+    expect(landing.status).toBe(200);
+    expect(landing.headers.get('content-type')).toContain('text/html');
+    expect(await landing.text()).toContain('Gozargah');
+  });
+
+  it('exposes AXR-v2 fields in the manifest (transports, flow profile, clean IP hints)', async () => {
+    const token = await subTokenFor('gozargah.test', axrV2User!.uuid);
+    const response = await mf.dispatchFetch(`https://gozargah.test/sub/${token}/axr-manifest`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('json');
+    const manifest = (await response.json()) as {
+      version: string;
+      transports: string[];
+      flow_profile: { mode: string };
+      clean_ip_hints: string[];
+    };
+    expect(manifest.version).toBe(VERSION);
+    expect(manifest.transports).toEqual(['ws', 'ws-alt']);
+    expect(manifest.flow_profile.mode).toBe('web');
+    // invalid entry (999.1.1.1) must be filtered out by cleanIpHints
+    expect(manifest.clean_ip_hints).toEqual(['203.0.113.10', '203.0.113.11']);
+  });
+
+  it('signs the manifest v3 with a verifiable HMAC keyed by the sub token (2.16)', async () => {
+    const { createHmac } = await import('node:crypto');
+    const token = await subTokenFor('gozargah.test', axrV2User!.uuid);
+    const response = await mf.dispatchFetch(`https://gozargah.test/sub/${token}/axr-manifest`);
+    expect(response.status).toBe(200);
+    const m = (await response.json()) as Record<string, any>;
+    expect(m.schema).toBe('gozargah-axr-manifest/v3');
+    expect(typeof m.manifest_sig).toBe('string');
+    expect(m.manifest_sig).toMatch(/^[0-9a-f]{64}$/);
+    // Recompute the canonical string EXACTLY as the Go client does and verify.
+    const canonical = [
+      String(m.schema), String(m.version), String(m.host), String(m.ws_path_base),
+      String(m.path_rotation_minutes), (m.transports as string[]).join(','),
+      (m.entries as Array<Record<string, string>>).map((e) => e.host + ':' + e.role).sort().join(','),
+      (m.clean_ip_hints as string[]).join(','), m.fronting_hint ?? '',
+      String(m.flow_profile.mode), String(m.reconnect.probe_interval_ms),
+    ].join('|');
+    const expected = createHmac('sha256', token).update(canonical, 'utf8').digest('hex');
+    expect(m.manifest_sig).toBe(expected);
+    // A one-field tamper must break the signature (client-side rejection path).
+    const tampered = canonical.replace('gozargah.test|/primary', 'gozargah.test|/primary').replace(/web\|90000$/, 'chat|90000');
+    const tamperedSig = createHmac('sha256', token).update(tampered, 'utf8').digest('hex');
+    expect(tamperedSig).not.toBe(m.manifest_sig);
+  });
+
+  it('publishes the FRONTING_RELAY_HOST env as a validated fronting_hint (2.16)', async () => {
+    const token = await subTokenFor('gozargah.test', axrV2User!.uuid);
+    const response = await mf.dispatchFetch(`https://gozargah.test/sub/${token}/axr-manifest`);
+    const m = (await response.json()) as Record<string, any>;
+    expect(m.fronting_hint).toBe('relay.example-iran.net');
+  });
+
+  it('ingests client-scan clean IPs via the harvest endpoint and unions them into the manifest (2.16)', async () => {
+    const token = await subTokenFor('gozargah.test', axrV2User!.uuid);
+    const endpoint = 'https://gozargah.test/gozargah/api/network/harvest';
+    // Bad token is rejected with 401.
+    const bad = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'not-a-real-token', ips: ['203.0.113.99'] }),
+    });
+    expect(bad.status).toBe(401);
+    // Valid token: invalid/duplicate entries are filtered; survivors persist.
+    const ok = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        token, source: 'client-scan',
+        ips: ['203.0.113.99', '203.0.113.100', '203.0.113.99', '999.1.1.1', '203.0.113.10'],
+      }),
+    });
+    expect(ok.status).toBe(200);
+    const body = (await ok.json()) as Record<string, any>;
+    expect(body.ok).toBe(true);
+    // dedup + invalid (999.1.1.1) dropped; .99/.100/.10 are all new to the (empty) harvest set
+    expect(body.accepted).toBe(3);
+    // The manifest now serves env ∪ D1 harvest (dedup, env order first).
+    const feed = await mf.dispatchFetch(`https://gozargah.test/sub/${token}/axr-manifest`);
+    const m = (await feed.json()) as Record<string, any>;
+    expect(m.clean_ip_hints).toEqual(['203.0.113.10', '203.0.113.11', '203.0.113.99', '203.0.113.100']);
+    // The sig still verifies after the union (structural fields changed coherently).
+    const { createHmac } = await import('node:crypto');
+    const canonical = [
+      String(m.schema), String(m.version), String(m.host), String(m.ws_path_base),
+      String(m.path_rotation_minutes), (m.transports as string[]).join(','),
+      (m.entries as Array<Record<string, string>>).map((e) => e.host + ':' + e.role).sort().join(','),
+      (m.clean_ip_hints as string[]).join(','), m.fronting_hint ?? '',
+      String(m.flow_profile.mode), String(m.reconnect.probe_interval_ms),
+    ].join('|');
+    expect(m.manifest_sig).toBe(createHmac('sha256', token).update(canonical, 'utf8').digest('hex'));
+  });
+
+  it('stores canary liveness reports via harvest kind=canary (2.17)', async () => {
+    const token = await subTokenFor('gozargah.test', axrV2User!.uuid);
+    const endpoint = 'https://gozargah.test/gozargah/api/network/harvest';
+    // Bad canary host is rejected with 400.
+    const bad = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, kind: 'canary', canaryHost: 'not_a_host', canaryOk: true }),
+    });
+    expect(bad.status).toBe(400);
+    // Valid reports are stored newest-first, capped.
+    const ok1 = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, kind: 'canary', canaryHost: 'canary.example.com', canaryOk: true }),
+    });
+    expect(ok1.status).toBe(200);
+    let body = (await ok1.json()) as Record<string, any>;
+    expect(body.ok).toBe(true);
+    expect(body.kind).toBe('canary');
+    expect(body.stored).toBe(1);
+    const ok2 = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, kind: 'canary', canaryHost: 'canary.example.com', canaryOk: false }),
+    });
+    expect(ok2.status).toBe(200);
+    body = (await ok2.json()) as Record<string, any>;
+    expect(body.stored).toBe(2);
+    // Unauthenticated canary reports are rejected like IP harvests.
+    const anon = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'canary', canaryHost: 'canary.example.com', canaryOk: true }),
+    });
+    expect(anon.status).toBe(401);
+  });
+
+  it('fleet canary failures raise manifest pressure to level 3 (2.17)', async () => {
+    const token = await subTokenFor('gozargah.test', axrV2User!.uuid);
+    const endpoint = 'https://gozargah.test/gozargah/api/network/harvest';
+    // The previous test left 2 results (1 ok, 1 fail). Add one more failure
+    // within the 30-min window -> 3 samples, 2/3 failing >= 0.5 floor.
+    const ok3 = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, kind: 'canary', canaryHost: 'canary.example.com', canaryOk: false }),
+    });
+    expect(ok3.status).toBe(200);
+    const m = (await (await mf.dispatchFetch(`https://gozargah.test/sub/${token}/axr-manifest`)).json()) as Record<string, any>;
+    expect(m.pressure).toBeDefined();
+    expect(m.pressure.level).toBe(3);
+    expect(m.pressure.reasons).toContain('canary_fleet_failures');
+    // Dynamic levers: faster probes + highest-entropy outflow profile.
+    expect(m.reconnect.probe_interval_ms).toBe(15_000);
+    expect(m.reconnect.probe_jitter_ms).toBe(15_000); // one-cycle de-sync width
+    expect(m.flow_profile.mode).toBe('video');
+    // The canary host is NOT in the manifest (env not configured here) and
+    // the signature still verifies over the (now higher) pressure dynamics.
+    expect((m.entries as Array<Record<string, string>>).some((e) => e.role === 'canary')).toBe(false);
+    const { createHmac } = await import('node:crypto');
+    const canonical = [
+      String(m.schema), String(m.version), String(m.host), String(m.ws_path_base),
+      String(m.path_rotation_minutes), (m.transports as string[]).join(','),
+      (m.entries as Array<Record<string, string>>).map((e) => e.host + ':' + e.role).sort().join(','),
+      (m.clean_ip_hints as string[]).join(','), m.fronting_hint ?? '',
+      String(m.flow_profile.mode), String(m.reconnect.probe_interval_ms),
+    ].join('|');
+    expect(m.manifest_sig).toBe(createHmac('sha256', token).update(canonical, 'utf8').digest('hex'));
   });
 });

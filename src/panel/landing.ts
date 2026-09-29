@@ -9,15 +9,41 @@ import { LOGO_FAV_B64 } from '../assets/logo';
 import { PANEL_CSS } from './styles';
 import { VERSION } from '../config';
 
+/**
+ * 2.13 — benign-traffic hardening for the stealth decoy:
+ *  - 3 subtly different poetic variants per language (content-variant rotation);
+ *  - a random padding comment so the byte hash/length of the response is not
+ *    constant across requests (defeats static page-hash fingerprinting).
+ * The page still leaks nothing; variants only change wording/padding.
+ */
+const VARIANTS: Record<'fa' | 'en', Array<{ line1: string; line2: string }>> = {
+  fa: [
+    { line1: 'هر مسیری، از یک گذرگاه می‌گذرد.', line2: 'سدی، پیش از آبِ روان نایستد.' },
+    { line1: 'گذرگاه‌ها همیشه باز هستند.', line2: 'آبِ روان، راه می‌یابد.' },
+    { line1: 'برای رسیدن، لازم است گذر کرد.', line2: 'مسیرهای بسته، دیر می‌مانند.' },
+  ],
+  en: [
+    { line1: 'Every road passes through a gateway.', line2: 'A dam cannot hold flowing water forever.' },
+    { line1: 'Gateways stay open.', line2: 'Flowing water finds a way.' },
+    { line1: 'To arrive, you pass through.', line2: 'Closed routes do not last.' },
+  ],
+};
+
+function randomHex(len: number): string {
+  const b = crypto.getRandomValues(new Uint8Array(Math.ceil(len / 2)));
+  let s = '';
+  for (const v of b) s += v.toString(16).padStart(2, '0');
+  return s.slice(0, len);
+}
+
 export function landingHtml(lang: string): string {
   const fa = lang !== 'en';
   const title = fa ? 'گذرگاه' : 'Gozargah';
-  const line1 = fa
-    ? 'هر مسیری، از یک گذرگاه می‌گذرد.'
-    : 'Every road passes through a gateway.';
-  const line2 = fa
-    ? 'سدی، پیش از آبِ روان نایستد.'
-    : 'A dam cannot hold flowing water forever.';
+  const pool = VARIANTS[fa ? 'fa' : 'en'];
+  const variant = pool[crypto.getRandomValues(new Uint32Array(1))[0] % pool.length];
+  const line1 = variant.line1;
+  const line2 = variant.line2;
+  const pad = '<!-- gz:' + randomHex(16) + '-->';
   return (
     '<!DOCTYPE html><html lang="' + (fa ? 'fa' : 'en') + '" dir="' + (fa ? 'rtl' : 'ltr') + '"><head>' +
     '<meta charset="utf-8">' +
@@ -43,6 +69,6 @@ export function landingHtml(lang: string): string {
     '<p>' + line1 + '</p>' +
     '<p class="p2">«' + line2 + '»</p>' +
     '<footer>Gozargah · v' + VERSION + '</footer>' +
-    '</div></body></html>'
+    '</div>' + pad + '</body></html>'
   );
 }

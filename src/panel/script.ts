@@ -419,6 +419,7 @@ export const PANEL_JS = String.raw`
     api('/settings').then(function (s) {
       S.settings = s;
       $('#s-proxyips').value = (s.proxyIPs || []).join('\n');
+      $('#s-backupentries').value = (s.backupEntryHosts || []).join('\n');
       $('#s-subpath').value = s.subPath || '';
       $('#s-panelpath').value = s.panelPath || '';
       $('#s-resetcycle').value = s.resetCycle || 'none';
@@ -430,6 +431,7 @@ export const PANEL_JS = String.raw`
     var btn = $('#save-settings'); btn.disabled = true; btn.textContent = t('saving');
     var body = {
       proxyIPs: $('#s-proxyips').value.split('\n').map(function (x) { return x.trim(); }).filter(Boolean),
+      backupEntryHosts: $('#s-backupentries').value.split('\n').map(function (x) { return x.trim(); }).filter(Boolean),
       subPath: $('#s-subpath').value.trim(),
       panelPath: $('#s-panelpath').value.trim(),
       resetCycle: $('#s-resetcycle').value || 'none'

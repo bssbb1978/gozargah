@@ -5,8 +5,9 @@
  */
 import { Env, VERSION } from '../config';
 import { listUsers } from '../db/users';
-import { loadSettings, loadPathHealth, loadProfileHealth, loadAiModelHealth, saveAiModelHealth, loadNetworkState } from '../db/store';
+import { loadSettings, loadPathHealth, loadProfileHealth, loadAiModelHealth, saveAiModelHealth, loadNetworkState, loadPredictiveStates } from '../db/store';
 import { decideResilience, localResilienceAdvice, PathObservation } from './resilience';
+import type { RegimeAssessment } from './regime';
 
 export interface AiBinding {
   run(model: string, input: {
@@ -163,6 +164,23 @@ function localAdvice(summary: Record<string, number | string>, language: 'fa' | 
       ? 'هیچ ProxyIP جایگزینی تنظیم نشده؛ فقط برای مقصدهای پشت Cloudflare کاربرد دارد و راهکار عمومی قطعی فیلترینگ نیست.'
       : 'No ProxyIP fallback is configured. It only applies to Cloudflare-fronted destinations and is not a general censorship workaround.');
   }
+  // 2.12 — regime intelligence note (aggregate statistics, never DPI proof).
+  const regimeState = String(summary.regimeState ?? 'unknown');
+  if (regimeState === 'suspected_change') {
+    notes.push(language === 'fa'
+      ? 'هوش مصنوعی داخلی افت محسوس نرخ موفقیت در پنجرهٔ اخیر نسبت به خط پایه دیده است (فقط آمار تجمیعی، نه تشخیص DPI و نه اثبات فیلتر). موتور به‌طور خودکار تنوع ترنسپورت و نقاط ورود را افزایش داده است؛ تنظیمات را تغییر ندهید تا شواهد تازه‌تر جمع شود.'
+      : 'The internal AI detected a material drop in the recent success rate versus baseline (aggregate statistics only — not DPI detection or proof of filtering). The engine has automatically increased transport/entry diversity; avoid changing settings until fresher evidence arrives.');
+  } else if (regimeState === 'recovering') {
+    notes.push(language === 'fa'
+      ? 'نرخ موفقیت در پنجرهٔ اخیر نسبت به خط پایه بهبود یافته و رژیم به سمت پایدار در حال بازگشت است (آمار تجمیعی).'
+      : 'The recent success rate recovered versus baseline; the regime is returning to stable (aggregate statistics).');
+  }
+  const netState = String(summary.networkState ?? 'unknown');
+  if (Number(summary.backupEntryCount) === 0 && (netState === 'recovery' || netState === 'no_healthy_path')) {
+    notes.push(language === 'fa'
+      ? 'هیچ نقطهٔ ورود جایگزینی تنظیم نشده است؛ اضافه کردن دومینِ دوم متصل به همین Worker (از بخش تنظیمات) احتمال بقای مسیر در قطع‌ها و فیلترهای موضعی را بالا می‌برد — اما نمی‌تواند قطع کامل مسیر را از راه دور رفع کند.'
+      : 'No backup entry point is configured; adding a second domain pointing at this same Worker (Settings) raises the odds of a surviving route during partial outages — it cannot remotely restore a fully cut path.');
+  }
   if (!notes.length) {
     notes.push(language === 'fa'
       ? 'از شمارنده‌های موجود مشکل قطعی مشخص نیست. وضعیت شبکهٔ کاربر و سلامت دامنه را از همان شبکه به‌صورت جداگانه بررسی کنید.'
@@ -193,6 +211,19 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
 }> {
   const users = env.GZ_DB ? await listUsers(env.GZ_DB) : [];
   const enabled = users.filter((u) => u.enabled).length;
+  // 2.12 — aggregate regime label + configured backup entry count (never
+  // hostnames or per-user data).
+  let regime: RegimeAssessment | null = null;
+  let backupEntryCount = 0;
+  if (env.GZ_DB) {
+    try { backupEntryCount = (await loadSettings(env.GZ_DB))?.backupEntryHosts?.length ?? 0; } catch { /* optional */ }
+    try {
+      const rows = await loadPredictiveStates(env.GZ_DB, 'regime');
+      const row = rows.find((r) => r.subjectId === 'global');
+      if (row) regime = JSON.parse(row.stateJson) as RegimeAssessment;
+    } catch { /* optional */ }
+  }
+  const networkState = env.GZ_DB ? ((await loadNetworkState(env.GZ_DB))?.state ?? 'unknown') : 'unknown';
   const summary = {
     version: VERSION,
     database: env.GZ_DB ? 'connected' : 'not_bound',
@@ -205,7 +236,10 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
     configuredFallbackCount: env.GZ_DB ? (await loadSettings(env.GZ_DB))?.proxyIPs.length ?? 0 : 0,
     pathHealthCount: env.GZ_DB ? (await loadPathHealth(env.GZ_DB)).length : 0,
     profileHealthCount: env.GZ_DB ? (await loadProfileHealth(env.GZ_DB)).length : 0,
-    networkState: env.GZ_DB ? ((await loadNetworkState(env.GZ_DB))?.state ?? 'unknown') : 'unknown',
+    networkState,
+    regimeState: regime?.state ?? 'unknown',
+    regimeConfidence: regime ? regime.confidence : 0,
+    backupEntryCount,
   };
 
   if (env.GZ_DB) {
@@ -228,8 +262,8 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
 
   const models = await selectModels(env);
   const system = language === 'fa'
-    ? 'شما مشاور عملیات فقط-خواندنی برای پنل Cloudflare Worker هستید. بر اساس فقط شمارنده‌های تجمیعی، حداکثر سه پیشنهاد عملی و کوتاه به فارسی بده. هیچ‌گاه ادعای تضمین عبور از فیلترینگ/DPI نکن، روش پنهان‌سازی یا دورزدن محدودیت شبکه ارائه نده، تنظیمات را تغییر نده و اگر داده کافی نیست صریح بگو. موارد قابل پیشنهاد: امنیت حساب، سهمیه/انقضا، بازبینی سلامت Worker/D1، بررسی دستی و مجاز دامنه یا مسیر. پاسخ را با محدودیت‌ها و عدم قطعیت همراه کن.'
-    : 'You are a read-only operations advisor for a Cloudflare Worker panel. Give at most three concise, practical recommendations based only on aggregate counters. Never claim guaranteed censorship/DPI bypass, provide stealth/evasion instructions, or change settings. If evidence is insufficient, say so. You may suggest account security, quota/expiry review, Worker/D1 health checks, and authorized manual domain/path checks. State uncertainty and platform limitations.';
+    ? 'شما مشاور عملیات فقط-خواندنی برای پنل Cloudflare Worker هستید. بر اساس فقط شمارنده‌های تجمیعی (از جمله regimeState به‌عنوان برچسب آماری تجمیعی و backupEntryCount)، حداکثر سه پیشنهاد عملی و کوتاه به فارسی بده. هیچ‌گاه ادعای تضمین عبور از فیلترینگ/DPI نکن، regimeState را «تشخیص DPI» تفسیر نکن، روش پنهان‌سازی یا دورزدن محدودیت شبکه ارائه نده، تنظیمات را تغییر نده و اگر داده کافی نیست صریح بگو. موارد قابل پیشنهاد: امنیت حساب، سهمیه/انقضا، بازبینی سلامت Worker/D1، بررسی دستی و مجاز دامنه یا مسیر، و در صورت صفر بودن backupEntryCount توصیهٔ افزودن نقطهٔ ورود جایگزین. پاسخ را با محدودیت‌ها و عدم قطعیت همراه کن.'
+    : 'You are a read-only operations advisor for a Cloudflare Worker panel. Give at most three concise, practical recommendations based only on aggregate counters (including regimeState as an aggregate statistics label and backupEntryCount). Never claim guaranteed censorship/DPI bypass, never interpret regimeState as DPI detection, do not provide stealth/evasion instructions, and do not change settings. If evidence is insufficient, say so. You may suggest account security, quota/expiry review, Worker/D1 health checks, authorized manual domain/path checks, and — when backupEntryCount is zero — suggesting a backup entry point. State uncertainty and platform limitations.';
   const prompt = JSON.stringify(summary);
   let lastError: unknown;
   for (const model of models) {

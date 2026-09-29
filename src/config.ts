@@ -2,8 +2,8 @@
  * Gozargah — global config, types and shared errors.
  */
 
-export const VERSION = '2.11.0';
-export const SCHEMA_VERSION = 15;
+export const VERSION = '2.17.0';
+export const SCHEMA_VERSION = 17;
 
 /** D1 binding name (see wrangler.toml) */
 export const DB_BINDING = 'GZ_DB';
@@ -36,6 +36,26 @@ export interface Env {
   DNS64_PREFIX?: string;
   /** Comma-separated ports for scheduled health probes of configured endpoints. */
   HEALTH_PROBE_PORTS?: string;
+  /** 2.13 — in-tunnel traffic shaping: 'conservative' (default), 'aggressive' or 'off'. */
+  TRAFFIC_SHAPE?: string;
+  /** 2.15 — comma-separated clean Cloudflare edge IPv4 hints re-broadcast in the AXR manifest. */
+  CLEAN_EDGE_IPS?: string;
+  /** 2.16 — operator-level token accepted by POST /{panelPath}/api/network/harvest
+   *  (a valid user subscription token is always accepted too). */
+  HARVEST_TOKEN?: string;
+  /** 2.16 — domestic-CDN fronting relay host. When set (and validated), it is
+   *  published as `fronting_hint` in the AXR manifest: deploy this same Worker
+   *  script to a domestic CDN domain and point this var at that domain. The
+   *  client core merges it into the entry ladder as a high-priority backup. */
+  FRONTING_RELAY_HOST?: string;
+  /** 2.17 — canary liveness host for the closed-loop pressure engine. When set
+   *  (and validated) it is published in the AXR manifest (entries role
+   *  "canary" + a `canary` pointer, both inside the HMAC coverage); client
+   *  cores probe it as a plain TLS liveness check and report ok/fail via the
+   *  harvest endpoint (kind="canary"). The fleet's canary evidence then
+   *  drives the dynamic manifest (rotation/probe/flow-profile). A canary is
+   *  a liveness signal, never a DPI detector. */
+  AXR_CANARY_HOST?: string;
   /** Optional Xray/sing-box origin engine for protocols not terminated natively by the Worker. */
   ORIGIN_ENGINE_HOST?: string;
   /** Optional origin engine port; defaults to 443. */

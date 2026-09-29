@@ -1,4 +1,142 @@
-# Gozargah 2.11.0 — AEAD, DNS64 & Evidence-Scoped Adaptation
+# Gozargah 2.17.0 — AXR-v3.1 Deep Evasion: Closed-Loop Fleet Pressure + Ensemble AI + net-e-melli Reflex
+
+## 2.17.0 — AXR-v3.1 Deep Evasion (advanced increment)
+
+### Highlights
+- **Closed-loop fleet pressure (fully automatic, no human in the loop)** — the client's new **canary** liveness loop (plain TLS probe of the operator's `AXR_CANARY_HOST`, HMAC-signed into the manifest's `entries` field) reports ok/fail to the harvest endpoint (`kind: "canary"`); the new Worker **pressure engine** (`src/ai/pressure.ts`) fuses fleet canary evidence + clean-IP harvest freshness + the aggregate regime label into a 0–3 level that **dynamically** re-tunes every manifest: probe cadence 90 s → 15 s, outflow-profile floor web → video, entry diversity 4 → 6. A filter change degrades the fleet canary → pressure rises → the next (HMAC-verified) manifest makes all clients probe faster, morph harder, and have more options — and it decays automatically on recovery. Absence of evidence is never pressure (fresh installs stay at level 0).
+- **net-e-melli reflex (`netstate`, Go)** — a 12-observation hysteresis state machine (stable ⇄ degraded ⇄ cut ⇄ recovering) over the client's own tunnel outcomes + canary probes. The net-e-melli signature (international primaries failing while the domestic fronting entry still succeeds) is recognized within two failed connections and triggers **automatic priority inversion**: the fronting entry jumps to the front of the ladder (priority 50 → 10, → 0 under full cut) and the probe cadence goes aggressive — instead of waiting for the bandit to quarantine dead entries one by one. A live canary vetoes any "cut" verdict (it travels the same international pipe).
+- **Ensemble internal AI (`bandit`, Go)** — the 16-dim LinUCB is now joined by a per-arm **Beta-Bernoulli Thompson sampler**, with a **meta-learned arbitration weight** (realized-reward EMAs, tanh-combined): after each pull, credit goes to whichever member's deterministic ranking picked the arm that carried, so the hedge between condition-aware and outcome-aware learning is itself learned. Seeded draws keep selection deterministic; 2.16 snapshots restore to the neutral ensemble; the decision audit gains `model: "lin"|"ts"`.
+- **Surgery v2 (`surgery`, Go)** — the multi-segment ClientHello surgery now extends across the **first 1–3 client-flight writes** (`frag_writes`, not just the ClientHello — certificate/key-encipherment/CCS/finished records carry the shape too), and the inter-segment micro-gaps are drawn from a **non-linear skewed distribution** (`SkewGap`, u² — heavy toward the small end, like real interactive traffic; a uniform draw is statistically distinguishable).
+- **Flow-profile floor (`flowprofile`, Go)** — the manifest's (now pressure-driven) `flow_profile.mode` can only **escalate** the client's local regime-driven profile (web < chat < video): the client never morphs below what the fleet evidence asks for.
+- **Version** — Worker `VERSION 2.17.0` / `SCHEMA_VERSION 17`; manifest keeps the pinned 11-field HMAC canonical (the canary rides inside the signed `entries` field — a tampered canary fails the signature); client core updated.
+
+### Honest platform boundary (restated)
+The canary is a liveness signal, never a DPI detector — its outputs are pressure levels and priority policies, not identifications; the Worker still performs no active probing. eBPF/TC/XDP, UDP-noise, DoH/ICMP steganography are **not shipped** (roadmap, as in 2.16 — 0-RTT session-ticket resumption is the documented v3.2 candidate). Nothing here is a guarantee: a fully cut route is reported, not looped.
+
+### Verification status
+Worker side: `npm run typecheck`, `npm run test:engine` (12 suites incl. the new `pressure` suite, 14 checks: engine rules, evidence reduction, canary manifest wiring + HMAC coverage) and `npm run test:integration` (22 tests incl. canary harvest auth/shape and fleet-failure → level 3 → dynamic manifest levers) all pass; bundle 521.09 KiB / 135.92 KiB gzip. Go core: complete source + unit tests (netstate 7, bandit 20 incl. sampler moments + arbitration + determinism + 2.16-compat restore, surgery 14 incl. multi-write + skew gaps), **not compiled in the authoring sandbox** (no Go toolchain) — the gate is automated in [CI v3.1](.github/workflows/ci-v31.yml) (matrix: linux/darwin/windows + Android NDK; `go vet` + staticcheck on both TLS identities, `go test -race`, stripped cross-builds; full checklist in [CI-EXECUTION-CHECKLIST](docs/CI-EXECUTION-CHECKLIST.md)) and locally `go vet && go build && go test -race ./...` per [AXR-DEPLOY](docs/AXR-DEPLOY.md).
+
+### Engineering documents
+- [AXR-v3.1 Deep Evasion (2.17) — closed-loop spec, wire contracts, verification matrix](docs/AXR-V31-DEEP-EVASION.md)
+- [AXR-v3 Hyper-Resilience (2.16) — spec mapping, wire contracts, roadmap](docs/AXR-V3-HYPER-RESILIENCE.md)
+- [AXR-v2 Enterprise Core — Advanced Features (2.15)](docs/AXR-V2-ADVANCED.md)
+- [AXR Protocol Specification](docs/AXR-SPEC.md)
+- [AXR Cross-Compile & Deploy Guide](docs/AXR-DEPLOY.md)
+- [Client Core README](client/README.md)
+- [Test Report 2.17.0](TEST-REPORT-2.17.0.md)
+- [Persian Upgrade Report 2.17.0](UPGRADE-REPORT-FA-2.17.0.md)
+
+## 2.16.0 — AXR-v3 Hyper-Resilience (advanced increment)
+
+### Highlights
+- **Fully-automatic clean-IP loop (Worker + Go client)** — the CFScanner capability set from the production Rust scouting scripts is now first-class and *swapped into the platform, with no capability deleted*: new `client/internal/cfscan` (Cloudflare API CIDRs with offline snapshot fallback, operator priority /24 ranges, blocked-range exclusion, SNI-anchored TLS probes ×3 with **real cert verification**, median RTT + loss, `/cdn-cgi/trace` **colo validation**, top-N ranking, JSON+CSV reports) and a new Worker endpoint `POST /{panelPath}/api/network/harvest` (token-gated: any valid subscription token or `HARVEST_TOKEN`; IPv4 validate → dedup → cap 32 → D1-persist). `axr scan [-upload]` probes from the local network, refreshes `~/.axr/clean-ips.json` (auto-merged into the failover ladder at startup, 30-day freshness guard), and publishes the survivors to the Worker; the manifest then serves `clean_ip_hints = env ∪ D1` to **every** client. Cron-ready, zero human in the loop.
+- **Manifest v3 with HMAC integrity** — `manifest_sig` = HMAC-SHA256 over a canonical 11-field string, keyed by the user's subscription token (shared pinned test vector in both test suites + [docs/AXR-V3-HYPER-RESILIENCE](docs/AXR-V3-HYPER-RESILIENCE.md) §5). The Go client verifies in constant time: tampered manifest → **rejected**, last-known-good state kept + raw JSON persisted for audit; absent signature (older workers) → documented unverified mode.
+- **Domestic-CDN fronting hint** — operator env `FRONTING_RELAY_HOST` (validated hostname) is published as `fronting_hint` and joined by every client as a priority-50 ladder entry (ws + ws-alt arms) — deploy the same Worker to a domestic CDN domain and it becomes a reachable second entry automatically.
+- **16-dim LinUCB context (was 7)** — measured, not assumed: real tunnel **throughput** (bytes/sec EWMA from pump accounting), **loss velocity** (recent-vs-baseline drop rate), **TLS error rate**, **entry churn** (dial-address change = BGP-flap/anyshift proxy), **time-of-day sin/cos**, **session longevity**, **regime ordinal**, and the **flow-profile KL divergence** below. Per-arm 16×16 ridge state; 2.15 snapshots restore stats with the ridge prior rebuilt (dim migration unit-tested).
+- **KL-divergence self-monitoring** — new `flowprofile.KLDiv` + `TargetBins` + shared frame buckets: the pump buckets every outflow WS frame live, and the core continuously measures `KL(empirical outflow ‖ target app-class profile)` feeding bandit feature f11 — the client *knows* when its morph is drifting from its own target.
+- **Multi-segment ClientHello surgery (fragA/fragB style)** — `surgery.MultiSplitConn`: the first write is cut at randomized **2–3 split points** inside the **SNI region** (40–90 % window) with **1–8 ms micro-gaps** (per-connection randomization; deterministic seeded tests). Same honest boundary: TCP-level segmentation of TLS-produced bytes — no record padding, no extension rewriting.
+- **Version** — Worker `VERSION 2.16.0` / `SCHEMA_VERSION 16`; client core updated; decoy layer and 0-RTT early data (2.15) retained unchanged.
+
+### Honest platform boundary (restated)
+eBPF/TC/XDP, UDP-noise, DoH/ICMP steganography are **not shipped** (root+Linux/raw-socket deployment cost; socket-level segmentation already produces the same on-wire TCP effect for this client) — documented with the v3.1 roadmap in [AXR-v3 Hyper-Resilience](docs/AXR-V3-HYPER-RESILIENCE.md) §1/§10. Nothing here is DPI detection; a probe success is "this edge IP answers the relay's TLS handshake from *your* network now"; a fully cut route cannot be created from the client and is reported, not looped.
+
+### Verification status
+Worker side: `npm run typecheck`, `npm run test:engine` (36 checks incl. new `manifest-integrity` vector suite) and `npm run test:integration` (20 tests incl. new HMAC-verify, fronting-hint, harvest-ingest suites) all pass. Go core: complete source + unit tests (cfscan pure logic, 16-dim LinUCB incl. dim-migration, KLDiv/TargetBins, PlanCuts/MultiSplitConn, manifest HMAC vector), **not compiled in the authoring sandbox** (no Go toolchain) — deploy gate `go vet && go build && go test ./...` per [AXR-DEPLOY](docs/AXR-DEPLOY.md).
+
+### Engineering documents
+- [AXR-v3 Hyper-Resilience (2.16) — spec mapping, wire contracts, roadmap](docs/AXR-V3-HYPER-RESILIENCE.md)
+- [AXR-v2 Enterprise Core — Advanced Features (2.15)](docs/AXR-V2-ADVANCED.md)
+- [AXR Protocol Specification](docs/AXR-SPEC.md)
+- [AXR Cross-Compile & Deploy Guide](docs/AXR-DEPLOY.md)
+- [Client Core README](client/README.md)
+- [Test Report 2.16.0](TEST-REPORT-2.16.0.md)
+- [Persian Upgrade Report 2.16.0](UPGRADE-REPORT-FA-2.16.0.md)
+
+## 2.15.0 — AXR-v2 Enterprise Core (advanced increment)
+
+### Highlights
+- **LinUCB contextual bandit (Go client, M1)** — the decision core upgrades from UCB1 to a zero-dependency **LinUCB** contextual bandit: per-arm ridge state (7×7 `A`, 7-dim `b`, pure-Go Gauss-Jordan inverse) scored against a **7-dim context** (RTT level, RTT variance, RST frequency, TLS drop delta, CUSUM loss step, protocol anomaly, bias) measured from the client's own outcomes. Same entry can be preferred or avoided as conditions change. Unchanged: [0,1] reward shaping, quarantine backoff, auto-prune (≥2 live arms), deterministic tie-breaks, atomic persistence (legacy 2.14 snapshots restore with the ridge prior rebuilt).
+- **App-class flow morphing (Go client, M2)** — new `internal/flowprofile`: post-handshake writes are split by a **packet-length histogram** toward a target app class (`web`/`video`/`chat`) with **lognormal inter-packet delays**; regime-driven (stable→web, watch→chat, suspected_change→video). Wired into `surgery.ChunkConn` via a `Slicer` interface. New `internal/sockopt`: **Nagle off + per-connection randomized `SO_SNDBUF`** (64–512 KB), build-tagged linux/darwin/windows, no-op elsewhere.
+- **Clean edge-IP harvesting (Go client, M3)** — `failover.HarvestedIPs` / `Engine.HarvestEntries` merge each entry's live **A records** (injectable resolver, IPv4-only, deduped, capped at 8, explicit operator IPs first) into the endpoint matrix at startup; the manifest's new `clean_ip_hints` (operator `CLEAN_EDGE_IPS`, validated) merge the same way.
+- **Session reuse + decision audit (Go client, M4 half)** — a tunnel ending on a clean local close keeps its WS **warm ≤ 30 s** for same-destination adoption (zero re-dial/re-handshake; stale sessions auto-fall-back to a fresh dial). Every decision appends to `~/.axr/decision.jsonl` (context, chosen arm, full score table, attempts tried, outcome; 4 MB rotation). Every entry now also runs a **`ws-alt`** arm — same host over the `gz_profile=fragmented` path/query shape — so the bandit learns the healthier shape.
+- **Scanner decoy layer (Worker, M4 half)** — new `src/panel/decoy.ts`: unmatched GET/HEAD requests with scanner path shapes (`/.env`, `/.git/…`, `/wp-login.php`, `/admin`, `/api/…`, `/config.json`, `/axr*`, `/sub/<bad>/…`, …) receive **benign variants** — 3 small-business HTML product pages (random 32-hex padding per response) or 2 benign JSON API shapes for JSON-typed probes — before the stealth landing. No user enumeration, no constant signature, real routes untouched, POST never decoyed.
+- **Manifest v2 fields (Worker)** — `transports: ["ws","ws-alt"]`, `flow_profile.mode` (regime-escalated web/chat/video from D1 state), `clean_ip_hints[]`.
+- **Reserved stubs, documented** — HTTP-chunked duplex relay measured untestable in CI (miniflare buffers request bodies → would ship unverified), so gRPC and HTTP/3 remain arm-set placeholders with documented status; WS (+ws-alt) is the shipped data plane.
+
+### Honest platform boundary (restated)
+Flow morphing shapes the client's own write segmentation — no payload inspection, no replayed traffic, no invisibility guarantee. The decoy layer changes *unmatched* probe responses only. A fully cut route (no path from the local network to any entry) cannot be created by client or Worker code; the core reports it instead of looping. See [AXR-v2 Advanced Features](docs/AXR-V2-ADVANCED.md).
+
+### Verification status
+Worker side: `npm run typecheck`, `npm test` (engine checks + 10 pure-logic suites incl. new `decoy` + 17 integration tests incl. new decoy/manifest-v2), and `npm run build` all pass. Go core: complete source + unit tests (LinUCB closed-form context tests, flowprofile distribution tests, sockopt, harvest), **not compiled in the authoring sandbox** (no Go toolchain) — deploy gate `go vet && go build && go test ./...` per [AXR-DEPLOY](docs/AXR-DEPLOY.md).
+
+### Engineering documents
+- [AXR-v2 Enterprise Core — Advanced Features (2.15)](docs/AXR-V2-ADVANCED.md)
+- [AXR Protocol Specification](docs/AXR-SPEC.md)
+- [AXR Cross-Compile & Deploy Guide](docs/AXR-DEPLOY.md)
+- [Client Core README](client/README.md)
+- [Test Report 2.15.0](TEST-REPORT-2.15.0.md)
+- [Persian Upgrade Report 2.15.0](UPGRADE-REPORT-FA-2.15.0.md)
+
+## 2.14.0 — AXR Protocol Framework
+
+### Highlights
+- **AXR native client core (Go, `client/`)** — a production SOCKS5 TCP inbound that tunnels every stream over a **bandit-selected VLESS-over-WebSocket** path. All TLS-identity morphing and ClientHello surgery is **client-side** (TLS terminates at the Cloudflare edge — the Worker never sees the ClientHello).
+  - **M1 decision core** (`internal/bandit` + `internal/measure`): a zero-dependency contextual **UCB1** learner over (host, transport, fingerprint) arms with throughput-stability + RTT reward shaping, quarantine backoff, and **auto-prune** of degraded arms (always ≥ 2 live). A deterministic state vector — RTT/jitter EWMA, RST & TLS-timeout rates, CUSUM step-change, HTTP anomaly codes — drives a regime label (`stable|watch|suspected_change|recovering`) that boosts exploration ×1.8 during suspected change.
+  - **M2 low-level surgery** (`internal/surgery`): the TLS **ClientHello is split into two TCP segments** at a randomized offset (25–85 % of the record, bias crossing the SNI extensions block) with a randomized 20–120 ms gap; post-handshake writes are **TCP-chunked** in randomized 512–1400 B pieces. uTLS identity rotation (`chrome/firefox/safari/randomized`) via the single pinned dependency `refraction-networking/utls v1.6.7`, opt-in with `-tags axr_utls` (default build is 100 % stdlib).
+  - **M3 national-intranet failover** (`internal/failover`): an endpoint matrix (host × clean-IP × transport × fp) with a **persistent routing cache** and live per-IP health, a `normal⇄aggressive` probe state machine (2 all-fail rounds → aggressive cadence), and instant zero-control-plane failover ordered by bandit score then IP health.
+  - **M4 Worker edge relay** (existing): zero-copy WS/chunked streaming, multi-domain routing, 0-RTT VLESS early data, dynamic fallback responses — now plus a new machine feed (below).
+- **AXR machine feed (Worker, 2.14 new)** — `GET /{subPath}/{token}/axr-manifest` returns `gozargah-axr-manifest/v1`: rotated WS path base, fingerprint window, regime/strategy/probe mode, network state, measured entry ladder (primary + backups), reconnect cadence (30 s in recovery), and an explicit `honest_limit`. Aggregate intelligence only; authenticated by the subscription token; unknown tokens fall through to the stealth landing.
+- **Native VLESS-WS tunnel** (`internal/vlessws`): VLESS v1 header byte-compatible with the Worker parser; 0-RTT early data via `Sec-WebSocket-Protocol` (the mechanism the Worker already consumes); full RFC 6455 client codec (mask, ping→pong, close, fragmentation).
+
+### Honest platform boundary (unchanged, restated)
+The client core is transport obfuscation and adaptive path selection — **not** payload inspection, **not** a DPI "detector", and **not** a bypass guarantee: its regime labels describe the client's own delivery quality. Post-handshake fragmentation is **TCP-level chunking**, not TLS record padding. The core is TCP-only (SOCKS5 CONNECT; UDP rejected, matching the no-UDP-relay boundary). And a fully cut route — no path from the user's network to any entry — cannot be created by client or Worker code; the core reports `no healthy candidate` instead of looping.
+
+### Verification status
+Worker side: `npm run typecheck`, `npm test` (36 engine checks + 9 pure-logic suites + 16 integration tests), and `npm run build` all pass (504.35 KiB / 131.51 KiB gzip). Go core: complete source + unit tests with a pinned `go.mod`, **not compiled in the authoring sandbox** (no Go toolchain) — the deploy gate is `go vet && go build && go test` per [AXR-DEPLOY](docs/AXR-DEPLOY.md).
+
+### Engineering documents
+- [AXR Protocol Specification](docs/AXR-SPEC.md)
+- [AXR Cross-Compile & Deploy Guide](docs/AXR-DEPLOY.md)
+- [Client Core README](client/README.md)
+- [Test Report 2.14.0](TEST-REPORT-2.14.0.md)
+- [Persian Upgrade Report 2.14.0](UPGRADE-REPORT-FA-2.14.0.md)
+
+## 2.13.0 — Hardened dynamic layer
+
+### Highlights
+- **Client fingerprint rotation** (`src/sub/fp-rotation.ts`): generated configs rotate the neutral uTLS identity (chrome/firefox/safari — the set every format supports) deterministically per user and 6h window, in step with the rotating WS path. Static JA3/JA4 blocklist entries go stale across windows. Explicit operator presets always win. TLS itself terminates at the Cloudflare edge — the Worker never sees or mutates the ClientHello.
+- **In-tunnel traffic shaping** (`src/utils/shape.ts`, WS pipeline): bounded downlink segmentation (≤8 segments, conservative default) with randomized inter-frame micro-gaps plus bounded handshake-timing jitter. Pure size/timing entropy inside the edge TLS tunnel; zero protocol-byte change; fully stock-client-compatible. `TRAFFIC_SHAPE=conservative|aggressive|off`.
+- **Aggressive probing state machine**: when the previous cycle was `recovery`/`no_healthy_path`/`UPSTREAM_UNAVAILABLE`/`SEVERELY_DEGRADED`, the next cycle probes backup entries with full-path HTTPS (DNS+TCP+TLS+HTTP on `/healthz`) so a reopening route is detected and selected immediately. Transitions audited via `probe_mode_changed`.
+- **Internal decision view**: `GET /{panelPath}/api/network/decision` — one bounded verdict (`stable|watch|degraded|critical`) with score, regime label, controller strategy, probe mode, traffic shape, active profile, fallback ladder, emergency entries and honest bilingual advice. Synthesized from the existing engines; no external model required.
+- **Smart client reconnection**: Xray-core `observatory.probeInterval` is emitted as 30s during engine recovery and 90s otherwise; the live bundle gains `client_behavior.reconnect` (observe-and-failover, backoff schedule, ladder-ordered failover, immediate resume on route reopen) plus `fingerprint` and `traffic_shape` metadata blocks.
+- **Stealth decoy hardening**: the landing page now serves rotated wording variants + random padding per response (byte-hash/length variance) while still leaking no state.
+
+### Honest platform boundary (unchanged, restated)
+The Worker cannot create or mutate the TLS ClientHello, cannot add FEC, and does not mutate protocol framing — VLESS/Trojan/Shadowsocks remain stock-client-compatible. Shaping, fingerprint rotation, path rotation and entry diversity raise the odds a route survives partial filtering; they are aggregate-statistics adaptation, not a DPI classifier, and no bypass is guaranteed. A fully cut route (no path from the user's network to the Worker/Cloudflare edge) cannot be restored remotely by any Worker code.
+
+### Engineering documents
+- [Test Report 2.13.0](TEST-REPORT-2.13.0.md)
+- [Persian Upgrade Report 2.13.0](UPGRADE-REPORT-FA-2.13.0.md)
+- [Adaptive Engine](ADAPTIVE-ENGINE.md)
+- [AI Engine and limits](AI-ENGINE.md)
+
+## 2.12.0 — Fully dynamic adaptive layer
+
+### Highlights
+- **Internal AI regime detection** (`src/ai/regime.ts`): a bounded, deterministic change-point detector (dual-timescale windows + step-change rule + one-sided CUSUM) over the aggregate probe/dial outcome stream. A suspected regime change automatically upgrades the protocol controller from `stable` to `diversify` so the emitted fallback ladder spans more transport/protocol families. States are `stable | watch | suspected_change | recovering` with confidence and reason codes; persisted in D1 and audited via the `network_regime_changed` event.
+- **Dynamic rotating WebSocket path**: every generated link uses a deterministic 6-hour-rotating path base (`/<uuid>/g/<16hex>`). The Worker accepts any path, so previous windows stay valid — installed clients are never stranded — while static path fingerprints go stale each window. All client formats (raw, Base64, Clash-Meta, Sing-box, Xray-core) rotate at generation time.
+- **Emergency entry ladder**: up to four `backupEntryHosts` (other domains pointing at the same Worker) configured in the panel. The scheduled health loop probes them on 443; the live bundle publishes `emergency_ladder` with measured status and an explicit honest-limit statement; every client format emits same-credentials outbounds for the backup hosts (Xray-core joins the `auto-best` balancer so its observatory probes reachability); the user status page lists per-host tokens/links and shows an honest network alert in `recovery`/`no_healthy_path`.
+- **Read-only advisor extended**: the optional Workers AI advisor now receives `regimeState`, `regimeConfidence` and `backupEntryCount` (aggregate only) and is explicitly instructed not to interpret the regime label as DPI detection; local rule-based advice gains honest regime/backup notes.
+- **Panel**: `/api/network/state` returns the regime label and configured backup entries; the settings form gains the backup-entry field (fa/en).
+
+### Honest platform boundary (unchanged, restated)
+The regime label is aggregate statistics — not a DPI classifier, not a censorship proof; no payload is inspected and no bypass is guaranteed. Rotating paths and entry diversity raise the odds a route survives a partial block or outage. The emergency ladder only helps while at least one entry point (primary or backup domain) is still reachable from the client network: if no route to the Worker/Cloudflare edge remains, no Worker code can create a new route remotely. Shadowsocks remains TCP-only `aes-256-gcm`/SIP004 over WebSocket, VLESS UDP remains DNS-only on port 53, and DNS64 still requires a reachable NAT64 translator.
+
+### Engineering documents
+- [Test Report 2.12.0](TEST-REPORT-2.12.0.md)
+- [Persian Upgrade Report 2.12.0](UPGRADE-REPORT-FA-2.12.0.md)
+- [Adaptive Engine](ADAPTIVE-ENGINE.md)
+- [AI Engine and limits](AI-ENGINE.md)
 
 ## 2.11.0 — Protocol and DNS data-plane additions
 
@@ -76,7 +214,7 @@ New endpoints:
 
 **گذرگاه** یک پنل پروکسی چندکاربرهٔ کامل است که به‌صورت بومی روی Cloudflare Workers زندگی می‌کند: یک فایل جاوااسکریپت که همه‌چیز داخلش تعبیه شده — پنل مدیریت، موتور پروکسی، اشتراک‌ساز، صفحهٔ وضعیت کاربر و تمام دارایی‌های رابط کاربری. نه سرور می‌خواهد، نه نصب، نه هزینه؛ یک اکانت رایگان کلودفلر و پنج دقیقه وقت کافی است تا یک پنل کامل با دیتابیس اختصاصی، داشبورد فارسی/انگلیسی و لینک اشتراک برای هر کاربر داشته باشید.
 
-طراحی گذرگاه از روز اول با سه قاعده پیش رفته: **امنیت واقعی به‌جای نمایشی**، **حسابداری دقیق به‌جای تخمین**، و **تصمیم‌گیری محلیِ قابل‌توضیح**. قابلیت‌های قدیمی‌تر مانند پریست اپراتورها، کانفیگ تطبیقی و صفحهٔ وضعیت حفظ شده‌اند. در نسخهٔ **2.11.0**، Shadowsocks AEAD روی WebSocket/TLS، DNS-over-HTTPS احراز هویت‌شده، فوروارد DNS از VLESS UDP پورت ۵۳ و DNS64 اضافه شده‌اند. این قابلیت‌ها مرزهای واقعی Worker را تغییر نمی‌دهند: UDP عمومی و NAT64 gateway ارائه نمی‌شود و هیچ مدل AI نمی‌تواند مسیر شبکه‌ای ازدست‌رفته یا عبور تضمینی از DPI ایجاد کند.
+طراحی گذرگاه از روز اول با سه قاعده پیش رفته: **امنیت واقعی به‌جای نمایشی**، **حسابداری دقیق به‌جای تخمین**، و **تصمیم‌گیری محلیِ قابل‌توضیح**. قابلیت‌های قدیمی‌تر مانند پریست اپراتورها، کانفیگ تطبیقی و صفحهٔ وضعیت حفظ شده‌اند. در نسخهٔ **2.13.0**، لایهٔ سخت‌افزای‌شده اضافه شد: چرخش فینگرپرینت کلاینت (uTLS/JA4) هر ۶ ساعت، شکل‌دهی ترافیک درون تونل (سایز/زمان‌بندی)، ماشین حالت پروب تهاجمی، و نمای تصمیم هوش مصنوعی داخلی. در نسخهٔ **2.12.0**، لایهٔ داینامیک و پویا اضافه شده: تشخیص تغییر رژیم با هوش مصنوعی داخلی (آمار تجمیعی، بدون payload)، مسیر چرخشی WebSocket هر ۶ ساعت، و پلهٔ اضطراری نقاط ورود جایگزین — که در قطع‌های موضعی شانس بقای مسیر را بالا می‌برند اما قطع کامل مسیر را از راه دور رفع نمی‌کنند. در نسخهٔ **2.11.0**، Shadowsocks AEAD روی WebSocket/TLS، DNS-over-HTTPS احراز هویت‌شده، فوروارد DNS از VLESS UDP پورت ۵۳ و DNS64 اضافه شده‌اند. این قابلیت‌ها مرزهای واقعی Worker را تغییر نمی‌دهند: UDP عمومی و NAT64 gateway ارائه نمی‌شود و هیچ مدل AI نمی‌تواند مسیر شبکه‌ای ازدست‌رفته یا عبور تضمینی از DPI ایجاد کند.
 
 ## ✨ چرا گذرگاه؟
 
@@ -338,6 +476,9 @@ npm run build        # اعتبارسنجی و باندل Worker با Wrangler 4
 - [x] ECH به‌صورت opt-in در فرمت‌های پشتیبانی‌شده — v1.2
 - [x] Shadowsocks AEAD به‌عنوان پروتکل سوم (SIP004 AES-256-GCM + v2ray-plugin) — 2.11
 - [x] فوروارد DNS با VLESS UDP روی پورت ۵۳، DoH و DNS64 — 2.11
+- [x] هوش مصنوعی داخلیِ تشخیص تغییر رژیم + استراتژی پویای diversify — 2.12
+- [x] مسیر چرخشی deterministicِ WebSocket (هر ۶ ساعت، سازگار با عقب) — 2.12
+- [x] پلهٔ اضطراری: نقاط ورود جایگزین با پروب سلامت و آوتباند در همهٔ قالب‌ها — 2.12
 
 ## 📄 لایسنس
 
@@ -361,7 +502,7 @@ MIT — آزاد برای استفاده، تغییر و توسعه. جزئیا�
 - The classifier is observational and does not claim to prove DPI or an international outage.
 
 
-## Protocol capability matrix (current: 2.11.0)
+## Protocol capability matrix (current: 2.12.0)
 
 Every protocol/transport pair is returned with an explicit boundary: `WORKER_NATIVE`, `ORIGIN_ENGINE_REQUIRED`, or `UNSUPPORTED`. The matrix is conservative: a profile is `ready` only if this repository has a matching generator. `ORIGIN_ENGINE_HOST` is a declaration, not a remote validation or health check. VLESS/Trojan WebSocket and Shadowsocks AEAD WebSocket profiles are Worker-native; Shadowsocks uses the v2ray-plugin and is TCP-only. UDP-only WireGuard/Hysteria2, generic Shadowsocks UDP, generic HTTP proxying, and unimplemented transports remain `UNSUPPORTED`. Separately, VLESS UDP is supported only for DNS destination port 53 via the DoH adapter; it is not a generic UDP capability.
 

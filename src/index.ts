@@ -17,11 +17,13 @@
 import { Env, VERSION } from './config';
 import { getEffectiveSettings } from './settings';
 import { acceptWebSocket } from './handlers/websocket';
-import { buildLiveAdaptiveClientBundle, findUserByToken, renderSub, resolveApp, subHeaders } from './subscription';
+import { buildAxrManifest, buildLiveAdaptiveClientBundle, findUserByToken, renderSub, resolveApp, subHeaders } from './subscription';
 import { resolveOpts } from './sub/operators';
 import { lazyMaintenance } from './db/users';
+import { loadNetworkState } from './db/store';
 import { handlePanelApi } from './panel/api';
 import { panelHtml } from './panel/ui';
+import { decoyResponse } from './panel/decoy';
 import { landingHtml } from './panel/landing';
 import { userPageHtml } from './panel/userpage';
 import { LOGO_FAV_B64 } from './assets/logo';
@@ -102,9 +104,15 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const user = await findUserByToken(env.GZ_DB, url.hostname, token);
     if (user) {
       if (segs.length === 2 && segs[1] === 'dns-query') return handleUserDnsRequest(request, env, user);
-      const dnsUrl = url.origin + '/' + eff.subPath + '/' + token + '/dns-query';
       const opts = resolveOpts(url.searchParams.get('op'), url.searchParams.get('ech'));
       const lang = url.searchParams.get('lang') === 'en' ? 'en' : 'fa';
+      // 2.14 — AXR machine feed: bootstrap JSON for the native AXR core (no UA sniffing).
+      if (segs.length === 2 && segs[1] === 'axr-manifest') {
+        // 2.16 — the token keys the manifest HMAC (manifest_sig).
+        const body = await buildAxrManifest(url.hostname, user, env, token);
+        return new Response(body, { headers: subHeaders(eff, url.hostname, user, 'adaptive', opts, token) });
+      }
+      const dnsUrl = url.origin + '/' + eff.subPath + '/' + token + '/dns-query';
       const app = resolveApp(appOverride, request.headers.get('user-agent') ?? '');
 
       // v1.2: lazy maintenance (first-use stamp + rolling reset) on any sub/status read
@@ -113,6 +121,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       }
 
       if (app === 'page') {
+        // 2.12 — best-effort network state for the honest emergency alert.
+        let netState: { state: string; updatedAt: number } | null = null;
+        if (env.GZ_DB) {
+          try {
+            const ns = await loadNetworkState(env.GZ_DB);
+            if (ns) netState = { state: ns.state, updatedAt: ns.updatedAt };
+          } catch { /* optional */ }
+        }
         const html = await userPageHtml({
           host: url.hostname,
           user,
@@ -122,6 +138,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
           lang,
           opts,
           echOn: !!opts.ech,
+          backupEntryHosts: eff.backupEntryHosts ?? [],
+          networkState: netState,
         });
         return new Response(html, {
           headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
@@ -132,13 +150,15 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         const body = await buildLiveAdaptiveClientBundle(url.hostname, user, opts, env, dnsUrl);
         return new Response(body, { headers: subHeaders(eff, url.hostname, user, app, opts, token) });
       }
-      const { body } = renderSub(app, url.hostname, user, opts, env, dnsUrl);
+      const { body } = await renderSub(app, url.hostname, user, opts, env, dnsUrl);
       return new Response(body, { headers: subHeaders(eff, url.hostname, user, app, opts, token) });
     }
     // unknown token: fall through to stealth landing (no user enumeration)
   }
 
-  // 5) landing for everything else (stealth, nahan-style no-leak)
+  // 5) scanner decoy (2.15) → stealth landing for everything else
+  const decoy = decoyResponse(request, url);
+  if (decoy) return decoy;
   return new Response(landingHtml('fa'), {
     headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
   });

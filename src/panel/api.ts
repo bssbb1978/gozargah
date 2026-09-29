@@ -8,7 +8,7 @@ import { Env, GzError, VERSION } from '../config';
 import { EffectiveSettings } from '../settings';
 import {
   addEvent, recentEvents, saveSettings, SettingsBlob, loadSettings, invalidateCache,
-  consumeAiDiagnosticQuota, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState, saveHealthSample, loadLatestPathSamples,
+  consumeAiDiagnosticQuota, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState, saveHealthSample, loadLatestPathSamples, loadPredictiveStates, loadCleanIPHarvest, saveCleanIPHarvest, appendCanaryResult,
 } from '../db/store';
 import {
   createUser, deleteUser, GzUser, invalidateUsers, listUsers, updateUser, flushUsage,
@@ -17,7 +17,7 @@ import {
   checkLoginGate, clearedCookie, ipHash, isAuthed, makeSessionToken, onLoginResult,
   requireAuth, sessionCookie, verifyPanelPassword,
 } from '../auth';
-import { buildLinks, subTokenFor, buildProtocolMatrix } from '../subscription';
+import { buildLinks, subTokenFor, buildProtocolMatrix, findUserByToken } from '../subscription';
 import { qrSvg } from '../utils/qr';
 import { logRing } from '../utils/log';
 import { pbkdf2Hex, randomHex } from '../utils/crypto';
@@ -28,6 +28,9 @@ import { buildAdaptiveProtocolPlan } from '../ai/protocol-controller';
 import { assessHealth } from '../ai/predictive-mesh';
 import { defaultEdgeLearner, learnerConfidence } from '../ai/edge-learner';
 import { classifyFailureDomain, classifyNetworkCondition, normalizeFetchFailure } from '../ai/network-intelligence';
+import { buildDecisionView } from '../ai/decision';
+import type { RegimeAssessment } from '../ai/regime';
+import { shapeModeFor } from '../utils/shape';
 
 const JSON_CT = 'application/json; charset=utf-8';
 
@@ -86,6 +89,67 @@ export async function handlePanelApi(
       if (db) await addEvent(db, 'login_ok', 'panel login');
       const token = await makeSessionToken(eff);
       return json({ ok: true }, 200, new Headers({ 'set-cookie': sessionCookie(token) }));
+    }
+
+    /* 2.16 — clean-IP harvest ingest. Public (no session cookie) but
+     * authenticated by a valid user subscription token OR the operator's
+     * HARVEST_TOKEN env secret. Body: {token, ips: string[], source}.
+     * The client `axr scan` runner POSTs its probe survivors here; they are
+     * validated, deduped, capped at 32, persisted to D1, and unioned into
+     * the AXR manifest clean_ip_hints. The Worker never probes itself —
+     * live reachability only the client's own network can measure. */
+    if (action === 'network/harvest' && method === 'POST') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const body = (await request.json().catch(() => ({}))) as {
+        token?: unknown; ips?: unknown; source?: unknown;
+        kind?: unknown; canaryHost?: unknown; canaryOk?: unknown;
+      };
+      const host = new URL(request.url).hostname;
+      const tokenIn = String(body.token ?? request.headers.get('x-harvest-token') ?? '');
+      let authorized = false;
+      if (tokenIn) {
+        if (env.HARVEST_TOKEN && tokenIn === env.HARVEST_TOKEN) {
+          authorized = true;
+        } else {
+          authorized = (await findUserByToken(db, host, tokenIn)) !== null;
+        }
+      }
+      if (!authorized) {
+        if (db) await addEvent(db, 'harvest_rejected', 'bad token');
+        return json({ error: 'unauthorized' }, 401);
+      }
+      // 2.17 — canary liveness reports: a client's periodic probe of the
+      // operator's canary host (ok/fail). Stored newest-first (capped) and
+      // reduced to fleet evidence by the pressure engine. No IP semantics.
+      if (String(body.kind ?? '') === 'canary') {
+        const canaryHost = String(body.canaryHost ?? '').trim().toLowerCase();
+        if (!canaryHost || canaryHost.length > 253 || !/^[a-z0-9][a-z0-9.-]*$/.test(canaryHost)) {
+          return json({ error: 'bad canary host' }, 400);
+        }
+        const row = await appendCanaryResult(db, { host: canaryHost, ok: Boolean(body.canaryOk), at: Date.now() });
+        await addEvent(db, 'harvest_canary', `${canaryHost}: ${row.results[0]?.ok ? 'ok' : 'fail'}`);
+        return json({ ok: true, kind: 'canary', stored: row.results.length });
+      }
+      const rawIps = Array.isArray(body.ips) ? body.ips : [];
+      const seen = new Set<string>();
+      const fresh: string[] = [];
+      for (const raw of rawIps) {
+        const ip = String(raw ?? '').trim();
+        if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) continue;
+        if (!ip.split('.').every((o) => Number(o) <= 255)) continue;
+        if (seen.has(ip)) continue;
+        seen.add(ip);
+        fresh.push(ip);
+        if (fresh.length >= 32) break;
+      }
+      const source = String(body.source ?? 'client-scan').slice(0, 48) || 'client-scan';
+      const existing = await loadCleanIPHarvest(db);
+      const merged = [...fresh, ...(existing?.ips ?? []).filter((ip) => !seen.has(ip))].slice(0, 32);
+      const sources = { ...(existing?.sources ?? {}) };
+      sources[source] = (sources[source] ?? 0) + fresh.length;
+      await saveCleanIPHarvest(db, { ips: merged, updatedAt: Date.now(), sources });
+      await addEvent(db, 'harvest_ok', `${source}: +${fresh.length} (total ${merged.length})`);
+      return json({ ok: true, accepted: fresh.length, stored: merged.length, total: merged.length, source });
     }
 
     /* ---------------- authenticated ---------------- */
@@ -153,10 +217,19 @@ export async function handlePanelApi(
         }
       }
       const condition = classifyNetworkCondition(configuredPaths, observations);
+      // 2.12 — aggregate regime label (internal AI, deterministic).
+      let regime: { state: string; confidence: number; baselineSuccess: number; recentSuccess: number; reasonCodes: string[] } | null = null;
+      try {
+        const rows = await loadPredictiveStates(db, 'regime');
+        const row = rows.find((r) => r.subjectId === 'global');
+        if (row) regime = JSON.parse(row.stateJson) as typeof regime;
+      } catch { /* optional */ }
       return json({
         ok: true,
         state,
         condition,
+        regime,
+        backupEntryHosts: settings?.backupEntryHosts ?? [],
         source: 'configured Worker-egress path telemetry only',
         physicalUpstreamDisconnectionProven: false,
         dpiProven: false,
@@ -318,6 +391,7 @@ export async function handlePanelApi(
         panelPath: s?.panelPath ?? eff.panelPath,
         subPath: s?.subPath ?? eff.subPath,
         proxyIPs: s?.proxyIPs ?? eff.proxyIPs,
+        backupEntryHosts: s?.backupEntryHosts ?? eff.backupEntryHosts ?? [],
         resetCycle: s?.resetCycle ?? eff.resetCycle ?? 'none',
         isDefaultPassword: s?.isDefaultPassword ?? eff.isDefaultPassword,
         dbOk: eff.dbOk,
@@ -359,6 +433,13 @@ export async function handlePanelApi(
             .filter((x) => /^[a-z0-9.\-:]+$/i.test(x) && x.length <= 253);
           if (ips.length > 32) throw new GzError('too many proxyIPs', 'validation');
           out.proxyIPs = ips.length ? ips : ['proxyip.cmliussss.net'];
+        }
+        if (Array.isArray(body.backupEntryHosts)) {
+          const hosts = (body.backupEntryHosts as unknown[])
+            .map((x) => String(x).trim().toLowerCase())
+            .filter((x) => /^[a-z0-9][a-z0-9.-]{2,252}$/.test(x) && x.includes('.'));
+          if (hosts.length > 4) throw new GzError('too many backupEntryHosts (max 4)', 'validation');
+          out.backupEntryHosts = hosts;
         }
         if (typeof body.newPassword === 'string' && body.newPassword.length > 0) {
           const pw = body.newPassword;
@@ -499,6 +580,57 @@ export async function handlePanelApi(
     if (action === 'events' && method === 'GET') {
       if (!db) return json({ events: [] });
       return json({ events: await recentEvents(db, 10) });
+    }
+
+    // 2.13 — internal decision view: the synthesized verdict of the local
+    // intelligence engine (network state + condition + regime + probe state
+    // machine + traffic shape + protocol plan + emergency ladder).
+    if (action === 'network/decision' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const [state, signal, policy, settings, pathRows] = await Promise.all([
+        loadNetworkState(db), loadPolicySignalState(db), loadProtocolPolicyState(db), loadSettings(db), loadPathHealth(db),
+      ]);
+      let regime: RegimeAssessment | null = null;
+      try {
+        const rows = await loadPredictiveStates(db, 'regime');
+        const row = rows.find((r) => r.subjectId === 'global');
+        if (row) regime = JSON.parse(row.stateJson) as RegimeAssessment;
+      } catch { /* optional */ }
+      let signalJson: Record<string, unknown> | null = null;
+      try { signalJson = signal ? (JSON.parse(signal.stateJson) as Record<string, unknown>) : null; } catch { signalJson = null; }
+      const host = new URL(request.url).hostname;
+      const ladder: Array<{ host: string; role: string; status: string; latencyMs: number | null }> = [
+        { host, role: 'primary', status: 'primary', latencyMs: null },
+      ];
+      for (const bh of (settings?.backupEntryHosts ?? []).slice(0, 4)) {
+        const row = pathRows.find((r) => r.pathId === 'entry:' + bh);
+        ladder.push({
+          host: bh, role: 'backup',
+          status: row ? (row.ok ? 'measured_ok' : 'measured_failed') : 'unmeasured',
+          latencyMs: row?.latencyMs ?? null,
+        });
+      }
+      const conditionCode = state?.reasonCodes.find((c) => c.startsWith('condition_'));
+      const view = buildDecisionView({
+        networkState: state ? {
+          state: state.state as 'healthy' | 'degraded' | 'recovery' | 'no_healthy_path',
+          confidence: state.confidence, updatedAt: state.updatedAt, reasonCodes: state.reasonCodes,
+        } : null,
+        conditionState: conditionCode ? conditionCode.slice('condition_'.length).toUpperCase() : null,
+        regime,
+        probeMode: signalJson?.probeMode === 'aggressive' ? 'aggressive' : 'normal',
+        shape: shapeModeFor(env.TRAFFIC_SHAPE),
+        plan: policy ? {
+          selected: policy.selectedProfile || null,
+          strategy: (signalJson?.strategy as 'stable' | 'diversify' | 'safe') ?? 'stable',
+          confidence: policy.confidence,
+          mode: policy.mode as 'normal' | 'degraded' | 'recovery' | 'no_healthy_path',
+          fallbackLadder: policy.fallbackLadder,
+          reasonCodes: policy.reasonCodes,
+        } : null,
+        ladder,
+      });
+      return json(view);
     }
 
     return json({ error: 'not_found' }, 404);

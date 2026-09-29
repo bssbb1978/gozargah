@@ -7,12 +7,13 @@
 
 import { connect } from 'cloudflare:sockets';
 import { Env } from '../config';
-import { addEvent, loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadProfileHealth, loadSettings, saveAdaptiveGuardState, saveNetworkState, savePathHealth, saveProtocolPolicyState, loadHealthSamples, saveHealthSample, savePredictiveState, savePolicySignalState } from '../db/store';
+import { addEvent, loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadProfileHealth, loadSettings, loadRecentHealthSamples, saveAdaptiveGuardState, saveNetworkState, savePathHealth, saveProtocolPolicyState, loadHealthSamples, loadPredictiveStates, saveHealthSample, savePredictiveState, savePolicySignalState } from '../db/store';
 import { classifyNetworkState } from './network-state';
-import { classifyNetworkCondition, normalizeSocketFailure } from './network-intelligence';
+import { classifyNetworkCondition, normalizeSocketFailure, normalizeFetchFailure } from './network-intelligence';
 import { updateObservation } from './resilience';
 import { buildAdaptiveProtocolPlan } from './protocol-controller';
 import { assessHealth } from './predictive-mesh';
+import { assessRegime, emptyRegime, type RegimeAssessment } from './regime';
 import { nextAdaptiveGuardState, reconcileAdaptivePlan } from './adaptive-guard';
 import { buildProtocolMatrix } from '../subscription';
 
@@ -45,6 +46,21 @@ async function probeEndpoint(host: string, port: number): Promise<{ ok: boolean;
   }
 }
 
+/** 2.13 — full-path entry probe (DNS+TCP+TLS+HTTP) used in aggressive mode. */
+async function probeEntryHttps(host: string): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
+  const started = Date.now();
+  try {
+    const res = await fetch('https://' + host + '/healthz', {
+      method: 'GET',
+      redirect: 'error',
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    return { ok: res.ok, latencyMs: Date.now() - started, error: res.ok ? undefined : 'http_status_' + res.status };
+  } catch (e) {
+    return { ok: false, latencyMs: Date.now() - started, error: normalizeFetchFailure(e) };
+  }
+}
+
 export async function runScheduledHealth(env: Env): Promise<void> {
   if (!env.GZ_DB) return;
   const settings = await loadSettings(env.GZ_DB);
@@ -54,6 +70,19 @@ export async function runScheduledHealth(env: Env): Promise<void> {
   const ports = parsePorts(env.HEALTH_PROBE_PORTS);
   const existing = await loadPathHealth(env.GZ_DB);
   const byId = new Map(existing.map((r) => [r.pathId, r]));
+
+  // 2.13 — probe state machine: when the PREVIOUS cycle was degraded
+  // (recovery / no_healthy_path / UPSTREAM_UNAVAILABLE / SEVERELY_DEGRADED),
+  // this tick probes entries with full-path HTTPS (DNS+TCP+TLS+HTTP) so the
+  // first route that reopens is detected and selected immediately. Bounded:
+  // ≤ 4 entries × (1 TCP + 1 HTTPS) per tick.
+  const previousNetworkState = (await loadNetworkState(env.GZ_DB).catch(() => null));
+  const previousConditionCode = previousNetworkState?.reasonCodes.find((code) => code.startsWith('condition_'));
+  const prevProbeMode: 'normal' | 'aggressive' =
+    previousNetworkState?.state === 'recovery' || previousNetworkState?.state === 'no_healthy_path' ||
+    previousConditionCode === 'condition_upstream_unavailable' || previousConditionCode === 'condition_severely_degraded'
+      ? 'aggressive'
+      : 'normal';
 
   for (const endpoint of endpoints) {
     // One primary probe plus at most one alternate port per cycle keeps cron
@@ -104,6 +133,46 @@ export async function runScheduledHealth(env: Env): Promise<void> {
     });
   }
 
+  // 2.12 — emergency entry ladder: probe alternate Worker domains (max 4)
+  // on port 443. They share the worker's credentials; a block of one domain
+  // does not have to mean a block of the service.
+  const backupHosts = [...new Set(settings?.backupEntryHosts ?? [])]
+    .map((x) => String(x).trim().toLowerCase())
+    .filter((x) => /^[a-z0-9][a-z0-9.-]{2,252}$/.test(x) && x.includes('.'))
+    .slice(0, 4);
+  for (const host of backupHosts) {
+    const pathId = 'entry:' + host;
+    const tcpResult = await probeEndpoint(host, 443);
+    // aggressive mode: the deeper full-path signal supersedes the TCP open
+    const result = prevProbeMode === 'aggressive' ? await probeEntryHttps(host) : tcpResult;
+    const previous = byId.get(pathId);
+    const next = updateObservation(previous ? {
+      id: previous.pathId,
+      latencyMs: previous.latencyMs,
+      ok: previous.ok,
+      checkedAt: previous.checkedAt,
+      failures: previous.failures,
+      successes: previous.successes,
+      quarantineUntil: previous.quarantineUntil,
+      consecutiveFailures: previous.consecutiveFailures,
+      consecutiveSuccesses: previous.consecutiveSuccesses,
+      lastError: previous.lastError,
+    } : undefined, result.ok, result.latencyMs, Date.now(), result.error);
+    next.id = pathId;
+    await savePathHealth(env.GZ_DB, {
+      pathId, latencyMs: next.latencyMs, ok: next.ok, failures: next.failures, successes: next.successes,
+      quarantineUntil: next.quarantineUntil, checkedAt: next.checkedAt, lastError: next.lastError,
+      consecutiveFailures: next.consecutiveFailures, consecutiveSuccesses: next.consecutiveSuccesses,
+    });
+    await saveHealthSample(env.GZ_DB, { kind: prevProbeMode === 'aggressive' ? 'path_https' : 'path_tcp', subjectId: pathId, ts: next.checkedAt, ok: next.ok, latencyMs: next.latencyMs });
+    byId.set(pathId, {
+      pathId, latencyMs: next.latencyMs, ok: next.ok,
+      failures: next.failures, successes: next.successes, quarantineUntil: next.quarantineUntil,
+      checkedAt: next.checkedAt, lastError: next.lastError,
+      consecutiveFailures: next.consecutiveFailures, consecutiveSuccesses: next.consecutiveSuccesses,
+    });
+  }
+
   const state = classifyNetworkState([...byId.values()].map((r) => ({
     id: r.pathId, latencyMs: r.latencyMs, ok: r.ok, checkedAt: r.checkedAt,
     failures: r.failures, successes: r.successes, quarantineUntil: r.quarantineUntil,
@@ -122,8 +191,6 @@ export async function runScheduledHealth(env: Env): Promise<void> {
     lastError: row.lastError,
   })), state.generatedAt);
   const conditionCode = 'condition_' + condition.state.toLowerCase();
-  const previousNetworkState = await loadNetworkState(env.GZ_DB);
-  const previousConditionCode = previousNetworkState?.reasonCodes.find((code) => code.startsWith('condition_'));
   await saveNetworkState(env.GZ_DB, {
     state: state.state,
     quorum: state.quorum,
@@ -146,6 +213,43 @@ export async function runScheduledHealth(env: Env): Promise<void> {
       scope: condition.scope,
     }).slice(0, 1400));
   }
+
+  // 2.13 — probe state machine: next tick's mode + audit the transition.
+  const probeMode: 'normal' | 'aggressive' =
+    state.state === 'recovery' || state.state === 'no_healthy_path' ||
+    condition.state === 'UPSTREAM_UNAVAILABLE' || condition.state === 'SEVERELY_DEGRADED'
+      ? 'aggressive'
+      : 'normal';
+  if (prevProbeMode !== probeMode) {
+    await addEvent(env.GZ_DB, 'probe_mode_changed', JSON.stringify({
+      from: prevProbeMode, to: probeMode, networkState: state.state, condition: condition.state,
+    }).slice(0, 400));
+  }
+
+  // 2.12 — regime intelligence: one bounded assessment of the global aggregate
+  // outcome stream. Aggregate statistics only; never a DPI or censor claim.
+  let regime: RegimeAssessment = emptyRegime(state.generatedAt);
+  try {
+    const stream = await loadRecentHealthSamples(env.GZ_DB, 60);
+    regime = assessRegime(stream, state.generatedAt);
+    const previousRegimeRows = await loadPredictiveStates(env.GZ_DB, 'regime');
+    const previousRegime = previousRegimeRows.find((r) => r.subjectId === 'global');
+    await savePredictiveState(env.GZ_DB, { kind: 'regime', subjectId: 'global', stateJson: JSON.stringify(regime), updatedAt: state.generatedAt });
+    let previousState: string | null = null;
+    if (previousRegime) {
+      try { previousState = (JSON.parse(previousRegime.stateJson) as RegimeAssessment).state ?? null; } catch { previousState = null; }
+    }
+    if (previousState && previousState !== regime.state) {
+      await addEvent(env.GZ_DB, 'network_regime_changed', JSON.stringify({
+        from: previousState,
+        to: regime.state,
+        confidence: regime.confidence,
+        baselineSuccess: regime.baselineSuccess,
+        recentSuccess: regime.recentSuccess,
+        reasonCodes: regime.reasonCodes.slice(0, 4),
+      }).slice(0, 800));
+    }
+  } catch { /* regime intelligence is best-effort and must never block health */ }
 
   // Refresh the live protocol policy at the same cadence. This keeps the D1
   // fallback ladder warm even when no client is actively requesting a manifest.
@@ -177,6 +281,7 @@ export async function runScheduledHealth(env: Env): Promise<void> {
       },
       learner,
       predictive,
+      regime,
       limit: 10,
       now: state.generatedAt,
     });
@@ -217,6 +322,9 @@ export async function runScheduledHealth(env: Env): Promise<void> {
         confidence: plan.confidence,
         strategy: plan.strategy,
         selected: plan.selected,
+        regimeState: plan.regimeState,
+        regimeConfidence: plan.regimeConfidence,
+        probeMode,
         reasonCodes: plan.reasonCodes.slice(0, 20),
       }),
       updatedAt: plan.generatedAt,

@@ -1,0 +1,12 @@
+{
+  "uuid": "00000000-0000-0000-0000-000000000000",
+  "manifest_url": "https://entry.example.com/sub/TOKEN/axr-manifest",
+  "entries": [
+    { "host": "entry.example.com", "priority": 0 },
+    { "host": "backup.example.com", "ips": ["104.16.0.1", "172.64.0.1"], "fp": "firefox", "priority": 1 }
+  ],
+  "surgery": true,
+  "split_gap_ms": [20, 120],
+  "probes": { "normal_ms": 90000, "aggressive_ms": 30000 },
+  "cache_dir": "~/.axr"
+}

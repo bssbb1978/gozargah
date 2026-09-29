@@ -185,6 +185,11 @@ ${particles()}
             <textarea id="s-proxyips" rows="3"></textarea>
             <div class="hint" data-i18n="proxyIPsHint"></div>
           </div>
+          <div class="field">
+            <label data-i18n="backupEntries"></label>
+            <textarea id="s-backupentries" rows="2" class="mono"></textarea>
+            <div class="hint" data-i18n="backupEntriesHint"></div>
+          </div>
           <div class="two-col">
             <div class="field">
               <label data-i18n="subPath"></label>

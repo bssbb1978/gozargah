@@ -17,6 +17,8 @@ export interface SettingsBlob {
   panelPath: string;
   subPath: string;
   proxyIPs: string[];
+  /** 2.12 — alternate domains pointing at the same Worker (emergency entry ladder). */
+  backupEntryHosts?: string[];
   /** rolling quota-reset window for every non-admin user */
   resetCycle: ResetCycle;
   passwordSalt: string;
@@ -251,6 +253,7 @@ export async function loadSettings(db: D1Database): Promise<SettingsBlob | null>
   const value = JSON.parse(row.value) as SettingsBlob;
   // forward-fill fields introduced after v1.1 (schema v2)
   if (!value.resetCycle) value.resetCycle = 'none';
+  if (!Array.isArray(value.backupEntryHosts)) value.backupEntryHosts = [];
   putCache(SETTINGS_KEY + '#rev', row.rev);
   putCache(SETTINGS_KEY, value);
   return value;
@@ -462,6 +465,19 @@ export async function loadHealthSamples(db: D1Database, kind: 'path' | 'profile'
   return (res.results ?? []).reverse().map(r => ({ ts:r.ts, ok:r.ok === 1, latencyMs:r.latency_ms }));
 }
 
+/**
+ * 2.12 — global aggregate outcome stream for regime intelligence: the most
+ * recent path-level observations across all configured subjects, ascending.
+ */
+export async function loadRecentHealthSamples(db: D1Database, limit = 60): Promise<Array<{ ts: number; ok: boolean; latencyMs: number | null }>> {
+  await ensureSchema(db);
+  const n = Math.max(8, Math.min(96, limit));
+  const res = await db
+    .prepare('SELECT ts, ok, latency_ms FROM health_samples WHERE kind IN (\'path\', \'path_tcp\', \'path_dial\', \'path_https\') ORDER BY ts DESC LIMIT ' + String(n))
+    .all<{ ts: number; ok: number; latency_ms: number | null }>();
+  return (res.results ?? []).reverse().map(r => ({ ts: r.ts, ok: r.ok === 1, latencyMs: r.latency_ms }));
+}
+
 export interface LatestPathSample {
   kind: Exclude<HealthSampleKind, 'profile'>;
   subjectId: string;
@@ -492,15 +508,108 @@ export async function loadLatestPathSamples(db: D1Database, subjectIds: string[]
   }));
 }
 
-export interface PredictiveStateRow { kind:'path'|'profile'; subjectId:string; stateJson:string; updatedAt:number; }
+export interface PredictiveStateRow { kind:'path'|'profile'|'regime'|'harvest'; subjectId:string; stateJson:string; updatedAt:number; }
 export async function savePredictiveState(db:D1Database,row:PredictiveStateRow):Promise<void>{
   await ensureSchema(db);
   await db.prepare('INSERT INTO predictive_state(kind,subject_id,state_json,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(kind,subject_id) DO UPDATE SET state_json=?3, updated_at=?4').bind(row.kind,row.subjectId,row.stateJson,row.updatedAt).run();
 }
-export async function loadPredictiveStates(db:D1Database, kind:'path'|'profile'):Promise<Array<{subjectId:string;stateJson:string;updatedAt:number}>>{
+export async function loadPredictiveStates(db:D1Database, kind:'path'|'profile'|'regime'|'harvest'):Promise<Array<{subjectId:string;stateJson:string;updatedAt:number}>>{
   await ensureSchema(db);
   const res=await db.prepare('SELECT subject_id,state_json,updated_at FROM predictive_state WHERE kind=?1 ORDER BY updated_at DESC LIMIT 64').bind(kind).all<{subject_id:string;state_json:string;updated_at:number}>();
   return (res.results ?? []).map(r=>({subjectId:r.subject_id,stateJson:r.state_json,updatedAt:r.updated_at}));
+}
+
+/**
+ * 2.16 — clean-IP harvest store. The AXR client `scan` runner probes real
+ * Cloudflare edge addresses from the local network and POSTs the survivors
+ * to the Worker; they are persisted here (capped) and unioned into the
+ * `clean_ip_hints` manifest field. One row: kind='harvest', subject_id
+ * ='clean_ips'. The JSON payload is `{ips: string[], updatedAt: number,
+ * sources: Record<string, number>}`.
+ */
+export interface CleanIPHarvestRow { ips: string[]; updatedAt: number; sources: Record<string, number>; }
+
+export async function loadCleanIPHarvest(db: D1Database): Promise<CleanIPHarvestRow | null> {
+  const rows = await loadPredictiveStates(db, 'harvest');
+  const row = rows.find((r) => r.subjectId === 'clean_ips');
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.stateJson) as CleanIPHarvestRow;
+    if (!Array.isArray(parsed.ips)) return null;
+    parsed.ips = parsed.ips.filter((x) => typeof x === 'string' && isIPv4ish(x));
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveCleanIPHarvest(db: D1Database, row: CleanIPHarvestRow): Promise<void> {
+  const ips = row.ips.filter((x) => isIPv4ish(x)).slice(0, 32);
+  const sources: Record<string, number> = {};
+  for (const [k, v] of Object.entries(row.sources ?? {})) {
+    if (typeof k === 'string' && k.length <= 48 && Number.isFinite(v)) sources[k] = v;
+  }
+  await savePredictiveState(db, {
+    kind: 'harvest',
+    subjectId: 'clean_ips',
+    stateJson: JSON.stringify({ ips, updatedAt: row.updatedAt, sources } satisfies CleanIPHarvestRow),
+    updatedAt: row.updatedAt,
+  });
+}
+
+function isIPv4ish(s: string): boolean {
+  if (!/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(s)) return false;
+  return s.split('.').every((o) => Number(o) <= 255);
+}
+
+/**
+ * 2.17 — canary liveness store. Clients periodically probe the operator's
+ * canary host (a plain host expected to stay reachable) and report ok/fail
+ * via the harvest endpoint (kind="canary"). Results are kept here, newest
+ * first, capped at 64, in one row: kind='harvest', subject_id='canary'.
+ * The pressure engine (ai/pressure.ts) reduces this list to fleet evidence.
+ * Honesty: these are liveness flags from client probes — aggregate
+ * statistics, never DPI detection.
+ */
+export interface CanaryResult { host: string; ok: boolean; at: number; }
+export interface CanaryStateRow { results: CanaryResult[]; updatedAt: number; }
+
+const CANARY_MAX_RESULTS = 64;
+const CANARY_MAX_HOST_LEN = 253;
+
+export async function loadCanaryState(db: D1Database): Promise<CanaryStateRow | null> {
+  const rows = await loadPredictiveStates(db, 'harvest');
+  const row = rows.find((r) => r.subjectId === 'canary');
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.stateJson) as CanaryStateRow;
+    if (!Array.isArray(parsed.results)) return null;
+    parsed.results = parsed.results
+      .filter((r) => r && typeof r.host === 'string' && typeof r.ok === 'boolean' && Number.isFinite(r.at))
+      .map((r) => ({ host: r.host.slice(0, CANARY_MAX_HOST_LEN), ok: r.ok, at: r.at }));
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/** Append one canary result (newest first, capped). Returns the stored row. */
+export async function appendCanaryResult(db: D1Database, r: CanaryResult): Promise<CanaryStateRow> {
+  const existing = (await loadCanaryState(db))?.results ?? [];
+  const clean: CanaryResult = {
+    host: String(r.host ?? '').slice(0, CANARY_MAX_HOST_LEN),
+    ok: Boolean(r.ok),
+    at: Number.isFinite(r.at) ? r.at : Date.now(),
+  };
+  const results = [clean, ...existing].slice(0, CANARY_MAX_RESULTS);
+  const row: CanaryStateRow = { results, updatedAt: clean.at };
+  await savePredictiveState(db, {
+    kind: 'harvest',
+    subjectId: 'canary',
+    stateJson: JSON.stringify(row),
+    updatedAt: row.updatedAt,
+  });
+  return row;
 }
 
 export interface NetworkStateRow {

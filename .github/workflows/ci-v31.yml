@@ -1,0 +1,270 @@
+# =============================================================================
+# AXR v3.1 — Deep Evasion: ZERO-DEFECT release gate
+#
+# Job Suite A (go-client): Go client core engine verification
+#   - Matrix: ubuntu-24.04 (linux/amd64, linux/arm64, android/arm64 + NDK)
+#             macos-15-intel (darwin/arm64, darwin/amd64; x64 pool keeps
+#             the run free of the macOS arm64 capacity notice)
+#             windows (windows/amd64)
+#   - Strict gates: go vet (0 warnings) + staticcheck (0 findings)
+#     + go test -race -count=1 on the native host arch (race detector is
+#     native-only; cross targets are build-verified)
+#   - Cross-compilation: stripped (-s -w, -trimpath) binaries per target
+#   - Android NDK: official toolchain (r26b) CC/CXX wiring, cached
+#
+# Job Suite B (worker): Cloudflare Worker edge relay
+#   - Node 20 (>=18 required) + npm cache, tsc, engine + integration
+#     suites, wrangler bundle (deploy --dry-run)
+#
+# Self-healing protocol (agent side, not in-run):
+#   1. Parse go vet / go test -race / tsc output on failure.
+#   2. Race flags are FIXED by explicit locking (sync.Mutex / RWMutex /
+#      sync/atomic) — never suppressed, never -race-free flags.
+#   3. Type fixes applied immediately, committed as
+#      "fix(ci): resolve ... for v3.1".
+# =============================================================================
+
+name: CI v3.1 — AXR Deep Evasion
+
+on:
+  push:
+    branches:
+      - main
+      - "arena/*"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-v31-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: "-mod=readonly"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB SUITE A — Go client core engine verification
+  # ---------------------------------------------------------------------------
+  go-client:
+    name: Go client — ${{ matrix.os }} → ${{ matrix.targets }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            targets: "linux/amd64 linux/arm64 android/arm64"
+            native_race: true
+            android: true
+          - os: macos-15-intel
+            targets: "darwin/arm64 darwin/amd64"
+            native_race: true
+            android: false
+          - os: windows-latest
+            targets: "windows/amd64"
+            native_race: true
+            android: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go (version pinned by client/go.mod)
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: client/go.mod
+          cache-dependency-path: client/go.sum
+
+      - name: Verify go.sum integrity
+        working-directory: client
+        run: |
+          go mod download
+          go mod verify
+
+      - name: "Gate 1 — go vet (zero warnings, both TLS identities)"
+        working-directory: client
+        # Default = stdlib TLS (tls_std.go); -tags axr_utls = the
+        # production uTLS fingerprint identity (tls_utls.go). Both
+        # variants must vet clean.
+        run: |
+          go vet ./...
+          go vet -tags axr_utls ./...
+
+      - name: "Gate 2 — staticcheck (zero findings, both TLS identities)"
+        working-directory: client
+        run: |
+          go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 ./...
+          go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 -tags axr_utls ./...
+
+      - name: "Gate 3 — go test -race -count=1 (native arch: ${{ matrix.os }})"
+        if: matrix.native_race
+        working-directory: client
+        shell: bash
+        # Race detector runs on the native host architecture only.
+        # Covers the concurrent goroutines the release gate cares about:
+        # netstate sliding window, bandit ensemble (LinUCB+Beta-TS),
+        # evade governor, surgery v2 splitters, canary background prober,
+        # shared measure.Tracker feeders. Run for BOTH TLS identities —
+        # the production one (axr_utls) first. The per-package result +
+        # the failure detail ALWAYS land in the step summary (readable
+        # via check-runs output.summary) even when the job is cancelled
+        # before the diagnostics step runs.
+        run: |
+          set -uo pipefail
+          out1=$(go test -race -count=1 -tags axr_utls ./... 2>&1)
+          st1=$?
+          out2=$(go test -race -count=1 ./... 2>&1)
+          st2=$?
+          {
+            echo "### Gate 3 — go test -race ($RUNNER_OS)"
+            echo '```'
+            echo "--- uTLS identity (exit $st1)"
+            echo "$out1" | grep -E "^(--- FAIL|FAIL|ok  |panic:|WARNING: DATA RACE)" | head -60
+            if [ "$st1" -ne 0 ]; then
+              echo "--- uTLS failure detail"
+              echo "$out1" | grep -B3 -A30 -E -- "--- FAIL|DATA RACE|panic:" | head -150
+            fi
+            echo "--- stdlib identity (exit $st2)"
+            echo "$out2" | grep -E "^(--- FAIL|FAIL|ok  |panic:|WARNING: DATA RACE)" | head -60
+            if [ "$st2" -ne 0 ]; then
+              echo "--- stdlib failure detail"
+              echo "$out2" | grep -B3 -A30 -E -- "--- FAIL|DATA RACE|panic:" | head -150
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$st1" -ne 0 ]; then exit "$st1"; fi
+          if [ "$st2" -ne 0 ]; then exit "$st2"; fi
+
+      - name: Cross-compile (stripped symbol tables, uTLS identity)
+        working-directory: client
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for t in ${{ matrix.targets }}; do
+            os="${t%%/*}"
+            arch="${t##*/}"
+            out="dist/axr-${os}-${arch}"
+            [ "$os" = "windows" ] && out="${out}.exe"
+            echo "::group::build $out"
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+              go build -tags axr_utls -trimpath -ldflags="-s -w" -o "$out" ./cmd/axr
+            ls -l "$out"
+            echo "::endgroup::"
+          done
+
+      # ---- Android NDK (official toolchain) — ubuntu leg only ----
+      - name: Android NDK (cache)
+        if: matrix.android
+        uses: actions/cache@v5
+        id: ndk-cache
+        with:
+          path: ${{ runner.temp }}/android-ndk
+          key: axr-ndk-r26b-linux
+
+      - name: "Android NDK cross-compile (CGO toolchain path, arm64)"
+        if: matrix.android
+        working-directory: client
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK_DIR="${RUNNER_TEMP}/android-ndk"
+          if [ ! -d "$NDK_DIR/android-ndk-r26b" ]; then
+            mkdir -p "$NDK_DIR"
+            curl -fsSL -o /tmp/ndk.zip \
+              https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
+            unzip -q /tmp/ndk.zip -d "$NDK_DIR"
+            rm -f /tmp/ndk.zip
+          fi
+          export ANDROID_NDK_HOME="$NDK_DIR/android-ndk-r26b"
+          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          export CC="$TOOLCHAIN/bin/aarch64-linux-android24-clang"
+          export CXX="$TOOLCHAIN/bin/aarch64-linux-android24-clang++"
+          echo "NDK compiler: $($CC --version | head -1)"
+          # CGO_ENABLED=1 with the NDK compilers proves the JNI/CGO
+          # toolchain path end-to-end. The current AXR client is pure Go
+          # (no cgo/JNI files), so this binary is bit-identical to the
+          # CGO_ENABLED=0 android build — the step stays in the gate so
+          # any future JNI/CGO addition is cross-compile-verified on day
+          # one.
+          GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
+            go build -tags axr_utls -trimpath -ldflags="-s -w" -o dist/axr-android-arm64-ndk ./cmd/axr
+          ls -l dist/axr-android-arm64-ndk
+
+      - name: "Diagnostics — surface Go failure as annotation"
+        # Same annotation strategy as the Worker leg: re-run the failed gate
+        # family and publish the tail, so race reports / linker errors are
+        # readable via check-run annotations even if log-zip fetch fails.
+        if: failure()
+        working-directory: client
+        shell: bash
+        run: |
+          out=$( { go vet ./...; go vet -tags axr_utls ./...; go test -race -count=1 -tags axr_utls ./...; go test -race -count=1 ./...; } 2>&1 | grep -vE "^(ok|---|===|PASS|FAIL\s+\[build\])" | tail -50 || true)
+          echo "::error title=go-gate-failed::${out//$'\n'/ | }"
+          exit 0
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v6
+        with:
+          name: axr-${{ matrix.os }}
+          path: client/dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # JOB SUITE B — Cloudflare Worker edge relay
+  # ---------------------------------------------------------------------------
+  worker:
+    name: Worker — Cloudflare edge relay
+    runs-on: ubuntu-24.04
+    env:
+      # Keep the dry-run hermetic: no telemetry network side channel.
+      WRANGLER_TELEMETRY_DISABLED: "1"
+      CI: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node 22 with npm cache
+        # The pinned wrangler (4.143.0, package-lock) hard-requires
+        # Node >= 22 ("Wrangler requires at least Node.js v22.0.0");
+        # this matches the v3.1 spec ("Node.js 22+").
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Clean install (npm ci)
+        run: npm ci
+
+      - name: "Gate 1 — TypeScript type check (npx tsc --noEmit)"
+        run: npx tsc --noEmit
+
+      - name: "Gate 2 — engine suites (node scripts/test.mjs)"
+        run: npm run test:engine
+
+      - name: "Gate 3 — integration (vitest)"
+        run: npm run test:integration
+
+      - name: "Gate 4 — Worker bundle (wrangler deploy --dry-run)"
+        run: npx wrangler deploy --dry-run
+
+      - name: "Diagnostics — surface bundle failure as annotation"
+        # Log-zip retrieval can be flaky; this re-runs the failing command and
+        # publishes the tail as a check-run annotation (readable via
+        # `gh api check-runs/<id>/annotations`) so the repair loop can
+        # diagnose without the raw log.
+        if: failure()
+        run: |
+          out=$(npx wrangler deploy --dry-run 2>&1 | tail -30 || true)
+          echo "::error title=wrangler-dry-run-failed::${out//$'\n'/ | }"
+          exit 0
+
+      - name: Upload bundle report
+        if: always()
+        run: |
+          echo "## Worker bundle" >> "$GITHUB_STEP_SUMMARY"
+          npx wrangler deploy --dry-run 2>&1 | grep -iE "total size|gzip|success" \
+            | sed 's/^/| /' >> "$GITHUB_STEP_SUMMARY" || true
