@@ -16,13 +16,12 @@ func rawControl(conn net.Conn, fn func(fd uintptr) error) error {
 	if err != nil {
 		return err
 	}
-	var serr error
-	if cerr := rc.Control(func(raw syscall.RawConn) {
-		_ = raw.Control(func(fd uintptr) { serr = fn(fd) })
+	if cerr := rc.Control(func(fd uintptr) error {
+		return fn(fd)
 	}); cerr != nil {
 		return cerr
 	}
-	return serr
+	return nil
 }
 
 func setNoNagle(conn net.Conn) error {

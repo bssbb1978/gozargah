@@ -166,6 +166,17 @@ jobs:
             go build -tags axr_utls -trimpath -ldflags="-s -w" -o dist/axr-android-arm64-ndk ./cmd/axr
           ls -l dist/axr-android-arm64-ndk
 
+      - name: "Diagnostics — surface Go failure as annotation"
+        # Same annotation strategy as the Worker leg: re-run the failed gate
+        # family and publish the tail, so race reports / linker errors are
+        # readable via check-run annotations even if log-zip fetch fails.
+        if: failure()
+        shell: bash
+        run: |
+          out=$( { go vet ./...; go vet -tags axr_utls ./...; go test -race -count=1 -tags axr_utls ./...; go test -race -count=1 ./...; } 2>&1 | grep -vE "^(ok|---|===|PASS|FAIL\s+\[build\])" | tail -50 || true)
+          echo "::error title=go-gate-failed::${out//$'\n'/ | }"
+          exit 0
+
       - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
@@ -180,6 +191,10 @@ jobs:
   worker:
     name: Worker — Cloudflare edge relay
     runs-on: ubuntu-latest
+    env:
+      # Keep the dry-run hermetic: no telemetry network side channel.
+      WRANGLER_TELEMETRY_DISABLED: "1"
+      CI: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -204,6 +219,17 @@ jobs:
 
       - name: "Gate 4 — Worker bundle (wrangler deploy --dry-run)"
         run: npx wrangler deploy --dry-run
+
+      - name: "Diagnostics — surface bundle failure as annotation"
+        # Log-zip retrieval can be flaky; this re-runs the failing command and
+        # publishes the tail as a check-run annotation (readable via
+        # `gh api check-runs/<id>/annotations`) so the repair loop can
+        # diagnose without the raw log.
+        if: failure()
+        run: |
+          out=$(npx wrangler deploy --dry-run 2>&1 | tail -30 || true)
+          echo "::error title=wrangler-dry-run-failed::${out//$'\n'/ | }"
+          exit 0
 
       - name: Upload bundle report
         if: always()
