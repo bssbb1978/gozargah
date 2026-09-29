@@ -64,10 +64,12 @@ export const ALPN_PROFILES: string[][] = [
   ['h3', 'h2', 'http/1.1'],
 ];
 
-export const DEFAULT_ORIGIN_TRANSPORTS: Transport[] = ['xhttp', 'grpc', 'httpupgrade', 'ws'];
+export const DEFAULT_ORIGIN_TRANSPORTS: Transport[] = ['xhttp', 'grpc', 'h2', 'httpupgrade', 'ws'];
 const SUPPORTED_ORIGIN_PAIRS = new Set<string>([
   'vless:xhttp',
   'vless:grpc',
+  'vless:h2',
+  'trojan:h2',
   'vless:httpupgrade',
   'trojan:xhttp',
   'vmess:ws',
@@ -153,7 +155,7 @@ export function protocolCatalog(
           : 'ORIGIN_ENGINE_REQUIRED: a matching client template can be generated, but remote engine compatibility and health have not been tested.';
       out.push({
         protocol, transport,
-        alpn: transport === 'grpc' ? ['h2'] : transport === 'httpupgrade' || transport === 'ws' ? ['http/1.1'] : ['h2', 'http/1.1'],
+        alpn: transport === 'grpc' || transport === 'h2' ? ['h2'] : transport === 'httpupgrade' || transport === 'ws' ? ['http/1.1'] : ['h2', 'http/1.1'],
         security: ['tls'],
         mode: 'origin-engine', boundary: 'ORIGIN_ENGINE_REQUIRED', status, layer: 'origin',
         generatorAvailable: true, liveVerificationAvailable: false, clientSupportRequired: true,
@@ -179,6 +181,7 @@ export function adaptiveProtocolOrder(originEngineConfigured: boolean, enabledOr
       if (c.transport === 'ws') score += 12;
       if (c.transport === 'xhttp') score += 8;
       if (c.transport === 'grpc') score += 5;
+      if (c.transport === 'h2') score += 4;
       if (c.protocol === 'vless') score += 4;
       if (c.protocol === 'trojan') score += 3;
       return { protocol: c.protocol, transport: c.transport, score };

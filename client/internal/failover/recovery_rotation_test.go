@@ -40,7 +40,7 @@ func TestAllQuietProbeRoundRotatesAndFindsRecoveredAlternate(t *testing.T) {
 	if len(second) != 1 || second[0].Endpoint.Host != "intl.example" {
 		t.Fatalf("recovered alternate must be returned as healthy, got %v", second)
 	}
-	if health := e.Health()["intl.example|intl.example:443"]; health.QuietUntilMS != 0 || health.ConsecOK != 1 {
+	if health := e.Health()["intl.example|ws|intl.example:443"]; health.QuietUntilMS != 0 || health.ConsecOK != 1 {
 		t.Fatalf("a recovered route must immediately clear its quiet gate, got %+v", health)
 	}
 }

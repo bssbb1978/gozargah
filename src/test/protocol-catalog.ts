@@ -17,7 +17,7 @@ for (const protocol of ['wireguard', 'hysteria2']) {
 const withEngine = protocolCatalog(true);
 const available = withEngine.filter((x) => x.ready);
 for (const [protocol, transport] of [
-  ['vless', 'xhttp'], ['vless', 'grpc'], ['vless', 'httpupgrade'], ['trojan', 'xhttp'], ['vmess', 'ws'],
+  ['vless', 'xhttp'], ['vless', 'grpc'], ['vless', 'h2'], ['trojan', 'h2'], ['vless', 'httpupgrade'], ['trojan', 'xhttp'], ['vmess', 'ws'],
 ]) {
   const row = available.find((x) => x.protocol === protocol && x.transport === transport);
   if (!row || row.boundary !== 'ORIGIN_ENGINE_REQUIRED' || row.deploymentValidation !== 'declared-not-tested') {

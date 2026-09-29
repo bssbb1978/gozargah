@@ -43,6 +43,7 @@ function score(c: ProtocolCapability, security: SecurityMode): { value: number; 
   else if (c.mode === 'origin-engine') { value += 8; rationale.push('origin-engine'); }
   if (c.transport === 'xhttp') { value += 14; rationale.push('xhttp'); }
   if (c.transport === 'grpc') { value += 8; rationale.push('multiplexed'); }
+  if (c.transport === 'h2') { value += 7; rationale.push('http2'); }
   if (c.transport === 'ws') { value += 5; rationale.push('websocket'); }
   if (c.transport === 'httpupgrade') { value -= 7; rationale.push('legacy-transport'); }
   if (c.transport === 'kcp') { value -= 12; rationale.push('udp-transport'); }

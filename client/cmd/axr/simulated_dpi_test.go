@@ -61,7 +61,7 @@ func TestSimulatedDPIFailureSignaturesFallBackToConfiguredDomesticEntry(t *testi
 			if len(order) == 0 || order[0].Endpoint.Host != testFronting {
 				t.Fatalf("domestic entry must lead the measured fallback ladder, got %v", order)
 			}
-			if health := engine.Health()["intl.example.com|intl.example.com:443"]; health.LastErr != tc.errorClass {
+			if health := engine.Health()["intl.example.com|ws|intl.example.com:443"]; health.LastErr != tc.errorClass {
 				t.Fatalf("simulated failure evidence was not retained as a bounded class: %+v", health)
 			}
 		})

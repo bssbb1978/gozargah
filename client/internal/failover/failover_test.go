@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -54,7 +55,7 @@ func TestProbeRoundFindsHealthyAndStops(t *testing.T) {
 }
 
 func TestHealthScoringAndFailoverOrder(t *testing.T) {
-	now := time.Unix(1700000000, 0)
+	now := time.Now()
 	e := New(testEntries(), fakeProbe(map[string]struct {
 		ok  bool
 		rtt float64
@@ -65,8 +66,8 @@ func TestHealthScoringAndFailoverOrder(t *testing.T) {
 	// 2.2.2.2 is healthy.
 	e.Observe(testEntries()[0], "2.2.2.2:443", true, 80, "", now.Add(2*time.Second))
 	h := e.Health()
-	bad := h["primary.example|1.1.1.1:443"]
-	good := h["primary.example|2.2.2.2:443"]
+	bad := h["primary.example|ws|1.1.1.1:443"]
+	good := h["primary.example|ws|2.2.2.2:443"]
 	if bad.Score >= good.Score {
 		t.Fatalf("failed IP must rank below healthy IP: bad=%.3f good=%.3f", bad.Score, good.Score)
 	}
@@ -80,6 +81,116 @@ func TestHealthScoringAndFailoverOrder(t *testing.T) {
 	cands := e.CandidatesFor(testEntries()[0])
 	if cands[0] != "2.2.2.2:443" {
 		t.Fatalf("expected healthy IP first, got %v", cands)
+	}
+}
+
+func TestTransportHealthIsIsolatedPerPath(t *testing.T) {
+	now := time.Now()
+	ws := Endpoint{Host: "edge.example", IPs: []string{"1.1.1.1"}, Transport: "ws", FP: "chrome"}
+	alt := Endpoint{Host: "edge.example", IPs: []string{"1.1.1.1"}, Transport: "ws-alt", FP: "chrome"}
+	e := New([]Endpoint{ws, alt}, nil)
+	e.Observe(ws, "1.1.1.1:443", false, 0, "simulated_rst", now)
+	e.Observe(alt, "1.1.1.1:443", true, 70, "", now)
+
+	health := e.Health()
+	if health["edge.example|ws|1.1.1.1:443"].Score >= health["edge.example|ws-alt|1.1.1.1:443"].Score {
+		t.Fatalf("transport outcomes must remain isolated: %+v", health)
+	}
+	if got := e.CandidatesFor(ws)[0]; got != "edge.example:443" {
+		t.Fatalf("failed WS hint should be below the unmeasured host fallback, got %v", e.CandidatesFor(ws))
+	}
+	if got := e.CandidatesFor(alt)[0]; got != "1.1.1.1:443" {
+		t.Fatalf("measured WS-alt success should lead its path, got %v", e.CandidatesFor(alt))
+	}
+}
+
+func TestProbeRoundUsesMeasuredTransportFallback(t *testing.T) {
+	probe := func(ep Endpoint, _ string, _ time.Duration) (bool, float64, string) {
+		if ep.Transport == "ws" {
+			return false, 25, "simulated_sni_block"
+		}
+		return true, 80, ""
+	}
+	entries := []Endpoint{
+		{Host: "edge.example", Transport: "ws", FP: "chrome", Priority: 0},
+		{Host: "edge.example", Transport: "ws-alt", FP: "chrome", Priority: 0},
+	}
+	e := New(entries, probe)
+	healthy := e.ProbeRound(time.Now())
+	if len(healthy) != 1 || healthy[0].Endpoint.Transport != "ws-alt" {
+		t.Fatalf("expected measured fallback to ws-alt, got %+v", healthy)
+	}
+	health := e.Health()
+	if health["edge.example|ws|edge.example:443"].Score >= health["edge.example|ws-alt|edge.example:443"].Score {
+		t.Fatalf("failed and successful transport measurements were not ranked separately: %+v", health)
+	}
+}
+
+func TestTransportHealthDecaysTowardUnknown(t *testing.T) {
+	now := time.Now()
+	good := &IPHealth{Score: 1, CheckedAtMS: now.UnixMilli()}
+	bad := &IPHealth{Score: 0, CheckedAtMS: now.UnixMilli()}
+	atHalfLife := now.Add(6 * time.Hour).UnixMilli()
+	if got := decayedHealthScore(good, atHalfLife); got < 0.749 || got > 0.751 {
+		t.Fatalf("good evidence should decay halfway toward neutral after one half-life, got %.4f", got)
+	}
+	if got := decayedHealthScore(bad, atHalfLife); got < 0.249 || got > 0.251 {
+		t.Fatalf("bad evidence should decay halfway toward neutral after one half-life, got %.4f", got)
+	}
+	atFourHalfLives := now.Add(24 * time.Hour).UnixMilli()
+	if got := decayedHealthScore(good, atFourHalfLives); got < 0.53 || got > 0.532 {
+		t.Fatalf("stale success should approach, not exceed, neutral, got %.4f", got)
+	}
+	if got := decayedHealthScore(bad, atFourHalfLives); got < 0.468 || got > 0.47 {
+		t.Fatalf("stale failure should approach, not stay pinned below, neutral, got %.4f", got)
+	}
+}
+
+func TestEqualHealthCleanIPsRotateAndPersistCursor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "routing.json")
+	entries := []Endpoint{{Host: "edge.example", IPs: []string{"1.1.1.1", "2.2.2.2"}, Transport: "ws", FP: "chrome"}}
+	e := New(entries, nil)
+	first := e.CandidatesFor(entries[0])[0]
+	if first != "1.1.1.1:443" {
+		t.Fatalf("initial clean-IP order changed unexpectedly: %s", first)
+	}
+	if err := e.SaveCache(path); err != nil {
+		t.Fatal(err)
+	}
+	e2 := New(entries, nil)
+	if err := e2.LoadCache(path); err != nil {
+		t.Fatal(err)
+	}
+	second := e2.CandidatesFor(entries[0])[0]
+	if second != "2.2.2.2:443" {
+		t.Fatalf("persisted pool cursor should rotate to the next equal-health IP, got %s", second)
+	}
+}
+
+func TestLegacyHealthCacheSeedsTransportScopedRows(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy-routing.json")
+	now := time.Now().UnixMilli()
+	data := []byte(`{"updated_at_ms":` + strconv.FormatInt(now, 10) + `,"health":{"edge.example|1.1.1.1:443":{"dial_addr":"1.1.1.1:443","score":0.9,"last_ok_ms":` + strconv.FormatInt(now, 10) + `}}}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries := []Endpoint{
+		{Host: "edge.example", Transport: "ws", FP: "chrome"},
+		{Host: "edge.example", Transport: "ws-alt", FP: "chrome"},
+	}
+	e := New(entries, nil)
+	if err := e.LoadCache(path); err != nil {
+		t.Fatal(err)
+	}
+	for _, transport := range []string{"ws", "ws-alt"} {
+		if _, ok := e.Health()["edge.example|"+transport+"|1.1.1.1:443"]; !ok {
+			t.Fatalf("legacy reachability seed missing for %s", transport)
+		}
+	}
+	if _, ok := e.Health()["edge.example|1.1.1.1:443"]; ok {
+		t.Fatal("legacy aggregate row should be removed after transport-scoped migration")
 	}
 }
 
@@ -143,7 +254,7 @@ func TestCachePersistenceRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := e2.Health()
-	if h["primary.example|1.1.1.1:443"].Score < 0.5 {
+	if h["primary.example|ws|1.1.1.1:443"].Score < 0.5 {
 		t.Fatal("persisted health not restored")
 	}
 	// LoadCache tolerates a missing file.

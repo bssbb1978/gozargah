@@ -1262,7 +1262,7 @@ func (s *server) openTunnel(client net.Conn, host string, port int, reply func(b
 	var last tunnelResult
 	var tried []string
 	replied := false
-	for _, cand := range cands {
+	for i, cand := range cands {
 		tag := cand.Endpoint.Host + "/" + cand.DialAddr + "[" + cand.Endpoint.Transport + "]"
 		tried = append(tried, tag)
 		// replyOnce is handed to every attempt; only the first call wins, so
@@ -1279,6 +1279,11 @@ func (s *server) openTunnel(client net.Conn, host string, port int, reply func(b
 			break
 		}
 		l.logf("attempt %s failed: %s", tag, res.reason)
+		// Credit every rejected candidate before trying the next one. The
+		// final candidate is observed below with the request's terminal result.
+		if i < len(cands)-1 {
+			s.recordFallbackFailure(cand, res, bctx)
+		}
 	}
 	if last.reason == "" {
 		last = tunnelResult{reason: "no_candidates"}
@@ -1350,6 +1355,22 @@ func (s *server) openTunnel(client net.Conn, host string, port int, reply func(b
 	}
 }
 
+// recordFallbackFailure stores the measured result for an intermediate
+// candidate before the next fallback attempt. Previously only the final
+// candidate was credited, so an earlier transport/IP failure disappeared
+// from both per-transport health and the learned arm ranking.
+func (s *server) recordFallbackFailure(cand failover.Candidate, res tunnelResult, ctx bandit.Context) {
+	now := time.Now()
+	arm := bandit.Arm{Host: cand.Endpoint.Host, Transport: cand.Endpoint.Transport, FP: cand.Endpoint.FP}
+	s.bandit.Observe(arm, bandit.Outcome{OK: false, RTTMS: res.rttMS, Reason: res.reason}, ctx, now.UnixMilli())
+	s.trackerFor(cand.Endpoint.Host).Feed(measure.Sample{
+		OK: false, RTTMS: res.rttMS, ErrClass: classErr(res.reason),
+		Transport: cand.Endpoint.Transport, UnixMS: now.UnixMilli(),
+	})
+	s.failover.Observe(cand.Endpoint, cand.DialAddr, false, res.rttMS, res.reason, now)
+	_ = s.failover.SaveCache(s.cfg.CacheDir + "/routing.json")
+}
+
 // tunnelResult carries the outcome of one candidate attempt.
 type tunnelResult struct {
 	ok       bool
@@ -1370,6 +1391,7 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	raw, err := dialer.DialContext(ctx, "tcp", cand.DialAddr)
 	if err != nil {
+		res.rttMS = time.Since(start).Seconds() * 1000
 		res.reason = "dial:" + err.Error()
 		return res
 	}
@@ -1417,6 +1439,7 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 	})
 	if err != nil {
 		raw.Close()
+		res.rttMS = time.Since(start).Seconds() * 1000
 		res.reason = "ws:" + err.Error()
 		return res
 	}
@@ -1427,6 +1450,7 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 	// letting the ladder move to the next candidate.
 	if err := ws.WaitVLESSOKUntil(time.Now().Add(s.timeout)); err != nil {
 		ws.Close()
+		res.rttMS = time.Since(start).Seconds() * 1000
 		res.reason = "vless-ok:" + err.Error()
 		return res
 	}
