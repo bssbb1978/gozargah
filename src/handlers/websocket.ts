@@ -23,6 +23,11 @@ import {
 } from '../db/users';
 import { envlessSettings } from '../settings';
 import { DEFAULTS } from '../config';
+import { decideResilience, orderPathsForUser, updateObservation } from '../ai/resilience';
+import { loadPathHealth, savePathHealth, loadProfileHealth, saveProfileHealth, loadAdaptiveModel, saveAdaptiveModel, loadUserAdaptiveState, saveUserAdaptiveState, saveHealthSample, loadHealthSamples, savePredictiveState } from '../db/store';
+import { nextProfileObservation } from '../ai/edge-brain';
+import { defaultEdgeLearner, observationFeatures, updateEdgeLearner } from '../ai/edge-learner';
+import { assessHealth } from '../ai/predictive-mesh';
 
 /** Implicit single user in no-database mode. */
 // Bounded revocation/quota lag without a database round-trip per traffic chunk.
@@ -47,9 +52,13 @@ export function acceptWebSocket(request: Request, env: Env, ctx: ExecutionContex
   }
   if (early && early.length === 0) early = null;
 
-  const host = new URL(request.url).host;
+  const requestUrl = new URL(request.url);
+  const host = requestUrl.host;
+  const rawProfile = requestUrl.searchParams.get('gz_profile');
+  const profileId = rawProfile === 'standard' || rawProfile === 'fragmented' || rawProfile === 'alt-port' || rawProfile === 'fragmented-alt'
+    ? rawProfile : 'standard';
 
-  ctx.waitUntil(pumpProxy(server, early, env, host, ctx).catch((e) => {
+  ctx.waitUntil(pumpProxy(server, early, env, host, ctx, profileId).catch((e) => {
     glog('proxy pump error: ' + (e instanceof Error ? e.message : String(e)));
     try { server.close(1011); } catch { /* ignore */ }
   }));
@@ -83,7 +92,7 @@ function wsReadable(server: WebSocket): ReadableStream<Uint8Array> {
   });
 }
 
-async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, host: string, ctx: ExecutionContext): Promise<void> {
+async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, host: string, ctx: ExecutionContext, profileId: 'standard' | 'fragmented' | 'alt-port' | 'fragmented-alt'): Promise<void> {
   const reader = wsReadable(server).getReader();
 
   // --- buffered header read (early data may carry only a partial header) ---
@@ -139,9 +148,101 @@ async function pumpProxy(server: WebSocket, early: Uint8Array | null, env: Env, 
   }
 
   // --- dial (direct first, ProxyIP fallback chain, per-user stable start) ---
-  const proxyIPs = await getProxyIPs(env);
-  const startIdx = info.user.isAdmin && info.user.id === 0 ? 0 : stableIndex(info.user.uuid, proxyIPs.length);
-  const dial = await dialWithFallback(info.host, info.port, proxyIPs, startIdx);
+  const currentUser = info.user;
+  if (!currentUser) throw new GzError('auth failed', 'auth_failed');
+  const configuredProxyIPs = await getProxyIPs(env);
+  const startIdx = currentUser.isAdmin && currentUser.id === 0 ? 0 : stableIndex(currentUser.uuid, configuredProxyIPs.length);
+  let proxyIPs = configuredProxyIPs;
+  let userAdaptive: Awaited<ReturnType<typeof loadUserAdaptiveState>> = null;
+  let activeLearner = defaultEdgeLearner();
+  if (env.GZ_DB && configuredProxyIPs.length) {
+    try {
+      if (currentUser.id > 0) userAdaptive = await loadUserAdaptiveState(env.GZ_DB, currentUser.id);
+      const modelRow = await loadAdaptiveModel(env.GZ_DB);
+      if (modelRow) {
+        try {
+          const parsed = JSON.parse(modelRow.stateJson) as ReturnType<typeof defaultEdgeLearner>;
+          if (parsed && parsed.version === 1 && Array.isArray(parsed.weights) && parsed.weights.length === 6) activeLearner = parsed;
+        } catch { /* corrupted model state: use safe defaults */ }
+      }
+      const rows = await loadPathHealth(env.GZ_DB);
+      const decision = decideResilience(rows.map(r => ({ id:r.pathId, latencyMs:r.latencyMs, ok:r.ok, checkedAt:r.checkedAt, failures:r.failures, successes:r.successes, quarantineUntil:r.quarantineUntil, consecutiveFailures:r.consecutiveFailures, consecutiveSuccesses:r.consecutiveSuccesses, lastError:r.lastError })), Date.now(), activeLearner, userAdaptive?.preferredPathId ?? '');
+      const ordered = orderPathsForUser(configuredProxyIPs, decision, startIdx, userAdaptive?.preferredPathId ?? '');
+      if (ordered.length) proxyIPs = ordered;
+    } catch { /* health intelligence is optional; retain deterministic fallback */ }
+  }
+  const dial = await dialWithFallback(info.host, info.port, proxyIPs, 0, (attempt) => {
+    if (!env.GZ_DB || !attempt.pathId) return;
+    ctx.waitUntil((async () => {
+      try {
+        const rows = await loadPathHealth(env.GZ_DB!);
+        const previous = rows.find(r => r.pathId === attempt.pathId);
+        const next = updateObservation(previous ? {
+          id: previous.pathId, latencyMs: previous.latencyMs, ok: previous.ok,
+          checkedAt: previous.checkedAt, failures: previous.failures, successes: previous.successes,
+          quarantineUntil: previous.quarantineUntil, consecutiveFailures: previous.consecutiveFailures,
+          consecutiveSuccesses: previous.consecutiveSuccesses, lastError: previous.lastError,
+        } : undefined, attempt.ok, attempt.latencyMs, Date.now(), attempt.error);
+        next.id = attempt.pathId;
+        await saveHealthSample(env.GZ_DB!, { kind:'path', subjectId:next.id, ts:next.checkedAt, ok:next.ok, latencyMs:next.latencyMs });
+        const pathSamples = await loadHealthSamples(env.GZ_DB!, 'path', next.id, 24);
+        const pathPredictive = assessHealth(pathSamples, next.checkedAt);
+        await savePredictiveState(env.GZ_DB!, { kind:'path', subjectId:next.id, stateJson:JSON.stringify(pathPredictive), updatedAt:next.checkedAt });
+        await savePathHealth(env.GZ_DB!, {
+          pathId: next.id, latencyMs: next.latencyMs, ok: next.ok, failures: next.failures,
+          successes: next.successes, quarantineUntil: next.quarantineUntil, checkedAt: next.checkedAt,
+          lastError: next.lastError, consecutiveFailures: next.consecutiveFailures,
+          consecutiveSuccesses: next.consecutiveSuccesses, drift:pathPredictive.drift, forecastSuccess:pathPredictive.forecastSuccess, volatility:pathPredictive.latencyVolatility,
+        });
+
+        const profileRows = await loadProfileHealth(env.GZ_DB!);
+        const profilePrevious = profileRows.find(r => r.profileId === profileId);
+        const profileNext = nextProfileObservation(profilePrevious ? {
+          profileId: profileId as 'standard' | 'fragmented' | 'alt-port' | 'fragmented-alt',
+          ok: profilePrevious.ok, latencyMs: profilePrevious.latencyMs, failures: profilePrevious.failures,
+          successes: profilePrevious.successes, checkedAt: profilePrevious.checkedAt,
+          consecutiveFailures: profilePrevious.consecutiveFailures, consecutiveSuccesses: profilePrevious.consecutiveSuccesses,
+          quarantineUntil: profilePrevious.quarantineUntil,
+        } : undefined, attempt.ok, attempt.latencyMs);
+        await saveHealthSample(env.GZ_DB!, { kind: 'profile', subjectId: profileId, ts: profileNext.checkedAt, ok: profileNext.ok, latencyMs: profileNext.latencyMs });
+        const profileSamples = await loadHealthSamples(env.GZ_DB!, 'profile', profileId, 24);
+        const profilePredictive = assessHealth(profileSamples, profileNext.checkedAt);
+        await savePredictiveState(env.GZ_DB!, { kind:'profile', subjectId:profileId, stateJson:JSON.stringify(profilePredictive), updatedAt:profileNext.checkedAt });
+        await saveProfileHealth(env.GZ_DB!, {
+          profileId, latencyMs: profileNext.latencyMs, ok: profileNext.ok, failures: profileNext.failures,
+          successes: profileNext.successes, quarantineUntil: profileNext.quarantineUntil, checkedAt: profileNext.checkedAt,
+          consecutiveFailures: profileNext.consecutiveFailures, consecutiveSuccesses: profileNext.consecutiveSuccesses,
+          drift: profilePredictive.drift, forecastSuccess: profilePredictive.forecastSuccess, volatility: profilePredictive.latencyVolatility,
+        });
+        // Online local learner: update only from aggregate outcome + latency.
+        const age = next.checkedAt ? Math.max(0, Date.now() - next.checkedAt) : Number.POSITIVE_INFINITY;
+        const freshness = Number.isFinite(age) ? Math.max(0, Math.min(1, 1 - age / (10 * 60_000))) : 0;
+        const trend = (next.consecutiveSuccesses ?? 0) >= 2 && (next.consecutiveSuccesses ?? 0) > (next.consecutiveFailures ?? 0)
+          ? 'improving' as const
+          : (next.consecutiveFailures ?? 0) >= 2 && (next.consecutiveFailures ?? 0) > (next.consecutiveSuccesses ?? 0)
+            ? 'declining' as const : 'stable' as const;
+        const modelState = updateEdgeLearner(activeLearner, observationFeatures({
+          latencyMs: next.latencyMs, failures: next.failures, successes: next.successes, freshness, trend,
+          consecutiveSuccesses: next.consecutiveSuccesses ?? 0,
+        }), attempt.ok);
+        activeLearner = modelState;
+        // Persist model state best-effort; a model failure never blocks the tunnel.
+        await saveAdaptiveModel(env.GZ_DB!, { scope: 'global', stateJson: JSON.stringify(modelState), updatedAt: modelState.updatedAt });
+
+        if (currentUser.id > 0) {
+          const ua = await loadUserAdaptiveState(env.GZ_DB!, currentUser.id);
+          const successes = (ua?.successes ?? 0) + (attempt.ok ? 1 : 0);
+          const failures = (ua?.failures ?? 0) + (attempt.ok ? 0 : 1);
+          const preferredPathId = attempt.ok ? attempt.pathId : (ua?.preferredPathId === attempt.pathId ? '' : (ua?.preferredPathId ?? ''));
+          const preferredProfileId = attempt.ok ? profileId : (ua?.preferredProfileId === profileId ? '' : (ua?.preferredProfileId ?? ''));
+          await saveUserAdaptiveState(env.GZ_DB!, {
+            userId: currentUser.id, preferredPathId, preferredProfileId, successes, failures,
+            lastOk: attempt.ok, updatedAt: Date.now(),
+          });
+        }
+      } catch { /* telemetry must never break the data plane */ }
+    })());
+  });
 
   if (info.proto === 'vless') server.send(vlessOkResponse(info.version));
 

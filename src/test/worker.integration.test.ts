@@ -41,7 +41,7 @@ describe('Cloudflare Worker + D1 integration', () => {
   it('serves health without initializing admin state', async () => {
     const response = await mf.dispatchFetch('https://gozargah.test/healthz');
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true, version: '1.4.1' });
+    expect(await response.json()).toMatchObject({ ok: true, version: '2.1.0' });
   });
 
   it('rejects webhook requests without Telegram secret', async () => {

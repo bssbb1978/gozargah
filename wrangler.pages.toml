@@ -1,0 +1,14 @@
+name = "gozargah-pages"
+compatibility_date = "2025-01-15"
+pages_build_output_dir = "dist-pages"
+
+[[d1_databases]]
+binding = "GZ_DB"
+database_name = "gozargah"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[ai]
+binding = "AI"
+
+[observability]
+enabled = true

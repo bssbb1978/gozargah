@@ -1,0 +1,27 @@
+Gozargah 2.7.0 — Predictive Resilience Mesh
+
+Core:
+- Predictive mesh: bounded 24-sample drift/forecast/volatility analysis
+- D1 health_samples + predictive_state memory
+- Forecast-aware protocol selection and guard promotion gate
+- Local ensemble: logistic learner + Bayesian reliability + UCB exploration
+- Failure-domain isolation by protocol:transport family
+- stable / diversify / safe controller strategies
+- Emergency safe mode under broad degradation
+- Adaptive Guard v2 with 3/30m promotion budget and 15m hold
+- Backward migration for Adaptive Guard v1 state in D1
+- Live adaptive manifest v6
+- D1 path/profile/network/guard telemetry
+- Per-user adaptive preference
+- Dynamic Workers AI discovery retained
+- Protocol/transport capability matrix retained
+
+Validation:
+- Production TypeScript source typecheck: PASS (Cloudflare API shim only for unavailable local @cloudflare/workers-types)
+- Engine smoke tests: PASS
+- Package/version consistency: PASS
+- Archive integrity: SHA-256 generated after packaging
+
+Boundary:
+- No claim of guaranteed DPI identification or bypass.
+- No claim of creating new international upstream connectivity during a complete upstream outage.

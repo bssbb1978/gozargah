@@ -17,13 +17,23 @@ const DIAL_TIMEOUT_MS = 6000;
 export interface DialResult {
   socket: Socket;
   via: string;
+  latencyMs: number;
 }
+
+export interface DialAttempt {
+  pathId: string;
+  ok: boolean;
+  latencyMs: number;
+  error?: string;
+}
+
 
 export async function dialWithFallback(
   host: string,
   port: number,
   proxyIPs: string[],
   startIdx = 0,
+  onAttempt?: (attempt: DialAttempt) => void,
 ): Promise<DialResult> {
   const candidates: string[] = [host + ':' + port];
   for (let k = 0; k < proxyIPs.length; k++) {
@@ -34,13 +44,18 @@ export async function dialWithFallback(
   let lastErr: unknown = null;
   for (const cand of candidates) {
     let sock: Socket | null = null;
+    const started = Date.now();
     try {
       sock = connect(cand);
       await withTimeout(sock.opened, DIAL_TIMEOUT_MS, 'dial ' + cand);
-      glog('dial ok -> ' + cand);
-      return { socket: sock, via: cand };
+      const latencyMs = Date.now() - started;
+      glog('dial ok -> ' + cand + ' ' + latencyMs + 'ms');
+      try { onAttempt?.({ pathId: cand.split(':')[0], ok: true, latencyMs }); } catch { /* telemetry is best effort */ }
+      return { socket: sock, via: cand, latencyMs };
     } catch (e) {
       lastErr = e;
+      const latencyMs = Date.now() - started;
+      try { onAttempt?.({ pathId: cand.split(':')[0], ok: false, latencyMs, error: String(e) }); } catch { /* telemetry is best effort */ }
       try { sock?.close(); } catch { /* ignore */ }
     }
   }

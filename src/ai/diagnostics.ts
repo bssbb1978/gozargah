@@ -5,7 +5,8 @@
  */
 import { Env, VERSION } from '../config';
 import { listUsers } from '../db/users';
-import { loadSettings } from '../db/store';
+import { loadSettings, loadPathHealth, loadProfileHealth, loadAiModelHealth, saveAiModelHealth, loadNetworkState } from '../db/store';
+import { decideResilience, localResilienceAdvice, PathObservation } from './resilience';
 
 export interface AiBinding {
   run(model: string, input: {
@@ -16,17 +17,24 @@ export interface AiBinding {
 }
 
 const DEFAULT_MODELS = [
-  // Safe fallback list for deployments that do not configure catalog discovery.
   '@cf/deepseek-ai/deepseek-v4-pro-0813',
   '@cf/deepseek-ai/deepseek-v4-flash-0731',
-  '@cf/zai-org/glm-5.3-flash',
   '@cf/qwen/qwen3.8-27b',
-  '@cf/google/gemma-4-26b-a4b-it',
-  '@cf/meta/llama-3.1-8b-instruct',
+  '@cf/zai-org/glm-5.3-flash',
+  '@cf/openai/gpt-oss-120b',
+  '@cf/openai/gpt-oss-20b',
 ] as const;
 
 const MODEL_ID = /^@[a-z0-9][a-z0-9._/-]{2,120}$/i;
 const CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
+const MODEL_FAILURE_COOLDOWN_MS = 10 * 60 * 1000;
+const MODEL_QUARANTINE_MS = 30 * 60 * 1000;
+const KNOWN_PAID_ONLY = new Set([
+  '@cf/moonshotai/kimi-k2.6',
+  '@cf/moonshotai/kimi-k2.7-code',
+  '@cf/zai-org/glm-5.2',
+]);
+const modelFailures = new Map<string, number>();
 let catalogCache: { account: string; expiresAt: number; models: string[] } | null = null;
 let catalogPromise: Promise<string[]> | null = null;
 
@@ -40,19 +48,33 @@ export function rankCatalogModels(payload: unknown): string[] {
   if (!payload || typeof payload !== 'object') return [];
   const root = payload as Record<string, unknown>;
   const rows = Array.isArray(root.result) ? root.result : Array.isArray(payload) ? payload : [];
-  const found: Array<{ id: string; date: number; index: number }> = [];
+  const found: Array<{ id: string; date: number; index: number; score: number }> = [];
   rows.forEach((row, index) => {
     if (!row || typeof row !== 'object') return;
     const item = row as Record<string, unknown>;
     const id = [item.id, item.model_id, item.name].find((value) => typeof value === 'string' && MODEL_ID.test(value)) as string | undefined;
     if (!id || !id.startsWith('@cf/')) return;
+    if (KNOWN_PAID_ONLY.has(id)) return;
     const task = String(item.task ?? item.task_name ?? '').toLowerCase();
-    if (task && !/(text|generation|language|chat)/.test(task)) return;
+    if (task && !/(text|generation|language|chat|reason)/.test(task)) return;
+    const description = String(item.description ?? '').toLowerCase();
+    const caps = JSON.stringify(item.capabilities ?? item.capability ?? '').toLowerCase();
+    const meta = task + ' ' + description + ' ' + caps + ' ' + id.toLowerCase();
     const dateValue = item.updated_at ?? item.created_at ?? item.created_on ?? item.release_date;
     const parsed = typeof dateValue === 'number' ? dateValue : Date.parse(String(dateValue ?? ''));
-    found.push({ id, date: Number.isFinite(parsed) ? parsed : 0, index });
+    const recent = Number.isFinite(parsed) && parsed > 0 ? Math.min(24, Math.max(0, (parsed - Date.UTC(2024, 0, 1)) / 86_400_000 / 180)) : 0;
+    const contextRaw = item.context_window ?? item.context_length ?? item.max_context_length;
+    const context = typeof contextRaw === 'number' ? Math.min(12, Math.log10(Math.max(1, contextRaw)) * 3) : 0;
+    let capability = 0;
+    if (/reason|thinking/.test(meta)) capability += 24;
+    if (/function.?call|tool.?call/.test(meta)) capability += 18;
+    if (/vision|multimodal/.test(meta)) capability += 8;
+    if (/agentic|long.?context|1.?m|million/.test(meta)) capability += 10;
+    if (/fast|flash|turbo/.test(meta)) capability += 4;
+    const score = capability + context + recent;
+    found.push({ id, date: Number.isFinite(parsed) ? parsed : 0, index, score });
   });
-  found.sort((a, b) => (a.date && b.date ? b.date - a.date : a.index - b.index));
+  found.sort((a, b) => b.score - a.score || (a.date && b.date ? b.date - a.date : a.index - b.index));
   return [...new Set(found.map((item) => item.id))].slice(0, 8);
 }
 
@@ -91,9 +113,25 @@ async function discoverModels(env: Env): Promise<string[]> {
 
 async function selectModels(env: Env): Promise<string[]> {
   const configured = (env.AI_MODELS || '').split(',').map((x) => x.trim()).filter((x) => MODEL_ID.test(x));
-  if (configured.length) return [...new Set(configured)].slice(0, 8);
-  const discovered = await discoverModels(env);
-  return discovered.length ? discovered : [...DEFAULT_MODELS];
+  const base = configured.length ? [...new Set(configured)] : (await discoverModels(env)).concat(DEFAULT_MODELS);
+  const unique = [...new Set(base)].slice(0, 24);
+  if (!env.GZ_DB) return unique.slice(0, 8);
+  try {
+    const health = await loadAiModelHealth(env.GZ_DB);
+    const byId = new Map(health.map(h => [h.modelId, h]));
+    const now = Date.now();
+    return unique
+      .filter(id => { const h = byId.get(id); return !h || h.quarantineUntil <= now; })
+      .sort((a,b) => {
+        const ha = byId.get(a); const hb = byId.get(b);
+        const sa = ha ? (ha.successes - ha.failures * 2) : 0;
+        const sb = hb ? (hb.successes - hb.failures * 2) : 0;
+        return sb - sa;
+      })
+      .slice(0, 8);
+  } catch {
+    return unique.slice(0, 8);
+  }
 }
 
 function localAdvice(summary: Record<string, number | string>, language: 'fa' | 'en', aiUnavailable: boolean): string {
@@ -165,7 +203,19 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
     quotaLimitedUsers: users.filter((u) => u.quotaBytes > 0).length,
     // Aggregate only; no domain names, IPs, user identifiers, or traffic content.
     configuredFallbackCount: env.GZ_DB ? (await loadSettings(env.GZ_DB))?.proxyIPs.length ?? 0 : 0,
+    pathHealthCount: env.GZ_DB ? (await loadPathHealth(env.GZ_DB)).length : 0,
+    profileHealthCount: env.GZ_DB ? (await loadProfileHealth(env.GZ_DB)).length : 0,
+    networkState: env.GZ_DB ? ((await loadNetworkState(env.GZ_DB))?.state ?? 'unknown') : 'unknown',
   };
+
+  if (env.GZ_DB) {
+    const rows = await loadPathHealth(env.GZ_DB);
+    const observations: PathObservation[] = rows.map(r => ({ id:r.pathId, latencyMs:r.latencyMs, ok:r.ok, checkedAt:r.checkedAt, failures:r.failures, successes:r.successes, quarantineUntil:r.quarantineUntil }));
+    const decision = decideResilience(observations);
+    if (!env.AI) {
+      return { ai:false, model:null, summary, text: localResilienceAdvice(decision, language) + '\n\n' + localAdvice(summary, language, false) };
+    }
+  }
 
   if (!env.AI) {
     return {
@@ -183,6 +233,8 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
   const prompt = JSON.stringify(summary);
   let lastError: unknown;
   for (const model of models) {
+    const failedAt = modelFailures.get(model) || 0;
+    if (failedAt && Date.now() - failedAt < MODEL_FAILURE_COOLDOWN_MS) continue;
     try {
       const result = await (env.AI as AiBinding).run(model, {
         messages: [
@@ -194,8 +246,24 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
       });
       const text = outputText(result).trim().slice(0, 5000);
       if (!text) throw new Error('empty model response');
+      modelFailures.delete(model);
+      if (env.GZ_DB) {
+        try {
+          const h = (await loadAiModelHealth(env.GZ_DB)).find(x => x.modelId === model);
+          await saveAiModelHealth(env.GZ_DB, { modelId: model, failures: h?.failures ?? 0, successes: (h?.successes ?? 0) + 1, quarantineUntil: 0, updatedAt: Date.now() });
+        } catch { /* health telemetry is optional */ }
+      }
       return { ai: true, model, text, summary };
     } catch (error) {
+      const now = Date.now();
+      modelFailures.set(model, now);
+      if (env.GZ_DB) {
+        try {
+          const h = (await loadAiModelHealth(env.GZ_DB)).find(x => x.modelId === model);
+          const failures = (h?.failures ?? 0) + 1;
+          await saveAiModelHealth(env.GZ_DB, { modelId: model, failures, successes: h?.successes ?? 0, quarantineUntil: now + MODEL_QUARANTINE_MS, updatedAt: now });
+        } catch { /* health telemetry is optional */ }
+      }
       lastError = error;
     }
   }

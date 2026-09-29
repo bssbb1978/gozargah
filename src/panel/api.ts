@@ -8,7 +8,7 @@ import { Env, GzError, VERSION } from '../config';
 import { EffectiveSettings } from '../settings';
 import {
   addEvent, recentEvents, saveSettings, SettingsBlob, loadSettings, invalidateCache,
-  consumeAiDiagnosticQuota,
+  consumeAiDiagnosticQuota, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState,
 } from '../db/store';
 import {
   createUser, deleteUser, GzUser, invalidateUsers, listUsers, updateUser, flushUsage,
@@ -17,11 +17,16 @@ import {
   checkLoginGate, clearedCookie, ipHash, isAuthed, makeSessionToken, onLoginResult,
   requireAuth, sessionCookie, verifyPanelPassword,
 } from '../auth';
-import { buildLinks, subTokenFor } from '../subscription';
+import { buildLinks, subTokenFor, buildProtocolMatrix } from '../subscription';
 import { qrSvg } from '../utils/qr';
 import { logRing } from '../utils/log';
 import { pbkdf2Hex, randomHex } from '../utils/crypto';
 import { createDiagnostics } from '../ai/diagnostics';
+import { decideResilience, updateObservation, localResilienceAdvice, PathObservation } from '../ai/resilience';
+import { decideAdaptiveProfile } from '../ai/edge-brain';
+import { buildAdaptiveProtocolPlan } from '../ai/protocol-controller';
+import { assessHealth } from '../ai/predictive-mesh';
+import { defaultEdgeLearner, learnerConfidence } from '../ai/edge-learner';
 
 const JSON_CT = 'application/json; charset=utf-8';
 
@@ -92,6 +97,150 @@ export async function handlePanelApi(
 
     if (action === 'me' && method === 'GET') {
       return json({ ok: true, version: VERSION, dbOk: eff.dbOk, isDefaultPassword: eff.isDefaultPassword });
+    }
+
+    if (action === 'network/resilience' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const rows = await loadPathHealth(db);
+      let learner = defaultEdgeLearner();
+      const modelRow = await loadAdaptiveModel(db);
+      if (modelRow) { try { learner = JSON.parse(modelRow.stateJson); } catch { /* safe default */ } }
+      const decision = decideResilience(rows.map(r => ({ id:r.pathId, latencyMs:r.latencyMs, ok:r.ok, checkedAt:r.checkedAt, failures:r.failures, successes:r.successes, quarantineUntil:r.quarantineUntil, consecutiveFailures:r.consecutiveFailures, consecutiveSuccesses:r.consecutiveSuccesses, lastError:r.lastError })), Date.now(), learner);
+      return json({ ok:true, decision, advice: localResilienceAdvice(decision, 'fa'), policy: { mode: decision.mode, selectedPath: decision.selectedPath, dynamicOrdering: true, aiOptional: true, localLearner: true } });
+    }
+
+    if (action === 'network/state' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const state = await loadNetworkState(db);
+      return json({ ok: true, state, source: 'configured-path telemetry only', internationalOutageProven: false, dpiProven: false, interpretation: 'observational-signal-only' });
+    }
+
+    if (action === 'network/brain' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const row = await loadAdaptiveModel(db);
+      let learner = defaultEdgeLearner();
+      if (row) { try { learner = JSON.parse(row.stateJson); } catch { /* safe default */ } }
+      return json({
+        ok: true, version: learner.version, updates: learner.updates, updatedAt: learner.updatedAt,
+        learnerConfidence: Math.round(learnerConfidence(learner) * 100) / 100,
+        weights: learner.weights, bias: learner.bias,
+        source: 'aggregate connection telemetry only',
+      });
+    }
+
+    if (action === 'network/capabilities' && method === 'GET') {
+      const matrix = buildProtocolMatrix(env, new URL(request.url).hostname);
+      return json({ ok: true, matrix, generatedAt: Date.now() });
+    }
+
+    if (action === 'network/policy' && method === 'GET') {
+      const matrix = buildProtocolMatrix(env, new URL(request.url).hostname);
+      return json({ ok: true, policy: matrix.adaptivePolicy, origin: matrix.origin, limitations: {
+        worker_native_tcp_inbound: false,
+        worker_native_udp_inbound: false,
+        udp_protocols_require_origin_engine: true,
+      } });
+    }
+
+    if (action === 'network/autoplan' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const host = new URL(request.url).hostname;
+      const matrix = buildProtocolMatrix(env, host);
+      const [pathRows, profileRows, state] = await Promise.all([loadPathHealth(db), loadProfileHealth(db), loadNetworkState(db)]);
+      let learner = defaultEdgeLearner();
+      const modelRow = await loadAdaptiveModel(db);
+      if (modelRow) { try { learner = JSON.parse(modelRow.stateJson); } catch { /* safe default */ } }
+      const predictive = Object.fromEntries(profileRows.map((r) => [r.profileId, {
+        sampleCount: r.successes + r.failures, reliability: (r.successes + r.failures) ? r.successes / (r.successes + r.failures) : 0.5,
+        latencyEwma: r.latencyMs, latencyVolatility: r.volatility ?? 1, successSlope: 0, latencySlope: 0,
+        drift: (r.drift ?? 'stable') as 'improving'|'stable'|'degrading', forecastSuccess: r.forecastSuccess ?? 0.5,
+        confidence: Math.min(1, (r.successes + r.failures) / 12),
+      }]));
+      const plan = buildAdaptiveProtocolPlan({ profiles: matrix.adaptivePolicy.profiles, health: profileRows, predictive, networkState: state ? { state: state.state as 'healthy'|'degraded'|'recovery'|'no_healthy_path', quorum: state.quorum, healthy: 0, degraded: 0, quarantined: 0, unknown: 0, total: pathRows.length, failureRate: state.failureRate, confidence: state.confidence, anomalyScore: state.anomalyScore, signalClass: state.signalClass as import('../ai/network-state').NetworkSignalClass, selectedPath: state.selectedPath || null, reasonCodes: state.reasonCodes, generatedAt: state.updatedAt } : null, learner, limit: 10 });
+      await saveProtocolPolicyState(db, { selectedProfile: plan.selected || '', fallbackLadder: plan.fallbackLadder, reasonCodes: plan.reasonCodes, diversity: plan.diversity, confidence: plan.confidence, mode: plan.mode, consensus: plan.consensus, signalAgreement: plan.signalAgreement, switchRisk: plan.switchRisk, fusionMode: plan.fusionMode, policyFingerprint: plan.policyFingerprint, updatedAt: plan.generatedAt });
+      return json({ ok: true, plan, persisted: true, origin: matrix.origin, generatedAt: Date.now() });
+    }
+
+    if (action === 'network/policy-state' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      return json({ ok: true, state: await loadProtocolPolicyState(db) });
+    }
+
+    if (action === 'network/fusion' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const state = await loadPolicySignalState(db);
+      let parsed: Record<string, unknown> | null = null;
+      if (state) { try { parsed = JSON.parse(state.stateJson) as Record<string, unknown>; } catch { parsed = null; } }
+      return json({ ok: true, state: state ? { ...(parsed || {}), updatedAt: state.updatedAt } : null, semantics: {
+        payloadInspection: false,
+        censorshipIdentityProven: false,
+        purpose: 'multi-signal policy gating',
+      } });
+    }
+
+    if (action === 'network/guard' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const state = await loadAdaptiveGuardState(db);
+      return json({
+        ok: true,
+        state,
+        semantics: {
+          autonomous_promotion: true,
+          canary_hold_ms: 900000,
+          change_window_ms: 1800000,
+          max_changes_per_window: 3,
+          rollback_on_active_failure: true,
+          packet_mutation: false,
+          dpi_mechanism_claimed: false,
+        },
+      });
+    }
+
+    if (action === 'network/profiles' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const rows = await loadProfileHealth(db);
+      const observations = rows.map(r => ({
+        profileId: r.profileId as 'standard' | 'fragmented' | 'alt-port' | 'fragmented-alt',
+        ok: r.ok, latencyMs: r.latencyMs, failures: r.failures, successes: r.successes,
+        checkedAt: r.checkedAt, consecutiveFailures: r.consecutiveFailures,
+        consecutiveSuccesses: r.consecutiveSuccesses, quarantineUntil: r.quarantineUntil,
+      }));
+      const decision = decideAdaptiveProfile(observations);
+      return json({ ok: true, decision, learning: { persistent: true, source: 'connection-telemetry', deterministicFallback: true } });
+    }
+
+    if (action === 'network/forecast' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const rows = await loadProfileHealth(db);
+      const forecast = rows.map((r) => ({
+        profileId: r.profileId, drift: r.drift ?? 'stable', forecastSuccess: r.forecastSuccess ?? 0.5,
+        volatility: r.volatility ?? 1, samples: r.successes + r.failures, checkedAt: r.checkedAt,
+      })).sort((a,b) => b.forecastSuccess - a.forecastSuccess);
+      return json({ ok: true, forecast, semantics: { predictive: true, payloadInspection: false, censorshipIdentityProven: false } });
+    }
+
+    if (action === 'network/probe' && method === 'POST') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const body = (await request.json().catch(() => ({}))) as { url?: unknown };
+      const target = String(body.url ?? '').trim();
+      if (!/^https:\/\//i.test(target) || target.length > 2048) throw new GzError('invalid probe url', 'validation');
+      const parsed = new URL(target);
+      const settings = await loadSettings(db);
+      const allowed = new Set(settings?.proxyIPs ?? eff.proxyIPs);
+      if (!allowed.has(parsed.hostname)) throw new GzError('probe target is not configured', 'validation');
+      const started = Date.now();
+      let ok = false;
+      try {
+        const r = await fetch(parsed.toString(), { method:'HEAD', redirect:'error', signal:AbortSignal.timeout(5000) });
+        ok = r.ok;
+      } catch { ok = false; }
+      const latencyMs = Date.now() - started;
+      const previous = (await loadPathHealth(db)).find(r => r.pathId === parsed.hostname);
+      const next = updateObservation(previous ? { id:previous.pathId, latencyMs:previous.latencyMs, ok:previous.ok, checkedAt:previous.checkedAt, failures:previous.failures, successes:previous.successes, quarantineUntil:previous.quarantineUntil, consecutiveFailures:previous.consecutiveFailures, consecutiveSuccesses:previous.consecutiveSuccesses, lastError:previous.lastError } : undefined, ok, latencyMs);
+      next.id = parsed.hostname;
+      await savePathHealth(db, { pathId:next.id, latencyMs:next.latencyMs, ok:next.ok, failures:next.failures, successes:next.successes, quarantineUntil:next.quarantineUntil, checkedAt:next.checkedAt, consecutiveFailures:next.consecutiveFailures, consecutiveSuccesses:next.consecutiveSuccesses, lastError: ok ? '' : 'probe_failed' });
+      const decision = decideResilience(await loadPathHealth(db).then(rows => rows.map(r => ({ id:r.pathId, latencyMs:r.latencyMs, ok:r.ok, checkedAt:r.checkedAt, failures:r.failures, successes:r.successes, quarantineUntil:r.quarantineUntil, consecutiveFailures:r.consecutiveFailures, consecutiveSuccesses:r.consecutiveSuccesses, lastError:r.lastError }))));
+      return json({ ok, latencyMs, decision });
     }
 
     if (action === 'ai/diagnostics' && method === 'POST') {
@@ -271,6 +420,7 @@ export async function handlePanelApi(
         subClash: 'https://' + host + '/' + eff.subPath + '/' + tok + '/clash',
         subSingbox: 'https://' + host + '/' + eff.subPath + '/' + tok + '/singbox',
         subXray: 'https://' + host + '/' + eff.subPath + '/' + tok + '/xray',
+        subAdaptive: 'https://' + host + '/' + eff.subPath + '/' + tok + '/adaptive',
         statusPage: 'https://' + host + '/' + eff.subPath + '/' + tok,
       });
     }

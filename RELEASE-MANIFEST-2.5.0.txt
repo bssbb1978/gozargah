@@ -1,0 +1,14 @@
+Gozargah 2.5.0
+Release: Self-Healing Adaptive Guard + Protocol Intelligence
+
+Primary additions:
+- live adaptive manifest v5
+- D1 adaptive_guard_state
+- canary/staged policy promotion with bounded hold window
+- automatic promotion on material confidence gain or active-profile failure
+- rollback counter and previous-plan retention
+- observational network anomaly score and signal class
+- adaptive policy audit events
+- authenticated /api/network/guard endpoint
+- local learner remains deterministic policy guard
+- Workers AI remains optional and dynamically discoverable

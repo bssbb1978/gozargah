@@ -9,14 +9,14 @@
  *   GET  /{panelPath}         -> panel UI (SPA)
  *   POST /{panelPath}/api/*   -> panel JSON API
  *   GET  /{subPath}/{token}       -> browser: rich status page · client: sub (UA-sniffed)
- *   GET  /{subPath}/{token}/{app} -> explicit format (clash | singbox | v2ray | xray | page)
+ *   GET  /{subPath}/{token}/{app} -> explicit format (clash | singbox | v2ray | xray | profiles | adaptive | capabilities | page)
  *   GET  anything else        -> stealth landing (no info leak, nahan-style)
  */
 
 import { Env, VERSION } from './config';
 import { getEffectiveSettings } from './settings';
 import { acceptWebSocket } from './handlers/websocket';
-import { findUserByToken, renderSub, resolveApp, subHeaders } from './subscription';
+import { buildLiveAdaptiveClientBundle, findUserByToken, renderSub, resolveApp, subHeaders } from './subscription';
 import { resolveOpts } from './sub/operators';
 import { lazyMaintenance } from './db/users';
 import { handlePanelApi } from './panel/api';
@@ -26,8 +26,12 @@ import { userPageHtml } from './panel/userpage';
 import { LOGO_FAV_B64 } from './assets/logo';
 import { glog, logRing } from './utils/log';
 import { handleTelegramWebhook } from './telegram';
+import { runScheduledHealth } from './ai/scheduled-health';
 
 export default {
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runScheduledHealth(env).catch(() => { /* scheduled health is best-effort */ }));
+  },
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
       return await route(request, env, ctx);
@@ -120,7 +124,11 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         });
       }
 
-      const { body } = renderSub(app, url.hostname, user, opts);
+      if (app === 'adaptive') {
+        const body = await buildLiveAdaptiveClientBundle(url.hostname, user, opts, env);
+        return new Response(body, { headers: subHeaders(eff, url.hostname, user, app, opts, token) });
+      }
+      const { body } = renderSub(app, url.hostname, user, opts, env);
       return new Response(body, { headers: subHeaders(eff, url.hostname, user, app, opts, token) });
     }
     // unknown token: fall through to stealth landing (no user enumeration)

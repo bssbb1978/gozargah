@@ -29,3 +29,5 @@ await build({
 const res = spawnSync(process.execPath, [outfile], { stdio: 'inherit' });
 try { rmSync(outfile, { force: true }); } catch { /* ignore */ }
 process.exit(res.status ?? 1);
+
+// predictive mesh smoke test is run via src/test/predictive-mesh.ts

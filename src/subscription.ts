@@ -9,16 +9,191 @@
  * Headers: real Subscription-Userinfo from byte accounting (not fake {usage}).
  */
 
-import { Env } from './config';
 import { toBase64 } from './utils/crypto';
 import { GzUser, listUsers } from './db/users';
+import { loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadProfileHealth, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState } from './db/store';
+import { decideResilience, type PathObservation } from './ai/resilience';
+import { buildAdaptiveProtocolPlan } from './ai/protocol-controller';
+import { nextAdaptiveGuardState, reconcileAdaptivePlan } from './ai/adaptive-guard';
 import { EffectiveSettings } from './settings';
-import { DEFAULT_FP, FragPreset, fpFor, opBranding, resolveOp, SubOpts } from './sub/operators';
+import { DEFAULT_FP, FragPreset, adaptiveProfiles, fpFor, opBranding, resolveOp, SubOpts, AdaptiveProfile } from './sub/operators';
+import { ALPN_PROFILES, protocolCatalog, adaptiveProtocolOrder } from './protocols/catalog';
+import { buildAdaptiveProtocolPolicy, choosePreferredProfiles, policySummary } from './protocols/policy';
+import { Env } from './config';
 
 export interface ClientLinks {
   vless: string;
   trojan: string;
   wsPath: string;
+}
+
+export interface ProtocolMatrixBundle {
+  version: string;
+  edge: { host: string; nativeProtocols: Array<{ protocol: string; transport: string; ready: boolean }> };
+  origin: { configured: boolean; host?: string; port?: number };
+  capabilities: ReturnType<typeof protocolCatalog>;
+  preferredOrder: ReturnType<typeof adaptiveProtocolOrder>;
+  alpnProfiles: string[][];
+  generatedAt: number;
+  adaptivePolicy: { profiles: ReturnType<typeof buildAdaptiveProtocolPolicy>; preferred: ReturnType<typeof choosePreferredProfiles>; summary: ReturnType<typeof policySummary> };
+}
+
+export function buildProtocolMatrix(env: Env | undefined, host: string): ProtocolMatrixBundle {
+  const originHost = env?.ORIGIN_ENGINE_HOST?.trim() || '';
+  const originPort = Number(env?.ORIGIN_ENGINE_PORT || 443);
+  const configured = !!originHost;
+  const all = protocolCatalog(configured);
+  const adaptiveProfiles = buildAdaptiveProtocolPolicy(all);
+  return {
+    version: '2.8.0',
+    edge: { host, nativeProtocols: all.filter((c) => c.mode === 'native-edge').map((c) => ({ protocol: c.protocol, transport: c.transport, ready: c.ready })) },
+    origin: configured ? { configured: true, host: originHost, port: Number.isFinite(originPort) && originPort > 0 ? originPort : 443 } : { configured: false },
+    capabilities: all,
+    preferredOrder: adaptiveProtocolOrder(configured),
+    alpnProfiles: ALPN_PROFILES,
+    generatedAt: Date.now(),
+    adaptivePolicy: { profiles: adaptiveProfiles, preferred: choosePreferredProfiles(adaptiveProfiles, 14), summary: policySummary(adaptiveProfiles) },
+  };
+}
+
+export function buildAdaptiveClientBundle(host: string, user: { uuid: string; trojanPass: string; name: string }, opts: BuildOpts | null | undefined, env?: Env): string {
+  const matrix = buildProtocolMatrix(env, host);
+  const out: Record<string, unknown> = {
+    schema: 'gozargah-adaptive-profiles/v4',
+    generated_at: matrix.generatedAt,
+    selection: { strategy: 'health-weighted', native_first: true, fallback: 'next-healthy' },
+    native: {
+      vless_ws: buildLinks(host, user, opts).vless,
+      trojan_ws: buildLinks(host, user, opts).trojan,
+    },
+    capability_matrix: matrix.capabilities,
+    preferred_order: matrix.preferredOrder,
+    adaptive_policy: matrix.adaptivePolicy,
+  };
+  if (matrix.origin.configured) {
+    const oh = matrix.origin.host!;
+    const op = matrix.origin.port!;
+    out.origin = {
+      host: oh,
+      port: op,
+      note: 'Origin-engine profiles require a compatible Xray/sing-box listener. The Worker does not terminate native UDP protocols.',
+      protocol_templates: {
+        vmess_ws: { protocol: 'vmess', transport: 'ws', server: oh, port: op, id: user.uuid, tls: true },
+        vless_xhttp: { protocol: 'vless', transport: 'xhttp', server: oh, port: op, id: user.uuid, tls: true },
+        vless_grpc: { protocol: 'vless', transport: 'grpc', server: oh, port: op, id: user.uuid, tls: true, alpn: ['h2'] },
+        vless_httpupgrade: { protocol: 'vless', transport: 'httpupgrade', server: oh, port: op, id: user.uuid, tls: true, alpn: ['http/1.1'] },
+        trojan_xhttp: { protocol: 'trojan', transport: 'xhttp', server: oh, port: op, password: user.trojanPass, tls: true },
+        shadowsocks_tcp: { protocol: 'shadowsocks', transport: 'tcp', server: oh, port: op, password: user.trojanPass },
+        http_tls: { protocol: 'http', transport: 'http/1.1', server: oh, port: op, tls: true },
+        wireguard: { protocol: 'wireguard', transport: 'h3', server: oh, port: op, requires_udp_engine: true },
+        hysteria2: { protocol: 'hysteria2', transport: 'h3', server: oh, port: op, requires_udp_engine: true },
+      },
+    };
+  }
+  return JSON.stringify(out, null, 2);
+}
+
+
+export async function buildLiveAdaptiveClientBundle(
+  host: string,
+  user: { id?: number; uuid: string; trojanPass: string; name: string },
+  opts: BuildOpts | null | undefined,
+  env?: Env,
+): Promise<string> {
+  const base = JSON.parse(buildAdaptiveClientBundle(host, user, opts, env)) as Record<string, unknown>;
+  const now = Date.now();
+  const matrix = buildProtocolMatrix(env, host);
+  const db = env?.GZ_DB;
+  let networkState = null as Awaited<ReturnType<typeof loadNetworkState>>;
+  let profileHealth = [] as Awaited<ReturnType<typeof loadProfileHealth>>;
+  let userState = null as Awaited<ReturnType<typeof loadUserAdaptiveState>>;
+  let learner: ReturnType<typeof JSON.parse> | undefined;
+  let pathRows: Awaited<ReturnType<typeof loadPathHealth>> = [];
+  if (db) {
+    try { networkState = await loadNetworkState(db); } catch { /* optional */ }
+    try { profileHealth = await loadProfileHealth(db); } catch { /* optional */ }
+    try { pathRows = await loadPathHealth(db); } catch { /* optional */ }
+    if (user.id && user.id > 0) {
+      try { userState = await loadUserAdaptiveState(db, user.id); } catch { /* optional */ }
+    }
+    try {
+      const row = await loadAdaptiveModel(db);
+      if (row) learner = JSON.parse(row.stateJson);
+    } catch { /* optional */ }
+  }
+  const observations: PathObservation[] = pathRows.map(r => ({
+    id: r.pathId, latencyMs: r.latencyMs, ok: r.ok, checkedAt: r.checkedAt,
+    failures: r.failures, successes: r.successes, quarantineUntil: r.quarantineUntil,
+    consecutiveFailures: r.consecutiveFailures, consecutiveSuccesses: r.consecutiveSuccesses,
+    lastError: r.lastError,
+  }));
+  const resilience = observations.length ? decideResilience(observations, now, learner, userState?.preferredPathId ?? '') : null;
+  const networkDecision = networkState ? {
+    state: networkState.state as 'healthy'|'degraded'|'recovery'|'no_healthy_path',
+    quorum: networkState.quorum, healthy: 0, degraded: 0, quarantined: 0, unknown: 0,
+    total: observations.length, failureRate: networkState.failureRate, confidence: networkState.confidence, anomalyScore: networkState.anomalyScore, signalClass: networkState.signalClass as import('./ai/network-state').NetworkSignalClass,
+    selectedPath: networkState.selectedPath || null, reasonCodes: networkState.reasonCodes, generatedAt: networkState.updatedAt,
+  } : null;
+  const predictive = Object.fromEntries(profileHealth.map((row) => [row.profileId, {
+    sampleCount: row.successes + row.failures,
+    reliability: (row.successes + row.failures) ? row.successes / (row.successes + row.failures) : 0.5,
+    latencyEwma: row.latencyMs, latencyVolatility: row.volatility ?? 1,
+    successSlope: 0, latencySlope: 0, drift: (row.drift ?? 'stable') as 'improving'|'stable'|'degrading',
+    forecastSuccess: row.forecastSuccess ?? 0.5, confidence: Math.min(1, (row.successes + row.failures) / 12),
+  }]));
+  const controllerPlan = buildAdaptiveProtocolPlan({
+    profiles: matrix.adaptivePolicy.profiles,
+    health: profileHealth,
+    predictive,
+    networkState: networkDecision,
+    learner,
+    preferredProfileId: userState?.preferredProfileId ?? '',
+    limit: 10,
+    now,
+  });
+
+  let activePlan = controllerPlan;
+  let guardMeta: Record<string, unknown> | null = null;
+  if (db) {
+    try {
+      const guardState = await loadAdaptiveGuardState(db);
+      const decision = reconcileAdaptivePlan(controllerPlan, guardState ?? undefined, profileHealth.map((r) => ({
+        profileId: r.profileId, latencyMs: r.latencyMs, failures: r.failures, successes: r.successes,
+        quarantineUntil: r.quarantineUntil, checkedAt: r.checkedAt, consecutiveFailures: r.consecutiveFailures, consecutiveSuccesses: r.consecutiveSuccesses,
+      })), now);
+      activePlan = decision.active;
+      const nextGuard = nextAdaptiveGuardState(guardState ?? undefined, decision, now);
+      await saveAdaptiveGuardState(db, nextGuard);
+      await saveProtocolPolicyState(db, {
+        selectedProfile: activePlan.selected || '', fallbackLadder: activePlan.fallbackLadder, reasonCodes: activePlan.reasonCodes,
+        diversity: activePlan.diversity, confidence: activePlan.confidence, mode: activePlan.mode,
+        consensus: activePlan.consensus, signalAgreement: activePlan.signalAgreement, switchRisk: activePlan.switchRisk, fusionMode: activePlan.fusionMode,
+        policyFingerprint: activePlan.policyFingerprint, updatedAt: activePlan.generatedAt,
+      });
+      guardMeta = { status: decision.status, promoted: decision.promoted, rolledBack: decision.rolledBack, staged: decision.staged?.policyFingerprint ?? null, reasonCodes: decision.reasonCodes };
+    } catch { /* guard is best-effort; candidate remains safe */ }
+  }
+
+  base.schema = 'gozargah-live-adaptive-profiles/v7';
+  base.generated_at = now;
+  base.live_policy = {
+    ...activePlan,
+    guard: guardMeta,
+    path_selection: resilience ? {
+      selected: resilience.selectedPath,
+      mode: resilience.mode,
+      confidence: resilience.confidence,
+      candidates: resilience.candidates.slice(0, 12).map(x => ({ id: x.id, score: x.score, state: x.state, failureRate: x.failureRate, latencyMs: x.latencyMs })),
+    } : null,
+    network_state: networkState,
+    client_behavior: {
+      sticky_preference: userState?.preferredProfileId || null,
+      switch_only_on_degrade_or_failure: true,
+      bounded_recovery_candidates: resilience?.recoveryCandidates?.slice(0, 2) ?? [],
+      no_random_protocol_generation: true,
+    },
+  };
+  return JSON.stringify(base, null, 2);
 }
 
 export interface BuildOpts extends SubOpts {
@@ -41,7 +216,7 @@ export function buildLinks(
   opts: BuildOpts | null | undefined,
 ): ClientLinks {
   const port = opts?.port && opts.port !== 443 ? opts.port : 443;
-  const wsPath = '/' + user.uuid + '?ed=2048';
+  const wsPath = '/' + user.uuid + '?ed=2048&gz_profile=standard';
   const fp = fpFor(opts);
   const ech = opts?.ech ? '&ech=' : '';
   const tag = encodeURIComponent(remarkFor(user, opts));
@@ -84,7 +259,7 @@ export function buildClashYaml(
   opts: BuildOpts | null | undefined,
 ): string {
   const port = opts?.port && opts.port !== 443 ? opts.port : 443;
-  const wsPath = '/' + user.uuid + '?ed=2048';
+  const wsPath = '/' + user.uuid + '?ed=2048&gz_profile=standard';
   const fp = fpFor(opts);
   const brand = opBranding(opts);
   const vName = 'Gozargah-VLESS-' + (brand ? brand.en.split(' ')[0] + '-' : '') + user.name;
@@ -144,7 +319,7 @@ export function buildSingBoxJson(
   opts: BuildOpts | null | undefined,
 ): string {
   const port = opts?.port && opts.port !== 443 ? opts.port : 443;
-  const wsPath = '/' + user.uuid + '?ed=2048';
+  const wsPath = '/' + user.uuid + '?ed=2048&gz_profile=standard';
   const fp = fpFor(opts);
   const tls: Record<string, unknown> = {
     enabled: true,
@@ -211,98 +386,122 @@ export function buildXrayJson(
   host: string,
   user: { uuid: string; trojanPass: string; name: string },
   opts: BuildOpts | null | undefined,
+  env?: Env,
 ): string {
-  const port = opts?.port && opts.port !== 443 ? opts.port : 443;
-  const wsPath = '/' + user.uuid + '?ed=2048';
-  const fp = fpFor(opts);
-  const op = resolveOp(opts?.opKey);
+  const profiles = adaptiveProfiles(opts);
+  const wsPath = (profileId: string) => '/' + user.uuid + '?ed=2048&gz_profile=' + profileId;
   const brand = opBranding(opts);
-  const suffix = brand ? ' · ' + brand.fa : '';
+  const suffix = brand ? '-' + brand.key : '';
+  const outbounds: Array<Record<string, unknown>> = [];
+  const appTags: string[] = [];
 
-  const stream = {
-    network: 'ws',
-    security: 'tls',
-    tlsSettings: { serverName: host, allowInsecure: false, fingerprint: fp },
-    wsSettings: { path: wsPath, headers: { Host: host } },
+  const addProfileOutbounds = (profile: AdaptiveProfile): void => {
+    const stream = {
+      network: 'ws',
+      security: 'tls',
+      tlsSettings: {
+        serverName: host,
+        allowInsecure: false,
+        fingerprint: profile.fp,
+      },
+      wsSettings: {
+        path: wsPath(profile.id),
+        headers: { Host: host },
+      },
+    };
+    const vTag = 'gz-' + profile.id + '-vless' + suffix;
+    const tTag = 'gz-' + profile.id + '-trojan' + suffix;
+    outbounds.push({
+      tag: vTag,
+      protocol: 'vless',
+      settings: { vnext: [{ address: host, port: profile.port, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] },
+      streamSettings: stream,
+    });
+    outbounds.push({
+      tag: tTag,
+      protocol: 'trojan',
+      settings: { servers: [{ address: host, port: profile.port, password: user.trojanPass, level: 0 }] },
+      streamSettings: stream,
+    });
+    appTags.push(vTag, tTag);
+
+    if (profile.frag) {
+      const fragTag = 'gzx-' + profile.id + '-frag';
+      outbounds.push({
+        tag: fragTag,
+        protocol: 'freedom',
+        settings: {
+          domainStrategy: 'AsIs',
+          fragment: { packets: profile.frag.packets, length: profile.frag.length, interval: profile.frag.interval },
+        },
+      });
+      const fvTag = 'gz-' + profile.id + '-frag-vless' + suffix;
+      outbounds.push({
+        tag: fvTag,
+        protocol: 'vless',
+        settings: { vnext: [{ address: host, port: profile.port, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] },
+        streamSettings: stream,
+        dialerProxy: fragTag,
+      });
+      appTags.push(fvTag);
+    }
   };
 
-  const outbounds: Array<Record<string, unknown>> = [
-    {
-      tag: 'gz-vless' + suffix,
-      protocol: 'vless',
-      settings: {
-        vnext: [{
-          address: host,
-          port,
-          users: [{ id: user.uuid, encryption: 'none', level: 0 }],
-        }],
-      },
-      streamSettings: stream,
-    },
-    {
-      tag: 'gz-trojan' + suffix,
-      protocol: 'trojan',
-      settings: {
-        servers: [{ address: host, port, password: user.trojanPass, level: 0 }],
-      },
-      streamSettings: stream,
-    },
-  ];
+  for (const profile of profiles) addProfileOutbounds(profile);
 
-  const appTags = ['gz-vless' + suffix, 'gz-trojan' + suffix];
-
-  if (op?.frag) {
-    const fragOut = (tag: string, preset: FragPreset): Record<string, unknown> => ({
-      tag,
-      protocol: 'freedom',
-      settings: {
-        domainStrategy: 'AsIs',
-        fragment: { packets: preset.packets, length: preset.length, interval: preset.interval },
-      },
-    });
-    outbounds.push(fragOut('gzx-frag', op.frag));
-    outbounds.push({
-      tag: 'gz-frag' + suffix,
-      protocol: 'vless',
-      settings: {
-        vnext: [{
-          address: host,
-          port,
-          users: [{ id: user.uuid, encryption: 'none', level: 0 }],
-        }],
-      },
-      streamSettings: stream,
-      dialerProxy: 'gzx-frag',
-    });
-    appTags.push('gz-frag' + suffix);
+  // When an origin engine is configured, emit a second adaptive family using
+  // current Xray transport primitives. The Worker itself still terminates only
+  // its native HTTP/WebSocket profiles; these outbounds are client->origin.
+  const originHost = env?.ORIGIN_ENGINE_HOST?.trim() || '';
+  const originPort = Number(env?.ORIGIN_ENGINE_PORT || 443);
+  if (originHost) {
+    const originSni = (env?.ORIGIN_ENGINE_SNI || originHost).trim();
+    const originPath = (env?.ORIGIN_ENGINE_PATH || '/' + user.uuid).trim() || '/';
+    const grpcService = (env?.ORIGIN_ENGINE_GRPC_SERVICE || 'g').trim() || 'g';
+    const allowed = new Set((env?.ORIGIN_ENGINE_TRANSPORTS || 'xhttp,grpc,httpupgrade,ws').split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
+    const originTags: string[] = [];
+    const addOrigin = (tag: string, protocol: string, transport: string, streamSettings: Record<string, unknown>, settings: Record<string, unknown>): void => {
+      outbounds.push({ tag, protocol, settings, streamSettings });
+      originTags.push(tag);
+    };
+    const tlsSettings = {
+      serverName: originSni,
+      allowInsecure: false,
+      fingerprint: 'chrome',
+    };
+    if (allowed.has('xhttp')) {
+      const stream = { network: 'xhttp', security: 'tls', tlsSettings, xhttpSettings: { path: originPath } };
+      addOrigin('origin-vless-xhttp', 'vless', 'xhttp', stream, { vnext: [{ address: originHost, port: Number.isFinite(originPort) ? originPort : 443, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] });
+      addOrigin('origin-trojan-xhttp', 'trojan', 'xhttp', stream, { servers: [{ address: originHost, port: Number.isFinite(originPort) ? originPort : 443, password: user.trojanPass, level: 0 }] });
+    }
+    if (allowed.has('grpc')) {
+      const stream = { network: 'grpc', security: 'tls', tlsSettings, grpcSettings: { serviceName: grpcService, multiMode: true } };
+      addOrigin('origin-vless-grpc', 'vless', 'grpc', stream, { vnext: [{ address: originHost, port: Number.isFinite(originPort) ? originPort : 443, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] });
+    }
+    if (allowed.has('httpupgrade')) {
+      const stream = { network: 'httpupgrade', security: 'tls', tlsSettings, httpupgradeSettings: { path: originPath, host: originSni } };
+      addOrigin('origin-vless-httpupgrade', 'vless', 'httpupgrade', stream, { vnext: [{ address: originHost, port: Number.isFinite(originPort) ? originPort : 443, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] });
+    }
+    if (allowed.has('ws')) {
+      const stream = { network: 'ws', security: 'tls', tlsSettings, wsSettings: { path: originPath, headers: { Host: originSni } } };
+      addOrigin('origin-vmess-ws', 'vmess', 'ws', stream, { vnext: [{ address: originHost, port: Number.isFinite(originPort) ? originPort : 443, users: [{ id: user.uuid, alterId: 0, security: 'auto' }] }] });
+      addOrigin('origin-trojan-ws', 'trojan', 'ws', stream, { servers: [{ address: originHost, port: Number.isFinite(originPort) ? originPort : 443, password: user.trojanPass, level: 0 }] });
+    }
+    appTags.push(...originTags);
   }
 
   const cfg = {
     log: { loglevel: 'warning' },
     dns: { servers: ['localhost', '1.1.1.1'], queryStrategy: 'UseIPv4' },
     inbounds: [
-      {
-        tag: 'socks-in',
-        listen: '127.0.0.1',
-        port: 10808,
-        protocol: 'socks',
-        settings: { udp: true, auth: 'noauth' },
-        sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'] },
-      },
-      {
-        tag: 'http-in',
-        listen: '127.0.0.1',
-        port: 10809,
-        protocol: 'http',
-        settings: {},
-        sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'] },
-      },
+      { tag: 'socks-in', listen: '127.0.0.1', port: 10808, protocol: 'socks', settings: { udp: true, auth: 'noauth' }, sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'] } },
+      { tag: 'http-in', listen: '127.0.0.1', port: 10809, protocol: 'http', settings: {}, sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'] } },
     ],
     outbounds,
     observatory: {
       subjectSelector: ['gz-'],
       probeUrl: 'https://connectivitycheck.gstatic.com/generate_204',
-      probeInterval: '3m',
+      probeInterval: '90s',
       enableConcurrency: true,
     },
     routing: {
@@ -311,7 +510,6 @@ export function buildXrayJson(
         { tag: 'auto-best', selector: appTags, strategy: { type: 'leastPing' } },
       ],
       rules: [
-        // catch-all -> auto-best balancer (leastPing picks the winner live)
         { type: 'field', network: 'tcp,udp', balancerTag: 'auto-best' },
       ],
     },
@@ -342,7 +540,7 @@ export function isBrowserUa(ua: string): boolean {
   return /mozilla|chrome|safari|firefox|edg\/|edie|opera|samsungbrowser|applewebkit/.test(s);
 }
 
-export type SubApp = 'clash' | 'singbox' | 'v2ray' | 'xray' | 'page';
+export type SubApp = 'clash' | 'singbox' | 'v2ray' | 'xray' | 'profiles' | 'adaptive' | 'capabilities' | 'page';
 
 /** Resolve the requested app: explicit override > confident UA > browser page > base64. */
 export function resolveApp(appOverride: string, ua: string): SubApp {
@@ -351,6 +549,9 @@ export function resolveApp(appOverride: string, ua: string): SubApp {
   if (ov === 'clash') return 'clash';
   if (ov === 'singbox') return 'singbox';
   if (ov === 'xray') return 'xray';
+  if (ov === 'profiles') return 'profiles';
+  if (ov === 'adaptive' || ov === 'autoadaptive' || ov === 'live') return 'adaptive';
+  if (ov === 'capabilities') return 'capabilities';
   if (ov === 'v2ray' || ov === 'base64') return 'v2ray';
   const uaApp = sniffApp(ua);
   if (uaApp === 'clash' || uaApp === 'singbox') return uaApp;
@@ -370,7 +571,7 @@ export function subHeaders(
 ): Headers {
   const h = new Headers();
   if (app === 'clash') h.set('content-type', 'text/yaml; charset=utf-8');
-  else if (app === 'singbox' || app === 'xray') h.set('content-type', 'application/json; charset=utf-8');
+  else if (app === 'singbox' || app === 'xray' || app === 'profiles' || app === 'adaptive' || app === 'capabilities') h.set('content-type', 'application/json; charset=utf-8');
   else h.set('content-type', 'text/plain; charset=utf-8');
   h.set('access-control-allow-origin', '*');
   h.set('cache-control', 'no-store');
@@ -396,10 +597,12 @@ export function subHeaders(
   return h;
 }
 
-export function renderSub(app: string, host: string, user: GzUser, opts: SubOpts | null | undefined): { body: string; app: string } {
+export function renderSub(app: string, host: string, user: GzUser, opts: SubOpts | null | undefined, env?: Env): { body: string; app: string } {
   if (app === 'clash') return { body: buildClashYaml(host, user, opts), app };
   if (app === 'singbox') return { body: buildSingBoxJson(host, user, opts), app };
-  if (app === 'xray') return { body: buildXrayJson(host, user, opts), app };
+  if (app === 'xray') return { body: buildXrayJson(host, user, opts, env), app };
+  if (app === 'profiles') return { body: buildAdaptiveClientBundle(host, user, opts, env), app };
+  if (app === 'capabilities') return { body: JSON.stringify(buildProtocolMatrix(env, host), null, 2), app };
   const links = buildLinks(host, user, opts);
   return { body: buildBase64([links]), app: 'v2ray' };
 }

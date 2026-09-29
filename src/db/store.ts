@@ -10,6 +10,7 @@
  */
 
 import { DEFAULTS, SCHEMA_VERSION, ResetCycle } from '../config';
+import type { AdaptiveGuardState } from '../ai/adaptive-guard';
 
 export interface SettingsBlob {
   schemaVersion: number;
@@ -60,10 +61,107 @@ const DDL = [
      count INTEGER NOT NULL,
      window_start INTEGER NOT NULL
    )`,
+  `CREATE TABLE IF NOT EXISTS path_health (
+     path_id TEXT PRIMARY KEY,
+     latency_ms INTEGER,
+     ok INTEGER NOT NULL DEFAULT 0,
+     failures INTEGER NOT NULL DEFAULT 0,
+     successes INTEGER NOT NULL DEFAULT 0,
+     quarantine_until INTEGER NOT NULL DEFAULT 0,
+     checked_at INTEGER NOT NULL DEFAULT 0,
+     last_error TEXT NOT NULL DEFAULT '',
+     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+     consecutive_successes INTEGER NOT NULL DEFAULT 0
+   )`,
   `CREATE TABLE IF NOT EXISTS ai_throttle (
      ip_hash TEXT PRIMARY KEY,
      count INTEGER NOT NULL,
      window_start INTEGER NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS profile_health (
+     profile_id TEXT PRIMARY KEY,
+     latency_ms INTEGER,
+     ok INTEGER NOT NULL DEFAULT 0,
+     failures INTEGER NOT NULL DEFAULT 0,
+     successes INTEGER NOT NULL DEFAULT 0,
+     quarantine_until INTEGER NOT NULL DEFAULT 0,
+     checked_at INTEGER NOT NULL DEFAULT 0,
+     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+     consecutive_successes INTEGER NOT NULL DEFAULT 0
+   )`,
+  `CREATE TABLE IF NOT EXISTS health_samples (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     kind TEXT NOT NULL,
+     subject_id TEXT NOT NULL,
+     ts INTEGER NOT NULL,
+     ok INTEGER NOT NULL DEFAULT 0,
+     latency_ms INTEGER
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_health_samples_subject ON health_samples(kind, subject_id, ts DESC)`,
+  `CREATE TABLE IF NOT EXISTS predictive_state (
+     kind TEXT NOT NULL,
+     subject_id TEXT NOT NULL,
+     state_json TEXT NOT NULL,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY(kind, subject_id)
+   )`,
+  `CREATE TABLE IF NOT EXISTS adaptive_model (
+     scope TEXT PRIMARY KEY,
+     state_json TEXT NOT NULL,
+     updated_at INTEGER NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS user_adaptive_state (
+     user_id INTEGER PRIMARY KEY,
+     preferred_path_id TEXT NOT NULL DEFAULT '',
+     preferred_profile_id TEXT NOT NULL DEFAULT '',
+     successes INTEGER NOT NULL DEFAULT 0,
+     failures INTEGER NOT NULL DEFAULT 0,
+     last_ok INTEGER NOT NULL DEFAULT 0,
+     updated_at INTEGER NOT NULL DEFAULT 0
+   )`,
+  `CREATE TABLE IF NOT EXISTS ai_model_health (
+     model_id TEXT PRIMARY KEY,
+     failures INTEGER NOT NULL DEFAULT 0,
+     successes INTEGER NOT NULL DEFAULT 0,
+     quarantine_until INTEGER NOT NULL DEFAULT 0,
+     updated_at INTEGER NOT NULL DEFAULT 0
+   )`,
+  `CREATE TABLE IF NOT EXISTS network_state (
+     id INTEGER PRIMARY KEY CHECK (id = 1),
+     state TEXT NOT NULL,
+     quorum REAL NOT NULL DEFAULT 0,
+     failure_rate REAL NOT NULL DEFAULT 0,
+     selected_path TEXT NOT NULL DEFAULT '',
+     reason_codes TEXT NOT NULL DEFAULT '[]',
+     confidence REAL NOT NULL DEFAULT 0,
+     anomaly_score REAL NOT NULL DEFAULT 0,
+     signal_class TEXT NOT NULL DEFAULT 'normal',
+     updated_at INTEGER NOT NULL DEFAULT 0
+   )`,
+  `CREATE TABLE IF NOT EXISTS protocol_policy_state (
+     id INTEGER PRIMARY KEY CHECK (id = 1),
+     selected_profile TEXT NOT NULL DEFAULT '',
+     fallback_ladder TEXT NOT NULL DEFAULT '[]',
+     reason_codes TEXT NOT NULL DEFAULT '[]',
+     diversity TEXT NOT NULL DEFAULT '{}',
+     confidence REAL NOT NULL DEFAULT 0,
+     mode TEXT NOT NULL DEFAULT 'normal',
+     policy_fingerprint TEXT NOT NULL DEFAULT '',
+     consensus REAL NOT NULL DEFAULT 0.5,
+     signal_agreement REAL NOT NULL DEFAULT 0.5,
+     switch_risk REAL NOT NULL DEFAULT 0.5,
+     fusion_mode TEXT NOT NULL DEFAULT 'insufficient_evidence',
+     updated_at INTEGER NOT NULL DEFAULT 0
+   )`,
+  `CREATE TABLE IF NOT EXISTS adaptive_guard_state (
+     id INTEGER PRIMARY KEY CHECK (id = 1),
+     state_json TEXT NOT NULL DEFAULT '{}',
+     updated_at INTEGER NOT NULL DEFAULT 0
+   )`,
+  `CREATE TABLE IF NOT EXISTS policy_signal_state (
+     id INTEGER PRIMARY KEY CHECK (id = 1),
+     state_json TEXT NOT NULL DEFAULT '{}',
+     updated_at INTEGER NOT NULL DEFAULT 0
    )`,
   `CREATE TABLE IF NOT EXISTS telegram_fsm (
      chat_id TEXT PRIMARY KEY,
@@ -78,9 +176,24 @@ const DDL = [
 
 /** v1.2 additions for databases created with v1.x (guarded ALTERs). */
 const MIGRATIONS = [
+  "ALTER TABLE path_health ADD COLUMN last_error TEXT NOT NULL DEFAULT ''",
+  'ALTER TABLE path_health ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE path_health ADD COLUMN consecutive_successes INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE users ADD COLUMN first_used_at INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE users ADD COLUMN expiry_days INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE users ADD COLUMN reset_anchor INTEGER NOT NULL DEFAULT 0',
+  "ALTER TABLE network_state ADD COLUMN anomaly_score REAL NOT NULL DEFAULT 0",
+  "ALTER TABLE network_state ADD COLUMN signal_class TEXT NOT NULL DEFAULT 'normal'",
+  "ALTER TABLE path_health ADD COLUMN drift TEXT NOT NULL DEFAULT 'stable'",
+  "ALTER TABLE path_health ADD COLUMN forecast_success REAL NOT NULL DEFAULT 0.5",
+  "ALTER TABLE path_health ADD COLUMN volatility REAL NOT NULL DEFAULT 1",
+  "ALTER TABLE profile_health ADD COLUMN drift TEXT NOT NULL DEFAULT 'stable'",
+  "ALTER TABLE profile_health ADD COLUMN forecast_success REAL NOT NULL DEFAULT 0.5",
+  "ALTER TABLE profile_health ADD COLUMN volatility REAL NOT NULL DEFAULT 1",
+  "ALTER TABLE protocol_policy_state ADD COLUMN consensus REAL NOT NULL DEFAULT 0.5",
+  "ALTER TABLE protocol_policy_state ADD COLUMN signal_agreement REAL NOT NULL DEFAULT 0.5",
+  "ALTER TABLE protocol_policy_state ADD COLUMN switch_risk REAL NOT NULL DEFAULT 0.5",
+  "ALTER TABLE protocol_policy_state ADD COLUMN fusion_mode TEXT NOT NULL DEFAULT 'insufficient_evidence'",
 ];
 
 let schemaPromise: Promise<void> | null = null;
@@ -235,4 +348,331 @@ export async function consumeAiDiagnosticQuota(db: D1Database, ipHash: string, n
 export async function clearLoginThrottle(db: D1Database, ipHash: string): Promise<void> {
   await ensureSchema(db);
   await db.prepare('DELETE FROM auth_throttle WHERE ip_hash = ?1').bind(ipHash).run();
+}
+
+
+export interface PathHealthRow {
+  pathId: string; latencyMs: number | null; ok: boolean; failures: number; successes: number; quarantineUntil: number; checkedAt: number;
+  lastError?: string; consecutiveFailures?: number; consecutiveSuccesses?: number; drift?: string; forecastSuccess?: number; volatility?: number;
+}
+
+export async function loadPathHealth(db: D1Database): Promise<PathHealthRow[]> {
+  await ensureSchema(db);
+  const res = await db.prepare('SELECT path_id, latency_ms, ok, failures, successes, quarantine_until, checked_at, last_error, consecutive_failures, consecutive_successes, drift, forecast_success, volatility FROM path_health ORDER BY checked_at DESC LIMIT 64').all<{path_id:string;latency_ms:number|null;ok:number;failures:number;successes:number;quarantine_until:number;checked_at:number;last_error:string;consecutive_failures:number;consecutive_successes:number;drift:string;forecast_success:number;volatility:number}>();
+  return (res.results ?? []).map(r => ({ pathId:r.path_id, latencyMs:r.latency_ms, ok:r.ok === 1, failures:r.failures, successes:r.successes, quarantineUntil:r.quarantine_until, checkedAt:r.checked_at, lastError:r.last_error, consecutiveFailures:r.consecutive_failures, consecutiveSuccesses:r.consecutive_successes, drift:r.drift, forecastSuccess:r.forecast_success, volatility:r.volatility }));
+}
+
+export async function savePathHealth(db: D1Database, row: PathHealthRow): Promise<void> {
+  await ensureSchema(db);
+  await db.prepare('INSERT INTO path_health(path_id,latency_ms,ok,failures,successes,quarantine_until,checked_at,last_error,consecutive_failures,consecutive_successes,drift,forecast_success,volatility) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(path_id) DO UPDATE SET latency_ms=?2, ok=?3, failures=?4, successes=?5, quarantine_until=?6, checked_at=?7, last_error=?8, consecutive_failures=?9, consecutive_successes=?10, drift=?11, forecast_success=?12, volatility=?13').bind(row.pathId,row.latencyMs,row.ok?1:0,row.failures,row.successes,row.quarantineUntil,row.checkedAt,row.lastError ?? '',row.consecutiveFailures ?? 0,row.consecutiveSuccesses ?? 0,row.drift ?? 'stable',row.forecastSuccess ?? 0.5,row.volatility ?? 1).run();
+}
+
+
+export interface ProfileHealthRow {
+  profileId: string;
+  latencyMs: number | null;
+  ok: boolean;
+  failures: number;
+  successes: number;
+  quarantineUntil: number;
+  checkedAt: number;
+  consecutiveFailures: number;
+  consecutiveSuccesses: number;
+  drift?: string;
+  forecastSuccess?: number;
+  volatility?: number;
+}
+
+export async function loadProfileHealth(db: D1Database): Promise<ProfileHealthRow[]> {
+  await ensureSchema(db);
+  const res = await db.prepare(
+    'SELECT profile_id, latency_ms, ok, failures, successes, quarantine_until, checked_at, consecutive_failures, consecutive_successes, drift, forecast_success, volatility FROM profile_health ORDER BY checked_at DESC LIMIT 16',
+  ).all<{
+    profile_id: string; latency_ms: number | null; ok: number; failures: number; successes: number;
+    quarantine_until: number; checked_at: number; consecutive_failures: number; consecutive_successes: number; drift: string; forecast_success: number; volatility: number;
+  }>();
+  return (res.results ?? []).map((r) => ({
+    profileId: r.profile_id,
+    latencyMs: r.latency_ms,
+    ok: r.ok === 1,
+    failures: r.failures,
+    successes: r.successes,
+    quarantineUntil: r.quarantine_until,
+    checkedAt: r.checked_at,
+    consecutiveFailures: r.consecutive_failures,
+    consecutiveSuccesses: r.consecutive_successes,
+    drift: r.drift, forecastSuccess: r.forecast_success, volatility: r.volatility,
+  }));
+}
+
+export async function saveProfileHealth(db: D1Database, row: ProfileHealthRow): Promise<void> {
+  await ensureSchema(db);
+  await db.prepare(
+    'INSERT INTO profile_health(profile_id,latency_ms,ok,failures,successes,quarantine_until,checked_at,consecutive_failures,consecutive_successes,drift,forecast_success,volatility) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ' +
+    'ON CONFLICT(profile_id) DO UPDATE SET latency_ms=?2, ok=?3, failures=?4, successes=?5, quarantine_until=?6, checked_at=?7, consecutive_failures=?8, consecutive_successes=?9, drift=?10, forecast_success=?11, volatility=?12',
+  ).bind(
+    row.profileId, row.latencyMs, row.ok ? 1 : 0, row.failures, row.successes, row.quarantineUntil, row.checkedAt,
+    row.consecutiveFailures, row.consecutiveSuccesses, row.drift ?? 'stable', row.forecastSuccess ?? 0.5, row.volatility ?? 1,
+  ).run();
+}
+
+
+
+export interface HealthSampleRow { kind: 'path' | 'profile'; subjectId: string; ts: number; ok: boolean; latencyMs: number | null; }
+
+export async function saveHealthSample(db: D1Database, row: HealthSampleRow): Promise<void> {
+  await ensureSchema(db);
+  await db.prepare('INSERT INTO health_samples(kind,subject_id,ts,ok,latency_ms) VALUES(?1,?2,?3,?4,?5)').bind(row.kind,row.subjectId,row.ts,row.ok?1:0,row.latencyMs).run();
+  await db.prepare('DELETE FROM health_samples WHERE kind = ?1 AND subject_id = ?2 AND id NOT IN (SELECT id FROM health_samples WHERE kind = ?1 AND subject_id = ?2 ORDER BY ts DESC LIMIT 24)').bind(row.kind,row.subjectId).run();
+}
+
+export async function loadHealthSamples(db: D1Database, kind: 'path' | 'profile', subjectId: string, limit = 24): Promise<Array<{ ts:number; ok:boolean; latencyMs:number|null }>> {
+  await ensureSchema(db);
+  const n = Math.max(1, Math.min(48, limit));
+  const res = await db.prepare('SELECT ts, ok, latency_ms FROM health_samples WHERE kind = ?1 AND subject_id = ?2 ORDER BY ts DESC LIMIT ' + String(n)).bind(kind,subjectId).all<{ts:number;ok:number;latency_ms:number|null}>();
+  return (res.results ?? []).reverse().map(r => ({ ts:r.ts, ok:r.ok === 1, latencyMs:r.latency_ms }));
+}
+
+export interface PredictiveStateRow { kind:'path'|'profile'; subjectId:string; stateJson:string; updatedAt:number; }
+export async function savePredictiveState(db:D1Database,row:PredictiveStateRow):Promise<void>{
+  await ensureSchema(db);
+  await db.prepare('INSERT INTO predictive_state(kind,subject_id,state_json,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(kind,subject_id) DO UPDATE SET state_json=?3, updated_at=?4').bind(row.kind,row.subjectId,row.stateJson,row.updatedAt).run();
+}
+export async function loadPredictiveStates(db:D1Database, kind:'path'|'profile'):Promise<Array<{subjectId:string;stateJson:string;updatedAt:number}>>{
+  await ensureSchema(db);
+  const res=await db.prepare('SELECT subject_id,state_json,updated_at FROM predictive_state WHERE kind=?1 ORDER BY updated_at DESC LIMIT 64').bind(kind).all<{subject_id:string;state_json:string;updated_at:number}>();
+  return (res.results ?? []).map(r=>({subjectId:r.subject_id,stateJson:r.state_json,updatedAt:r.updated_at}));
+}
+
+export interface NetworkStateRow {
+  state: string;
+  quorum: number;
+  failureRate: number;
+  selectedPath: string;
+  reasonCodes: string[];
+  confidence: number;
+  anomalyScore: number;
+  signalClass: string;
+  updatedAt: number;
+}
+
+export async function loadNetworkState(db: D1Database): Promise<NetworkStateRow | null> {
+  await ensureSchema(db);
+  const row = await db.prepare('SELECT state, quorum, failure_rate, selected_path, reason_codes, confidence, anomaly_score, signal_class, updated_at FROM network_state WHERE id = 1').first<{
+    state:string; quorum:number; failure_rate:number; selected_path:string; reason_codes:string; confidence:number; anomaly_score:number; signal_class:string; updated_at:number;
+  }>();
+  if (!row) return null;
+  let reasonCodes: string[] = [];
+  try {
+    const parsed = JSON.parse(row.reason_codes);
+    if (Array.isArray(parsed)) reasonCodes = parsed.filter((x): x is string => typeof x === 'string').slice(0, 12);
+  } catch { /* safe default */ }
+  return { state: row.state, quorum: row.quorum, failureRate: row.failure_rate, selectedPath: row.selected_path, reasonCodes, confidence: row.confidence, anomalyScore: row.anomaly_score ?? 0, signalClass: row.signal_class || 'normal', updatedAt: row.updated_at };
+}
+
+export interface ProtocolPolicyStateRow {
+  selectedProfile: string;
+  fallbackLadder: string[];
+  reasonCodes: string[];
+  diversity: { protocols: string[]; transports: string[]; securities: string[] };
+  confidence: number;
+  mode: string;
+  policyFingerprint: string;
+  consensus: number;
+  signalAgreement: number;
+  switchRisk: number;
+  fusionMode: string;
+  updatedAt: number;
+}
+
+export async function loadProtocolPolicyState(db: D1Database): Promise<ProtocolPolicyStateRow | null> {
+  await ensureSchema(db);
+  const row = await db.prepare(
+    'SELECT selected_profile, fallback_ladder, reason_codes, diversity, confidence, mode, policy_fingerprint, consensus, signal_agreement, switch_risk, fusion_mode, updated_at FROM protocol_policy_state WHERE id = 1',
+  ).first<{ selected_profile:string; fallback_ladder:string; reason_codes:string; diversity:string; confidence:number; mode:string; policy_fingerprint:string; consensus:number; signal_agreement:number; switch_risk:number; fusion_mode:string; updated_at:number }>();
+  if (!row) return null;
+  const parse = (value: string, fallback: unknown): any => { try { return JSON.parse(value); } catch { return fallback; } };
+  const ladder = parse(row.fallback_ladder, []);
+  const reasons = parse(row.reason_codes, []);
+  const diversity = parse(row.diversity, { protocols: [], transports: [], securities: [] });
+  return {
+    selectedProfile: row.selected_profile,
+    fallbackLadder: Array.isArray(ladder) ? ladder.filter((x): x is string => typeof x === 'string').slice(0, 12) : [],
+    reasonCodes: Array.isArray(reasons) ? reasons.filter((x): x is string => typeof x === 'string').slice(0, 16) : [],
+    diversity: {
+      protocols: Array.isArray(diversity?.protocols) ? diversity.protocols.filter((x: unknown): x is string => typeof x === 'string').slice(0, 16) : [],
+      transports: Array.isArray(diversity?.transports) ? diversity.transports.filter((x: unknown): x is string => typeof x === 'string').slice(0, 16) : [],
+      securities: Array.isArray(diversity?.securities) ? diversity.securities.filter((x: unknown): x is string => typeof x === 'string').slice(0, 16) : [],
+    },
+    confidence: row.confidence,
+    mode: row.mode,
+    policyFingerprint: row.policy_fingerprint,
+    consensus: Number.isFinite(row.consensus) ? row.consensus : 0.5,
+    signalAgreement: Number.isFinite(row.signal_agreement) ? row.signal_agreement : 0.5,
+    switchRisk: Number.isFinite(row.switch_risk) ? row.switch_risk : 0.5,
+    fusionMode: row.fusion_mode || 'insufficient_evidence',
+    updatedAt: row.updated_at,
+  };
+}
+
+export async function saveProtocolPolicyState(db: D1Database, row: ProtocolPolicyStateRow): Promise<void> {
+  await ensureSchema(db);
+  await db.prepare(
+    'INSERT INTO protocol_policy_state(id,selected_profile,fallback_ladder,reason_codes,diversity,confidence,mode,policy_fingerprint,consensus,signal_agreement,switch_risk,fusion_mode,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ' +
+    'ON CONFLICT(id) DO UPDATE SET selected_profile=?1, fallback_ladder=?2, reason_codes=?3, diversity=?4, confidence=?5, mode=?6, policy_fingerprint=?7, consensus=?8, signal_agreement=?9, switch_risk=?10, fusion_mode=?11, updated_at=?12',
+  ).bind(
+    row.selectedProfile,
+    JSON.stringify(row.fallbackLadder),
+    JSON.stringify(row.reasonCodes),
+    JSON.stringify(row.diversity),
+    row.confidence,
+    row.mode,
+    row.policyFingerprint,
+    row.consensus,
+    row.signalAgreement,
+    row.switchRisk,
+    row.fusionMode,
+    row.updatedAt,
+  ).run();
+}
+
+
+export async function saveNetworkState(db: D1Database, row: NetworkStateRow): Promise<void> {
+  await ensureSchema(db);
+  await db.prepare(
+    'INSERT INTO network_state(id,state,quorum,failure_rate,selected_path,reason_codes,confidence,anomaly_score,signal_class,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9) ' +
+    'ON CONFLICT(id) DO UPDATE SET state=?1, quorum=?2, failure_rate=?3, selected_path=?4, reason_codes=?5, confidence=?6, anomaly_score=?7, signal_class=?8, updated_at=?9',
+  ).bind(row.state, row.quorum, row.failureRate, row.selectedPath, JSON.stringify(row.reasonCodes.slice(0, 12)), row.confidence, row.anomalyScore, row.signalClass, row.updatedAt).run();
+}
+
+export interface AdaptiveModelRow {
+  scope: string;
+  stateJson: string;
+  updatedAt: number;
+}
+
+export async function loadAdaptiveModel(db: D1Database, scope = 'global'): Promise<AdaptiveModelRow | null> {
+  await ensureSchema(db);
+  const row = await db.prepare('SELECT scope, state_json, updated_at FROM adaptive_model WHERE scope = ?1').bind(scope).first<{scope:string;state_json:string;updated_at:number}>();
+  return row ? { scope: row.scope, stateJson: row.state_json, updatedAt: row.updated_at } : null;
+}
+
+export async function saveAdaptiveModel(db: D1Database, row: AdaptiveModelRow): Promise<void> {
+  await ensureSchema(db);
+  await db.prepare(
+    'INSERT INTO adaptive_model(scope,state_json,updated_at) VALUES(?1,?2,?3) ON CONFLICT(scope) DO UPDATE SET state_json=?2, updated_at=?3',
+  ).bind(row.scope, row.stateJson, row.updatedAt).run();
+}
+
+export interface UserAdaptiveRow {
+  userId: number;
+  preferredPathId: string;
+  preferredProfileId: string;
+  successes: number;
+  failures: number;
+  lastOk: boolean;
+  updatedAt: number;
+}
+
+export async function loadUserAdaptiveState(db: D1Database, userId: number): Promise<UserAdaptiveRow | null> {
+  await ensureSchema(db);
+  const row = await db.prepare(
+    'SELECT user_id, preferred_path_id, preferred_profile_id, successes, failures, last_ok, updated_at FROM user_adaptive_state WHERE user_id = ?1',
+  ).bind(userId).first<{user_id:number;preferred_path_id:string;preferred_profile_id:string;successes:number;failures:number;last_ok:number;updated_at:number}>();
+  return row ? {
+    userId: row.user_id, preferredPathId: row.preferred_path_id, preferredProfileId: row.preferred_profile_id,
+    successes: row.successes, failures: row.failures, lastOk: row.last_ok === 1, updatedAt: row.updated_at,
+  } : null;
+}
+
+export async function saveUserAdaptiveState(db: D1Database, row: UserAdaptiveRow): Promise<void> {
+  await ensureSchema(db);
+  await db.prepare(
+    'INSERT INTO user_adaptive_state(user_id,preferred_path_id,preferred_profile_id,successes,failures,last_ok,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ' +
+    'ON CONFLICT(user_id) DO UPDATE SET preferred_path_id=?2, preferred_profile_id=?3, successes=?4, failures=?5, last_ok=?6, updated_at=?7',
+  ).bind(row.userId,row.preferredPathId,row.preferredProfileId,row.successes,row.failures,row.lastOk?1:0,row.updatedAt).run();
+}
+
+
+export async function loadAdaptiveGuardState(db: D1Database): Promise<AdaptiveGuardState | null> {
+  await ensureSchema(db);
+  const row = await db.prepare('SELECT state_json FROM adaptive_guard_state WHERE id = 1').first<{ state_json: string }>();
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.state_json) as any;
+    const normalizePlan = (plan: any) => plan ? {
+      ...plan,
+      version: '2.8-consensus-mesh-v1',
+      consensus: Number.isFinite(Number(plan.consensus)) ? Number(plan.consensus) : 0.5,
+      signalAgreement: Number.isFinite(Number(plan.signalAgreement)) ? Number(plan.signalAgreement) : 0.5,
+      switchRisk: Number.isFinite(Number(plan.switchRisk)) ? Number(plan.switchRisk) : 0.5,
+      fusionMode: plan.fusionMode === 'stable' || plan.fusionMode === 'cautious' || plan.fusionMode === 'recovery' ? plan.fusionMode : 'insufficient_evidence',
+      forecastSuccess: Number.isFinite(Number(plan.forecastSuccess)) ? Number(plan.forecastSuccess) : 0.5,
+      drift: plan.drift === 'improving' || plan.drift === 'degrading' ? plan.drift : 'stable',
+      volatility: Number.isFinite(Number(plan.volatility)) ? Number(plan.volatility) : 1,
+    } : null;
+    if (parsed && parsed.version === 2) return { ...parsed, active: normalizePlan(parsed.active), previous: normalizePlan(parsed.previous), staged: normalizePlan(parsed.staged) } as AdaptiveGuardState;
+    if (parsed && parsed.version === 1) {
+      return {
+        version: 2,
+        active: normalizePlan(parsed.active),
+        previous: normalizePlan(parsed.previous),
+        staged: normalizePlan(parsed.staged),
+        status: parsed.status ?? 'stable',
+        holdUntil: Number(parsed.holdUntil) || 0,
+        rollbackCount: Number(parsed.rollbackCount) || 0,
+        updatedAt: Number(parsed.updatedAt) || Date.now(),
+        changeWindowStartedAt: Number(parsed.updatedAt) || Date.now(),
+        changesInWindow: 0,
+        maxChangesPerWindow: 3,
+      };
+    }
+  } catch { /* safe default */ }
+  return null;
+}
+
+export async function saveAdaptiveGuardState(db: D1Database, state: AdaptiveGuardState): Promise<void> {
+  await ensureSchema(db);
+  await db.prepare(
+    'INSERT INTO adaptive_guard_state(id,state_json,updated_at) VALUES(1,?1,?2) ' +
+    'ON CONFLICT(id) DO UPDATE SET state_json=?1, updated_at=?2',
+  ).bind(JSON.stringify(state), state.updatedAt).run();
+}
+
+
+export interface AiModelHealthRow {
+  modelId: string; failures: number; successes: number; quarantineUntil: number; updatedAt: number;
+}
+
+export async function loadAiModelHealth(db: D1Database): Promise<AiModelHealthRow[]> {
+  await ensureSchema(db);
+  const res = await db.prepare('SELECT model_id, failures, successes, quarantine_until, updated_at FROM ai_model_health ORDER BY updated_at DESC LIMIT 64').all<{model_id:string;failures:number;successes:number;quarantine_until:number;updated_at:number}>();
+  return (res.results ?? []).map(r => ({ modelId:r.model_id, failures:r.failures, successes:r.successes, quarantineUntil:r.quarantine_until, updatedAt:r.updated_at }));
+}
+
+export async function saveAiModelHealth(db: D1Database, row: AiModelHealthRow): Promise<void> {
+  await ensureSchema(db);
+  await db.prepare(
+    'INSERT INTO ai_model_health(model_id,failures,successes,quarantine_until,updated_at) VALUES(?1,?2,?3,?4,?5) ' +
+    'ON CONFLICT(model_id) DO UPDATE SET failures=?2, successes=?3, quarantine_until=?4, updated_at=?5',
+  ).bind(row.modelId,row.failures,row.successes,row.quarantineUntil,row.updatedAt).run();
+}
+
+
+export interface PolicySignalStateRow {
+  stateJson: string;
+  updatedAt: number;
+}
+
+export async function loadPolicySignalState(db: D1Database): Promise<PolicySignalStateRow | null> {
+  await ensureSchema(db);
+  const row = await db.prepare('SELECT state_json, updated_at FROM policy_signal_state WHERE id = 1').first<{state_json:string;updated_at:number}>();
+  return row ? { stateJson: row.state_json, updatedAt: row.updated_at } : null;
+}
+
+export async function savePolicySignalState(db: D1Database, row: PolicySignalStateRow): Promise<void> {
+  await ensureSchema(db);
+  await db.prepare(
+    'INSERT INTO policy_signal_state(id,state_json,updated_at) VALUES(1,?1,?2) ON CONFLICT(id) DO UPDATE SET state_json=?1, updated_at=?2',
+  ).bind(row.stateJson, row.updatedAt).run();
 }

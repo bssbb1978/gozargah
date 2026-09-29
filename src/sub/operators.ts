@@ -77,6 +77,40 @@ export const OPERATORS: Operator[] = [
 
 export const DEFAULT_FP = 'chrome';
 
+export type AdaptiveProfileId = 'standard' | 'fragmented' | 'alt-port' | 'fragmented-alt';
+
+export interface AdaptiveProfile {
+  id: AdaptiveProfileId;
+  fp: string;
+  port: number;
+  frag: FragPreset | null;
+  labelFa: string;
+  labelEn: string;
+}
+
+/**
+ * Bounded client-side profile ensemble. Every profile is derived from the
+ * explicit operator preset; the engine never invents arbitrary fingerprints,
+ * ports or fragment sizes. Xray observatory / Clash url-test / Sing-box
+ * selector can evaluate these variants independently.
+ */
+export function adaptiveProfiles(opts: SubOpts | null | undefined): AdaptiveProfile[] {
+  const op = opts?.opKey ? resolveOp(opts.opKey) : null;
+  const fp = fpFor(opts);
+  const ports = op?.ports?.length ? op.ports : TLS_PORTS;
+  const altPort = ports.find((p) => p !== 443) ?? 443;
+  const frag = op?.frag ?? null;
+  const profiles: AdaptiveProfile[] = [
+    { id: 'standard', fp, port: 443, frag: null, labelFa: 'پایه', labelEn: 'Standard' },
+    { id: 'alt-port', fp, port: altPort, frag: null, labelFa: 'پورت جایگزین', labelEn: 'Alt-port' },
+  ];
+  if (frag) {
+    profiles.splice(1, 0, { id: 'fragmented', fp, port: 443, frag, labelFa: 'فرگمنت', labelEn: 'Fragmented' });
+    profiles.push({ id: 'fragmented-alt', fp, port: altPort, frag, labelFa: 'فرگمنت + پورت جایگزین', labelEn: 'Fragmented + alt-port' });
+  }
+  return profiles;
+}
+
 /** Workers HTTPS port wheel (informational alt-port list). */
 export const TLS_PORTS = [443, 2053, 2083, 2087, 8443];
 

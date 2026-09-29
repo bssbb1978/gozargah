@@ -19,3 +19,7 @@ binding = "AI"
 
 [observability]
 enabled = true
+
+# Periodic health loop. It probes only endpoints saved in D1 settings.
+[triggers]
+crons = ["*/5 * * * *"]

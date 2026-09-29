@@ -2,8 +2,8 @@
  * Gozargah — global config, types and shared errors.
  */
 
-export const VERSION = '1.4.1';
-export const SCHEMA_VERSION = 3;
+export const VERSION = '2.8.0';
+export const SCHEMA_VERSION = 14;
 
 /** D1 binding name (see wrangler.toml) */
 export const DB_BINDING = 'GZ_DB';
@@ -26,6 +26,20 @@ export interface Env {
   AI_CATALOG_ACCOUNT_ID?: string;
   /** Optional service binding for controlled egress/tests; normally omitted. */
   TELEGRAM_API?: Fetcher;
+  /** Comma-separated ports for scheduled health probes of configured endpoints. */
+  HEALTH_PROBE_PORTS?: string;
+  /** Optional Xray/sing-box origin engine for protocols not terminated natively by the Worker. */
+  ORIGIN_ENGINE_HOST?: string;
+  /** Optional origin engine port; defaults to 443. */
+  ORIGIN_ENGINE_PORT?: string;
+  /** Optional SNI override for origin-engine TLS/REALITY profiles. */
+  ORIGIN_ENGINE_SNI?: string;
+  /** Optional URI path used by XHTTP/WebSocket/HTTPUpgrade origin profiles. */
+  ORIGIN_ENGINE_PATH?: string;
+  /** Optional gRPC service name used by origin-engine gRPC profiles. */
+  ORIGIN_ENGINE_GRPC_SERVICE?: string;
+  /** Comma-separated origin transports to emit; defaults to xhttp,grpc,httpupgrade,ws. */
+  ORIGIN_ENGINE_TRANSPORTS?: string;
 }
 
 /** Error type carrying a short machine code for the panel API. */

@@ -14,6 +14,13 @@ import { effectiveExpiry, isUserAllowed, resetDue } from '../db/users';
 import { userPageHtml } from '../panel/userpage';
 import { qrSvg } from '../utils/qr';
 import type { GzUser } from '../db/users';
+import { decideAdaptiveProfile, nextProfileObservation } from '../ai/edge-brain';
+import { defaultEdgeLearner, observationFeatures, predictSuccess, updateEdgeLearner } from '../ai/edge-learner';
+import { classifyNetworkState } from '../ai/network-state';
+import { buildAdaptiveProtocolPlan } from '../ai/protocol-controller';
+import { defaultAdaptiveGuard, nextAdaptiveGuardState, reconcileAdaptivePlan } from '../ai/adaptive-guard';
+import { bayesianReliability, riskAdjustedReliability } from '../ai/ensemble';
+import { fusePolicySignals } from '../ai/signal-fusion';
 
 let passed = 0;
 function ok(name: string, fn: () => void | Promise<void>): Promise<void> {
@@ -120,39 +127,40 @@ async function main() {
   });
 
   /* ---------------- xray core ---------------- */
-  await ok('xray: neutral profile = 2 outbounds + observatory + leastPing catch-all', () => {
+  await ok('xray: adaptive ensemble = base + alt-port, observatory + leastPing catch-all', () => {
     const cfg = JSON.parse(buildXrayJson(HOST, USER, {}));
     const tags = (cfg.outbounds as Array<{ tag: string }>).map((o) => o.tag);
-    assert.deepEqual(tags, ['gz-vless', 'gz-trojan']);
+    assert.equal(tags.length, 4);
+    assert.ok(tags.includes('gz-standard-vless'));
+    assert.ok(tags.includes('gz-alt-port-vless'));
     assert.equal(cfg.observatory.subjectSelector[0], 'gz-');
     assert.equal(cfg.routing.balancers[0].strategy.type, 'leastPing');
     assert.equal(cfg.routing.rules[0].balancerTag, 'auto-best');
     assert.equal(cfg.dns.queryStrategy, 'UseIPv4');
     assert.equal(cfg.inbounds.length, 2);
   });
-  await ok('xray: operator branding rides the outbound tags', () => {
+  await ok('xray: operator branding + profile ensemble', () => {
     const cfg = JSON.parse(buildXrayJson(HOST, USER, { opKey: 'tci' }));
     const tags = (cfg.outbounds as Array<{ tag: string }>).map((o) => o.tag);
-    assert.ok(tags[0].startsWith('gz-vless · مخابرات ایران'));
+    assert.ok(tags.some((t: string) => t.includes('gz-standard-vless-tci')));
+    assert.ok(tags.some((t: string) => t.includes('gz-fragmented-vless-tci')));
   });
-  await ok('xray: fragment clone appears only for op presets', () => {
+  await ok('xray: bounded fragment ensemble appears only for op presets', () => {
     const no = JSON.parse(buildXrayJson(HOST, USER, {}));
     assert.ok(!JSON.stringify(no).includes('fragment'));
     const mci = JSON.parse(buildXrayJson(HOST, USER, { opKey: 'mci' }));
     const tags = (mci.outbounds as Array<{ tag: string }>).map((o) => o.tag);
-    assert.equal(tags.length, 4); // gz-vless + gz-trojan + gzx-frag (transport) + gz-frag (clone)
-    assert.ok(tags[3].startsWith('gz-frag'));
-    const frag = (mci.outbounds as Array<Record<string, any>>).find((o) => o.tag === 'gzx-frag')!;
-    assert.equal(frag.protocol, 'freedom');
-    assert.deepEqual(frag.settings.fragment, { packets: 'tlshello', length: '100-200', interval: '10-20' });
-    // the clone dials through the fragment transport
-    const clone = (mci.outbounds as Array<Record<string, any>>).find((o) => o.tag.startsWith('gz-frag'))!;
-    assert.equal(clone.dialerProxy, 'gzx-frag');
-    // balancer must never route through the internal gzx-* transport
+    assert.equal(tags.length, 12);
+    const frags = (mci.outbounds as Array<Record<string, any>>).filter((o) => String(o.tag).includes('-frag-vless'));
+    assert.equal(frags.length, 2);
+    const transports = (mci.outbounds as Array<Record<string, any>>).filter((o) => String(o.tag).startsWith('gzx-'));
+    assert.equal(transports.length, 2);
+    assert.deepEqual(transports[0].settings.fragment, { packets: 'tlshello', length: '100-200', interval: '10-20' });
+    assert.ok(frags.every((o: any) => typeof o.dialerProxy === 'string' && o.dialerProxy.startsWith('gzx-')));
     const sel: string[] = mci.routing.balancers[0].selector;
-    assert.ok(sel.every((s: string) => s.startsWith('gz-') && !s.startsWith('gzx-')));
-    // shatel has no fragment preset (gentle network)
+    assert.ok(sel.every((tag: string) => tag.startsWith('gz-') && !tag.startsWith('gzx-')));
     const sh = JSON.parse(buildXrayJson(HOST, USER, { opKey: 'shatel' }));
+    assert.equal(sh.outbounds.length, 4);
     assert.ok(!JSON.stringify(sh).includes('fragment'));
   });
 
@@ -209,6 +217,98 @@ async function main() {
     assert.equal(resolveApp('', 'v2rayNG/1.8'), 'v2ray');
   });
 
+  /* ---------------- local adaptive policy brain ---------------- */
+  await ok('adaptive policy: learns, quarantines, then recovers', () => {
+    let o = undefined as ReturnType<typeof nextProfileObservation> | undefined;
+    o = nextProfileObservation(o, false, 800, 1_000);
+    o = nextProfileObservation(o, false, 850, 2_000);
+    o = nextProfileObservation(o, false, 900, 3_000);
+    assert.ok(o.quarantineUntil > 3_000);
+    o = nextProfileObservation(o, true, 120, 4_000);
+    o = nextProfileObservation(o, true, 110, 5_000);
+    assert.equal(o.quarantineUntil, 0);
+    const decision = decideAdaptiveProfile([o]);
+    assert.ok(decision.selected);
+    assert.ok(decision.policyVersion.includes('2.0'));
+  });
+
+  /* ---------------- network state classifier ---------------- */
+  await ok('network state: quorum classifier distinguishes recovery without claiming DPI', () => {
+    const now = 100_000;
+    const observations = [
+      { id: 'a', latencyMs: 80, ok: false, checkedAt: now, failures: 5, successes: 0, quarantineUntil: now + 60_000, consecutiveFailures: 5, consecutiveSuccesses: 0, lastError: 'timeout' },
+      { id: 'b', latencyMs: 100, ok: false, checkedAt: now, failures: 4, successes: 1, quarantineUntil: now + 60_000, consecutiveFailures: 4, consecutiveSuccesses: 0, lastError: 'timeout' },
+      { id: 'c', latencyMs: 120, ok: true, checkedAt: now, failures: 1, successes: 4, quarantineUntil: 0, consecutiveFailures: 0, consecutiveSuccesses: 2, lastError: '' },
+    ];
+    const d = classifyNetworkState(observations, now);
+    assert.equal(d.state, 'recovery');
+    assert.ok(d.reasonCodes.length >= 1);
+    assert.equal((d as any).dpiProven, undefined);
+  });
+
+  await ok('network signal fusion: reports an observational degradation class', () => {
+    const now = 100_000;
+    const observations = [
+      { id: 'a', latencyMs: 90, ok: false, checkedAt: now, failures: 6, successes: 0, quarantineUntil: now + 60_000, consecutiveFailures: 6, consecutiveSuccesses: 0, lastError: 'timeout' },
+      { id: 'b', latencyMs: 110, ok: false, checkedAt: now, failures: 5, successes: 0, quarantineUntil: now + 60_000, consecutiveFailures: 5, consecutiveSuccesses: 0, lastError: 'timeout' },
+      { id: 'c', latencyMs: 130, ok: true, checkedAt: now, failures: 0, successes: 6, quarantineUntil: 0, consecutiveFailures: 0, consecutiveSuccesses: 5, lastError: '' },
+    ];
+    const d = classifyNetworkState(observations, now);
+    assert.ok(d.anomalyScore >= 0 && d.anomalyScore <= 1);
+    assert.ok(['selective_degradation', 'broad_degradation', 'normal', 'insufficient_evidence'].includes(d.signalClass));
+  });
+
+  await ok('local ensemble: Bayesian reliability is conservative with uncertainty', () => {
+    const cold = bayesianReliability(0, 0);
+    const warm = bayesianReliability(18, 2);
+    assert.ok(cold.lower < cold.mean && cold.mean < cold.upper);
+    assert.ok(warm.mean > cold.mean && riskAdjustedReliability(18, 2) <= warm.mean);
+  });
+
+  await ok('signal fusion: agreement raises confidence and disagreement raises switch risk', () => {
+    const good = fusePolicySignals({ measuredHealth: 0.90, forecastSuccess: 0.88, learnerProbability: 0.91, networkConfidence: 0.86, freshness: 0.95, failureRate: 0.08, volatility: 0.15, sampleCount: 18, quarantined: false });
+    const noisy = fusePolicySignals({ measuredHealth: 0.88, forecastSuccess: 0.35, learnerProbability: 0.82, networkConfidence: 0.25, freshness: 0.35, failureRate: 0.46, volatility: 1.2, sampleCount: 3, quarantined: false });
+    assert.ok(good.consensus > noisy.consensus);
+    assert.ok(noisy.switchRisk > good.switchRisk);
+    assert.ok(['stable','cautious','recovery','insufficient_evidence'].includes(noisy.mode));
+  });
+
+  await ok('adaptive guard: stages small changes and promotes materially better candidates', () => {
+    const now = 1_000_000;
+    const base = { version: '2.8-consensus-mesh-v1' as const, selected: 'vless:ws:tls', fallbackLadder: ['vless:ws:tls','trojan:ws:tls'], confidence: 0.55, mode: 'normal' as const, reasonCodes: ['base'], diversity: { protocols: ['vless','trojan'], transports: ['ws'], securities: ['tls'] }, learnerConfidence: 0.4, policyFingerprint: 'aaa', generatedAt: now, strategy: 'stable' as const, failureDomains: [], forecastSuccess: 0.55, drift: 'stable' as const, volatility: 0.3, consensus: 0.74, signalAgreement: 0.82, switchRisk: 0.28, fusionMode: 'stable' as const };
+    const small = { ...base, selected: 'vmess:ws:tls', confidence: 0.58, policyFingerprint: 'bbb', generatedAt: now + 1 };
+    const health = [{ profileId: 'vless:ws:tls', latencyMs: 100, failures: 1, successes: 4, quarantineUntil: 0, checkedAt: now, consecutiveFailures: 0, consecutiveSuccesses: 2 }];
+    const staged = reconcileAdaptivePlan(small, { ...defaultAdaptiveGuard(now), active: base }, health, now + 1);
+    assert.equal(staged.promoted, false);
+    assert.equal(staged.status, 'staged');
+    const big = { ...base, selected: 'vmess:ws:tls', confidence: 0.72, policyFingerprint: 'ccc', generatedAt: now + 700_000 };
+    const promoted = reconcileAdaptivePlan(big, { ...defaultAdaptiveGuard(now), active: base, holdUntil: now }, health, now + 700_000);
+    assert.equal(promoted.promoted, true);
+    assert.equal(nextAdaptiveGuardState({ ...defaultAdaptiveGuard(now), active: base }, promoted, now + 700_000).active?.policyFingerprint, 'ccc');
+  });
+
+  await ok('adaptive guard: change budget prevents rapid policy flapping', () => {
+    const now = 2_000_000;
+    const base = { version: '2.8-consensus-mesh-v1' as const, selected: 'a', fallbackLadder: ['a'], confidence: 0.55, mode: 'normal' as const, reasonCodes: ['base'], diversity: { protocols: ['vless'], transports: ['ws'], securities: ['tls'] }, learnerConfidence: 0.5, policyFingerprint: 'base', generatedAt: now, strategy: 'stable' as const, failureDomains: [], forecastSuccess: 0.55, drift: 'stable' as const, volatility: 0.3, consensus: 0.74, signalAgreement: 0.82, switchRisk: 0.28, fusionMode: 'stable' as const };
+    let state = { ...defaultAdaptiveGuard(now), active: base, holdUntil: now, changesInWindow: 3, changeWindowStartedAt: now, maxChangesPerWindow: 3 };
+    const candidate = { ...base, selected: 'b', confidence: 0.9, policyFingerprint: 'next', generatedAt: now + 1 };
+    const d = reconcileAdaptivePlan(candidate, state, [{ profileId: 'a', latencyMs: 100, failures: 0, successes: 10, quarantineUntil: 0, checkedAt: now, consecutiveFailures: 0, consecutiveSuccesses: 3 }], now + 1);
+    assert.equal(d.promoted, false);
+    assert.ok(d.reasonCodes.includes('change_budget_exhausted'));
+  });
+
+  /* ---------------- local learner v2 ---------------- */
+  await ok('edge learner: bounded online update moves prediction with outcomes', () => {
+    let state = defaultEdgeLearner(1_000);
+    const good = observationFeatures({ latencyMs: 80, failures: 0, successes: 8, freshness: 1, trend: 'improving', consecutiveSuccesses: 4 });
+    const before = predictSuccess(state, good);
+    for (let i = 0; i < 8; i++) state = updateEdgeLearner(state, good, true, 2_000 + i);
+    const after = predictSuccess(state, good);
+    assert.equal(state.version, 1);
+    assert.ok(state.updates === 8);
+    assert.ok(after > before);
+  });
+
   /* ---------------- render + headers ---------------- */
   await ok('renderSub: all four formats produce sane bodies', () => {
     const b64 = renderSub('v2ray', HOST, USER, {});
@@ -220,7 +320,9 @@ async function main() {
     assert.ok(JSON.parse(sb.body).outbounds.length === 3);
     const xr = renderSub('xray', HOST, USER, { opKey: 'irancell' });
     const cfg = JSON.parse(xr.body);
-    assert.ok(cfg.outbounds.length === 4);
+    assert.ok(cfg.outbounds.length === 12);
+    assert.ok(cfg.outbounds.some((x: any) => String(x.tag).includes('fragmented')));
+    assert.ok(cfg.outbounds.some((x: any) => String(x.tag).includes('alt-port')));
   });
   await ok('subHeaders: real userinfo + status page profile-web-page-url', () => {
     const eff = {
@@ -279,3 +381,4 @@ async function main() {
 }
 
 main();
+

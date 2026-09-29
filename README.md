@@ -1,3 +1,45 @@
+
+# Gozargah 2.8.0 — Consensus Resilience Mesh
+
+## 2.8.0 — Consensus Resilience Mesh
+### 2.8.0 highlights
+- Multi-signal policy gating combines measured health, forecast, local learner, and network confidence before promotion.
+- D1 persists consensus/agreement/switch-risk state; `/{panelPath}/api/network/fusion` exposes it for observability.
+- Adaptive Guard blocks low-consensus/high-switch-risk promotions and falls back to staged/recovery behavior.
+
+- Bayesian reliability + UCB exploration in the local edge ensemble.
+- Failure-domain isolation by protocol/transport family.
+- `stable / diversify / safe` strategy modes driven by observed network state.
+- Emergency safe mode prefers measured, low-failure profiles during broad degradation.
+- 3 changes per 30-minute window with 15-minute promotion hold to prevent policy flapping.
+- Existing D1 telemetry, per-user preference, canary staging and rollback are preserved.
+
+
+- canary/staged policy promotion with a bounded 10-minute hold window
+- automatic promotion when the candidate is materially better or the active profile is unhealthy
+- rollback history in D1 via `adaptive_guard_state`
+- observational network anomaly score and signal class (`normal`, `broad_degradation`, `selective_degradation`, `insufficient_evidence`)
+- new authenticated endpoint: `/{panelPath}/api/network/guard`
+- audit events for adaptive policy promotions/staging/rollback
+- local deterministic learner remains the final policy guard; Workers AI remains optional
+
+2.5 continues the live protocol controller from 2.4 and adds a guard layer that
+stages small policy changes before promotion, rolls back on active-profile failure,
+and keeps a persistent previous/staged plan in D1.
+
+New endpoints:
+- `GET /{panelPath}/api/network/autoplan`
+- `GET /{panelPath}/api/network/policy-state`
+- `GET /{panelPath}/api/network/guard`
+- `GET /{subPath}/{token}/adaptive` (live adaptive manifest v5)
+
+The scheduled health loop refreshes health and policy every five minutes, so the
+D1 state remains warm even without an active subscriber. Raw TCP/UDP inbound is
+still not a Worker-native capability; UDP-native protocols remain origin-engine
+features, as documented by Cloudflare.
+
+This release adds deterministic multi-signal path scoring, circuit-breaker recovery, connection-outcome telemetry, stable per-user ordering, and AI-model cooldown/failover. It does not claim to defeat a complete upstream international outage and does not fingerprint or rewrite protocol bytes.
+
 <div align="center">
 
 <picture>
@@ -51,9 +93,32 @@
 
 ایدهٔ پشت این دوازده کارت ساده است: هر چیزی که می‌تواند یک وابستگی، یک سرور یا یک نقطهٔ شکست باشد، حذف شده؛ و هر چیزی که تجربهٔ کاربر ایرانی را بهتر می‌کند، با دروازهٔ صداقت اضافه شده. پنل به هیچ CDNای برای دارایی‌هایش درخواست نمی‌زند، مصرف را تخمین نمی‌زند و امنیت را به ظاهر رابط کاربری گره نمی‌زند. حتی QR و فونت و آیکون‌ها داخل همان یک فایل زندگی می‌کنند.
 
+## 🧠 موتور داخلی 2.0 — Edge Learner
+
+نسخهٔ 2.0 علاوه بر policy deterministic، یک مدل کوچک online داخل Worker دارد که از latency، reliability، freshness، trend و continuity یاد می‌گیرد. نتیجه در D1 نگه‌داری می‌شود و برای انتخاب مسیر و پروفایل استفاده می‌شود؛ بدون نیاز اجباری به Workers AI.
+
+وقتی همهٔ مسیرها unhealthy باشند، موتور recovery حداکثر دو مسیر را half-open دوباره امتحان می‌کند.
+
+### حافظهٔ per-user
+وضعیت ترجیح مسیر/پروفایل هر کاربر در D1 جداگانه ذخیره می‌شود تا یک کاربر مسیر خراب را روی سایر کاربران تحمیل نکند.
+
+### سلامت مدل‌های Workers AI
+نتیجهٔ واقعی inference برای هر model ID ذخیره می‌شود؛ مدل خراب موقتاً quarantine می‌شود و fallback بعدی انتخاب می‌شود.
+
+### Cloudflare Pages
+ساخت Pages Advanced Mode با `npm run build:pages` و `wrangler.pages.toml` اضافه شده است.
+
 ## 📱 صفحهٔ وضعیت کاربر — یک نگاه برای «وصل شم؟»
 
 هر کاربر یک لینک شخصی دارد؛ وقتی در مرورگر بازش کنید، به‌جای خروجی خام اشتراک، یک صفحهٔ زنده و شیشه‌ای می‌بینید: حلقهٔ مصرف با اعداد واقعی، وضعیت اتصال، انقضا، و هاب ایمپورت با دکمه‌های یک‌کلیکی برای v2rayNG، Hiddify، Clash-Meta و Sing-box. کلاینت‌های پروکسی همچنان همان خروجی خام را می‌گیرند — تشخیص خودکار از روی User-Agent.
+
+## 🧠 موتور تطبیقی 2.0 — Local Policy Brain + Profile Ensemble
+
+نسخهٔ 2.0 علاوه بر سلامت ProxyIP، سلامت **پروفایل اتصال** را نیز با telemetry واقعی ثبت می‌کند. چهار حالت محدود و صریح وجود دارد: `standard`، `fragmented`، `alt-port` و `fragmented-alt`؛ این‌ها از preset انتخاب‌شده ساخته می‌شوند و موتور مقادیر تصادفی یا خارج از محدوده تولید نمی‌کند. Xray با observatory و `leastPing` این مجموعه را به‌صورت دوره‌ای مقایسه می‌کند و پنل، نتیجهٔ آن را در D1 نگه می‌دارد.
+
+لایهٔ `Local Policy Brain` حتی بدون Workers AI کار می‌کند: با latency، نرخ خطا، تازگی داده، روند موفقیت/شکست و quarantine تصمیم می‌گیرد. این موتور جای مدل زبانی را نمی‌گیرد و «AI واقعی» نیست؛ مزیتش این است که با قطع سرویس مدل، لایهٔ تصمیم‌گیری شبکه از کار نمی‌افتد. endpoint مدیریت‌شدهٔ `network/profiles` نیز وضعیت پروفایل‌ها و انتخاب فعلی را نشان می‌دهد.
+
+این معماری **adaptive** است، نه تضمین‌کنندهٔ عبور از هر نوع فیلترینگ. اگر upstream بین‌المللی واقعاً قطع باشد، Worker نمی‌تواند مسیر فیزیکی جدید ایجاد کند؛ فقط می‌تواند از مسیرها و پروفایل‌هایی استفاده کند که از شبکهٔ کاربر واقعاً قابل دسترسی‌اند.
 
 ## 🧠 مشاور عملیات Workers AI (اختیاری و فقط‌خواندنی)
 
@@ -277,3 +342,48 @@ MIT — آزاد برای استفاده، تغییر و توسعه. جزئیا�
 <sub><b>گذرگاه</b> — دروازهٔ امن عبور · ساخته‌شده برای سرعت، سادگی و آزادی</sub>
 
 </div>
+
+## 2.3.0 — Adaptive Health Loop
+
+- Scheduled health loop every 5 minutes for only D1-configured fallback endpoints.
+- D1 `network_state` quorum classifier: healthy / degraded / recovery / no_healthy_path.
+- Authenticated `GET /{panelPath}/api/network/state`.
+- Configurable probe ports via `HEALTH_PROBE_PORTS` (default: 443,2053,2083,2087,8443).
+- No arbitrary network scanning; probes are bounded to endpoints already present in settings.
+- The classifier is observational and does not claim to prove DPI or an international outage.
+
+
+## Protocol capability matrix (2.3.0)
+
+The Worker natively serves the HTTP/WebSocket edge profiles. Full VMess, VLESS, Shadowsocks, HTTP, Trojan, WireGuard, Hysteria2 and extended Xray transports are exposed as adaptive capability profiles when a compatible Xray/sing-box origin engine is configured with `ORIGIN_ENGINE_HOST` (and optionally `ORIGIN_ENGINE_PORT`). UDP-native protocols are never advertised as Worker-native.
+
+
+### 2.3.0 capability endpoints
+- `GET /<panel>/api/network/capabilities` — authenticated protocol/transport matrix.
+- `GET /<sub>/<token>/profiles` — adaptive profile manifest.
+- `GET /<sub>/<token>/capabilities` — public capability metadata for the current subscription token.
+
+Optional env: `ORIGIN_ENGINE_HOST` and `ORIGIN_ENGINE_PORT` enable origin-engine profiles (VMess, extended VLESS/Trojan/SS/HTTP transports, WireGuard and Hysteria2). Without an origin engine, only the Worker-native VLESS/Trojan WebSocket data plane is marked ready.
+
+## Gozargah 2.3.0 — Adaptive Protocol Orchestrator
+
+2.3.0 adds a capability-aware protocol policy layer. It distinguishes Worker-native
+HTTP/WebSocket profiles from origin-engine profiles and emits a bounded, diverse
+preference list instead of pretending every transport is native to Workers.
+
+New optional origin-engine variables:
+- ORIGIN_ENGINE_HOST
+- ORIGIN_ENGINE_PORT
+- ORIGIN_ENGINE_SNI
+- ORIGIN_ENGINE_PATH
+- ORIGIN_ENGINE_GRPC_SERVICE
+- ORIGIN_ENGINE_TRANSPORTS (default: xhttp,grpc,httpupgrade,ws)
+
+New endpoint:
+- GET /<panelPath>/api/network/policy
+
+The /sub/<token>/profiles manifest now includes an adaptive policy with protocol,
+transport, security, ALPN, readiness, and a bounded score. Xray output also emits
+origin-engine profiles when an origin is explicitly configured and routes them
+through observatory/leastPing. UDP-only protocols remain origin-engine capabilities;
+the Worker itself does not claim to terminate inbound raw TCP/UDP.

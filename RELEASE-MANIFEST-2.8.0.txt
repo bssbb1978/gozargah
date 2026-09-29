@@ -1,0 +1,8 @@
+Gozargah 2.8.0 — Consensus Resilience Mesh
+
+Core: adaptive protocol controller + predictive mesh + adaptive guard + multi-signal fusion.
+New: signal-fusion.ts, D1 policy_signal_state, protocol_policy_state fusion metrics, /api/network/fusion.
+Version: 2.8.0
+Schema: 14
+Tests: production TypeScript typecheck PASS; focused fusion/controller smoke tests PASS.
+Caveat: npm integration suite requires local node_modules/esbuild and was not run in this environment.
