@@ -325,7 +325,7 @@ async function main() {
 
   await ok('adaptive guard: stages small changes and promotes materially better candidates', () => {
     const now = 1_000_000;
-    const base = { version: '2.8-consensus-mesh-v1' as const, selected: 'vless:ws:tls', fallbackLadder: ['vless:ws:tls','trojan:ws:tls'], confidence: 0.55, mode: 'normal' as const, reasonCodes: ['base'], diversity: { protocols: ['vless','trojan'], transports: ['ws'], securities: ['tls'] }, learnerConfidence: 0.4, policyFingerprint: 'aaa', generatedAt: now, strategy: 'stable' as const, failureDomains: [], forecastSuccess: 0.55, drift: 'stable' as const, volatility: 0.3, consensus: 0.74, signalAgreement: 0.82, switchRisk: 0.28, fusionMode: 'stable' as const };
+    const base = { version: '2.12-regime-mesh-v1' as const, selected: 'vless:ws:tls', fallbackLadder: ['vless:ws:tls','trojan:ws:tls'], confidence: 0.55, mode: 'normal' as const, reasonCodes: ['base'], diversity: { protocols: ['vless','trojan'], transports: ['ws'], securities: ['tls'] }, learnerConfidence: 0.4, policyFingerprint: 'aaa', generatedAt: now, strategy: 'stable' as const, failureDomains: [], forecastSuccess: 0.55, drift: 'stable' as const, volatility: 0.3, consensus: 0.74, signalAgreement: 0.82, switchRisk: 0.28, fusionMode: 'stable' as const, regimeState: 'stable' as const, regimeConfidence: 0 };
     const small = { ...base, selected: 'vmess:ws:tls', confidence: 0.58, policyFingerprint: 'bbb', generatedAt: now + 1 };
     const health = [{ profileId: 'vless:ws:tls', latencyMs: 100, failures: 1, successes: 4, quarantineUntil: 0, checkedAt: now, consecutiveFailures: 0, consecutiveSuccesses: 2 }];
     const staged = reconcileAdaptivePlan(small, { ...defaultAdaptiveGuard(now), active: base }, health, now + 1);
@@ -339,7 +339,7 @@ async function main() {
 
   await ok('adaptive guard: change budget prevents rapid policy flapping', () => {
     const now = 2_000_000;
-    const base = { version: '2.8-consensus-mesh-v1' as const, selected: 'a', fallbackLadder: ['a'], confidence: 0.55, mode: 'normal' as const, reasonCodes: ['base'], diversity: { protocols: ['vless'], transports: ['ws'], securities: ['tls'] }, learnerConfidence: 0.5, policyFingerprint: 'base', generatedAt: now, strategy: 'stable' as const, failureDomains: [], forecastSuccess: 0.55, drift: 'stable' as const, volatility: 0.3, consensus: 0.74, signalAgreement: 0.82, switchRisk: 0.28, fusionMode: 'stable' as const };
+    const base = { version: '2.12-regime-mesh-v1' as const, selected: 'a', fallbackLadder: ['a'], confidence: 0.55, mode: 'normal' as const, reasonCodes: ['base'], diversity: { protocols: ['vless'], transports: ['ws'], securities: ['tls'] }, learnerConfidence: 0.5, policyFingerprint: 'base', generatedAt: now, strategy: 'stable' as const, failureDomains: [], forecastSuccess: 0.55, drift: 'stable' as const, volatility: 0.3, consensus: 0.74, signalAgreement: 0.82, switchRisk: 0.28, fusionMode: 'stable' as const, regimeState: 'stable' as const, regimeConfidence: 0 };
     let state = { ...defaultAdaptiveGuard(now), active: base, holdUntil: now, changesInWindow: 3, changeWindowStartedAt: now, maxChangesPerWindow: 3 };
     const candidate = { ...base, selected: 'b', confidence: 0.9, policyFingerprint: 'next', generatedAt: now + 1 };
     const d = reconcileAdaptivePlan(candidate, state, [{ profileId: 'a', latencyMs: 100, failures: 0, successes: 10, quarantineUntil: 0, checkedAt: now, consecutiveFailures: 0, consecutiveSuccesses: 3 }], now + 1);
@@ -360,15 +360,15 @@ async function main() {
   });
 
   /* ---------------- render + headers ---------------- */
-  await ok('renderSub: all four formats produce sane bodies', () => {
-    const b64 = renderSub('v2ray', HOST, USER, {});
+  await ok('renderSub: all four formats produce sane bodies', async () => {
+    const b64 = await renderSub('v2ray', HOST, USER, {});
     const decoded = Buffer.from(b64.body, 'base64').toString('utf8');
     assert.ok(decoded.includes('vless://') && decoded.includes('trojan://') && decoded.includes('ss://'));
-    const clash = renderSub('clash', HOST, USER, {});
+    const clash = await renderSub('clash', HOST, USER, {});
     assert.ok(clash.body.includes('proxies:'));
-    const sb = renderSub('singbox', HOST, USER, {});
+    const sb = await renderSub('singbox', HOST, USER, {});
     assert.ok(JSON.parse(sb.body).outbounds.length === 5);
-    const xr = renderSub('xray', HOST, USER, { opKey: 'irancell' });
+    const xr = await renderSub('xray', HOST, USER, { opKey: 'irancell' });
     const cfg = JSON.parse(xr.body);
     assert.ok(cfg.outbounds.length === 12);
     assert.ok(cfg.outbounds.some((x: any) => String(x.tag).includes('fragmented')));

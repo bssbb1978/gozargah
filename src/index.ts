@@ -20,6 +20,7 @@ import { acceptWebSocket } from './handlers/websocket';
 import { buildLiveAdaptiveClientBundle, findUserByToken, renderSub, resolveApp, subHeaders } from './subscription';
 import { resolveOpts } from './sub/operators';
 import { lazyMaintenance } from './db/users';
+import { loadNetworkState } from './db/store';
 import { handlePanelApi } from './panel/api';
 import { panelHtml } from './panel/ui';
 import { landingHtml } from './panel/landing';
@@ -113,6 +114,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       }
 
       if (app === 'page') {
+        // 2.12 — best-effort network state for the honest emergency alert.
+        let netState: { state: string; updatedAt: number } | null = null;
+        if (env.GZ_DB) {
+          try {
+            const ns = await loadNetworkState(env.GZ_DB);
+            if (ns) netState = { state: ns.state, updatedAt: ns.updatedAt };
+          } catch { /* optional */ }
+        }
         const html = await userPageHtml({
           host: url.hostname,
           user,
@@ -122,6 +131,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
           lang,
           opts,
           echOn: !!opts.ech,
+          backupEntryHosts: eff.backupEntryHosts ?? [],
+          networkState: netState,
         });
         return new Response(html, {
           headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
@@ -132,7 +143,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         const body = await buildLiveAdaptiveClientBundle(url.hostname, user, opts, env, dnsUrl);
         return new Response(body, { headers: subHeaders(eff, url.hostname, user, app, opts, token) });
       }
-      const { body } = renderSub(app, url.hostname, user, opts, env, dnsUrl);
+      const { body } = await renderSub(app, url.hostname, user, opts, env, dnsUrl);
       return new Response(body, { headers: subHeaders(eff, url.hostname, user, app, opts, token) });
     }
     // unknown token: fall through to stealth landing (no user enumeration)

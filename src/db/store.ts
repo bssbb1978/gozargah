@@ -17,6 +17,8 @@ export interface SettingsBlob {
   panelPath: string;
   subPath: string;
   proxyIPs: string[];
+  /** 2.12 — alternate domains pointing at the same Worker (emergency entry ladder). */
+  backupEntryHosts?: string[];
   /** rolling quota-reset window for every non-admin user */
   resetCycle: ResetCycle;
   passwordSalt: string;
@@ -251,6 +253,7 @@ export async function loadSettings(db: D1Database): Promise<SettingsBlob | null>
   const value = JSON.parse(row.value) as SettingsBlob;
   // forward-fill fields introduced after v1.1 (schema v2)
   if (!value.resetCycle) value.resetCycle = 'none';
+  if (!Array.isArray(value.backupEntryHosts)) value.backupEntryHosts = [];
   putCache(SETTINGS_KEY + '#rev', row.rev);
   putCache(SETTINGS_KEY, value);
   return value;
@@ -462,6 +465,19 @@ export async function loadHealthSamples(db: D1Database, kind: 'path' | 'profile'
   return (res.results ?? []).reverse().map(r => ({ ts:r.ts, ok:r.ok === 1, latencyMs:r.latency_ms }));
 }
 
+/**
+ * 2.12 — global aggregate outcome stream for regime intelligence: the most
+ * recent path-level observations across all configured subjects, ascending.
+ */
+export async function loadRecentHealthSamples(db: D1Database, limit = 60): Promise<Array<{ ts: number; ok: boolean; latencyMs: number | null }>> {
+  await ensureSchema(db);
+  const n = Math.max(8, Math.min(96, limit));
+  const res = await db
+    .prepare('SELECT ts, ok, latency_ms FROM health_samples WHERE kind IN (\'path\', \'path_tcp\', \'path_dial\', \'path_https\') ORDER BY ts DESC LIMIT ' + String(n))
+    .all<{ ts: number; ok: number; latency_ms: number | null }>();
+  return (res.results ?? []).reverse().map(r => ({ ts: r.ts, ok: r.ok === 1, latencyMs: r.latency_ms }));
+}
+
 export interface LatestPathSample {
   kind: Exclude<HealthSampleKind, 'profile'>;
   subjectId: string;
@@ -492,12 +508,12 @@ export async function loadLatestPathSamples(db: D1Database, subjectIds: string[]
   }));
 }
 
-export interface PredictiveStateRow { kind:'path'|'profile'; subjectId:string; stateJson:string; updatedAt:number; }
+export interface PredictiveStateRow { kind:'path'|'profile'|'regime'; subjectId:string; stateJson:string; updatedAt:number; }
 export async function savePredictiveState(db:D1Database,row:PredictiveStateRow):Promise<void>{
   await ensureSchema(db);
   await db.prepare('INSERT INTO predictive_state(kind,subject_id,state_json,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(kind,subject_id) DO UPDATE SET state_json=?3, updated_at=?4').bind(row.kind,row.subjectId,row.stateJson,row.updatedAt).run();
 }
-export async function loadPredictiveStates(db:D1Database, kind:'path'|'profile'):Promise<Array<{subjectId:string;stateJson:string;updatedAt:number}>>{
+export async function loadPredictiveStates(db:D1Database, kind:'path'|'profile'|'regime'):Promise<Array<{subjectId:string;stateJson:string;updatedAt:number}>>{
   await ensureSchema(db);
   const res=await db.prepare('SELECT subject_id,state_json,updated_at FROM predictive_state WHERE kind=?1 ORDER BY updated_at DESC LIMIT 64').bind(kind).all<{subject_id:string;state_json:string;updated_at:number}>();
   return (res.results ?? []).map(r=>({subjectId:r.subject_id,stateJson:r.state_json,updatedAt:r.updated_at}));

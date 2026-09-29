@@ -66,6 +66,12 @@ const STR = {
     vlessLabel: 'VLESS',
     trojanLabel: 'Trojan',
     subLabel: 'اشتراک',
+    backupEntriesTitle: 'مسیرهای جایگزین ورود',
+    backupEntriesHint: 'اگر دامنهٔ اصلی فیلتر یا قطع شد، کلاینت می‌تواند از همین نقاط ورود با همان حساب استفاده کند (هر دامنه باید به همین Worker اشاره کند).',
+    backupLimit: 'مرز صادقانه: اگر از شبکهٔ شما هیچ مسیری تا Worker/کلادفلر باقی نمانده باشد، هیچ نرم‌افزاری نمی‌تواند از راه دور مسیر تازه‌ای بسازد؛ این مسیرها فقط وقتی کمک می‌کنند که دست‌کم یکی هنوز قابل‌رسو باشد.',
+    netAlertTitle: 'وضعیت شبکه از دید Worker',
+    netAlertRecovery: 'موتور در حالت بازیابی است؛ بخشی از مسیرهای پیکربندی‌شده ناسالم به نظر می‌رسند. مسیرهای جایگزین را امتحان کنید و اشتراک خود را تازه کنید.',
+    netAlertNone: 'هیچ مسیر پیکربندی‌شده سالمی از دید Worker در دسترس نیست؛ این به‌تنهایی ثابت نمی‌کند که اینترنت بین‌الملل قطع است. مسیرهای جایگزین را امتحان کنید و اشتراک را تازه کنید.',
     themeDark: 'تم تاریک',
     themeLight: 'تم روشن',
   },
@@ -115,6 +121,12 @@ const STR = {
     vlessLabel: 'VLESS',
     trojanLabel: 'Trojan',
     subLabel: 'Subscription',
+    backupEntriesTitle: 'Backup entry points',
+    backupEntriesHint: 'If the primary domain is blocked or cut, clients can use these entry points with the same account (each domain must point at this same Worker).',
+    backupLimit: 'Honest limit: if no route from your network reaches the Worker/Cloudflare edge, no software can create a new route remotely; these paths only help when at least one is still reachable.',
+    netAlertTitle: 'Network state from the Worker vantage',
+    netAlertRecovery: 'The engine is in recovery mode; some configured paths look unhealthy. Try the backup entries below and refresh your subscription.',
+    netAlertNone: 'No configured path is healthy from the Worker vantage. This alone does not prove an international outage. Try the backup entries and refresh your subscription.',
     themeDark: 'Dark',
     themeLight: 'Light',
   },
@@ -147,6 +159,10 @@ export interface UserPageParams {
   lang: Lang;
   opts: SubOpts;
   echOn: boolean;
+  /** 2.12 — configured alternate Worker domains (emergency ladder). */
+  backupEntryHosts?: string[];
+  /** 2.12 — latest classified network state from the Worker vantage. */
+  networkState?: { state: string; updatedAt: number } | null;
 }
 
 export async function userPageHtml(p: UserPageParams): Promise<string> {
@@ -236,6 +252,44 @@ export async function userPageHtml(p: UserPageParams): Promise<string> {
     const active = i === 0;
     return '<a class="chip' + (active ? ' on' : '') + '" href="' + esc(fmtChips[i][2]) + '" rel="noopener">' + esc(label) + '</a>';
   }).join('');
+
+  // 2.12 — emergency ladder on the status page: alternate entry hosts with
+  // their own subscription token + vless link, plus an honest limit note.
+  let backupHtml = '';
+  const backupHosts = (p.backupEntryHosts ?? []).slice(0, 4);
+  if (backupHosts.length) {
+    const rows: string[] = [];
+    for (const bh of backupHosts) {
+      try {
+        const bToken = await subTokenFor(bh, user.uuid);
+        const bVless = buildLinks(bh, user, opts).vless;
+        const bSub = 'https://' + bh + '/' + p.subPath + '/' + bToken;
+        rows.push(
+          '<div class="crow"><span class="clab mono" dir="ltr">' + esc(bh) + '</span>' +
+          '<span class="cval mono">' + esc(bVless.slice(0, 58)) + '…</span>' +
+          '<button class="btn sm" type="button" data-copy="' + esc(bVless) + '">⧉</button>' +
+          '<a class="btn sm" href="' + esc(bSub) + '" rel="noopener">' + (p.lang === 'fa' ? 'صفحهٔ وضعیت' : 'Status') + '</a></div>',
+        );
+      } catch {
+        rows.push('<div class="crow"><span class="clab mono" dir="ltr">' + esc(bh) + '</span><span class="cval mono">–</span></div>');
+      }
+    }
+    backupHtml =
+      '<details><summary>🛰 ' + esc(S.backupEntriesTitle) + '</summary>' +
+      '<div class="inner"><div class="hint" style="margin:6px 0 4px">' + esc(S.backupEntriesHint) + '</div>' +
+      rows.join('') +
+      '<div class="note">' + esc(S.backupLimit) + '</div></div></details>';
+  }
+
+  let netAlertHtml = '';
+  const netState = p.networkState?.state;
+  if (netState === 'recovery' || netState === 'no_healthy_path') {
+    const msg = netState === 'no_healthy_path' ? S.netAlertNone : S.netAlertRecovery;
+    netAlertHtml =
+      '<div class="card" style="border-color:rgba(245,158,11,.45)">' +
+      '<h3>⚠ ' + esc(S.netAlertTitle) + '</h3>' +
+      '<div class="hint" style="margin-top:6px">' + esc(msg) + '</div></div>';
+  }
 
   const opHtml =
     '<a class="chip' + (!brand ? ' on' : '') + '" href="' + esc(q(uspStr(null, p.echOn))) + '">' + esc(S.opAuto) + '</a>' +
@@ -365,6 +419,8 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
   <button class="tbtn" id="theme-btn" type="button">☀️</button>
 </div>
 
+${netAlertHtml}
+
 <div class="card hero">
   <span class="pill ${state === 'active' || state === 'notStarted' ? (state === 'active' ? 'ok' : 'idle') : state === 'quota' || state === 'expired' ? 'warn' : 'bad'}">
     <span class="dot"></span>${esc(stateLabel)}
@@ -436,6 +492,8 @@ html[dir="ltr"] .toast{transform:translateX(-50%)}
   </div>
 </details>
 
+${backupHtml}
+
 <details>
   <summary>📋 ${esc(S.rawLinks)}</summary>
   <div class="inner">
@@ -506,5 +564,4 @@ function uspStr(brand: { key: string } | null, ech: boolean): string {
   return s ? '?' + s : '';
 }
 
-// keep subTokenFor import referenced for type completeness in future extensions
-void subTokenFor;
+

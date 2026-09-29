@@ -1,4 +1,22 @@
-# Adaptive Engine — Gozargah 2.11.0
+# Adaptive Engine — Gozargah 2.12.0
+
+## 2.12 dynamic path rotation
+
+The Worker accepts WebSocket upgrades on any path (authentication is in-band per protocol), so the request path is a free entropy dimension. Every generated link (raw links, Base64, Clash-Meta, Sing-box, Xray-core) now uses a deterministic 6-hour-rotating path base `/<uuid>/g/<16 hex>` (`src/sub/path-rotation.ts`). The same uuid in the same window always yields the same path across all formats and entry hosts; previous windows remain valid, so installed clients are never stranded, while static path fingerprints in a blocklist age out every window. The live bundle advertises the current window via `dynamic_path`.
+
+## 2.12 emergency entry ladder
+
+Operators can register up to four `backupEntryHosts` — other domains that point at the same Worker (e.g. a second Cloudflare domain). The five-minute scheduled health loop probes them on port 443 (`entry:<host>` rows) alongside the ProxyIP chain, and the ladder surfaces in:
+
+- the live adaptive bundle as `emergency_ladder` (primary + backup entries with measured/unmeasured status, last latency, and an explicit `honest_limit` statement),
+- every client format as same-credentials outbounds on the backup hosts (Xray-core joins the `auto-best` balancer so the observatory probes reachability itself; Clash-Meta adds them to the select group; Sing-box to the selector; Base64 appends the VLESS links),
+- the per-user status page with per-host subscription tokens and an honest network alert when the engine is in `recovery` / `no_healthy_path`.
+
+The ladder is diversity, not resurrection: it raises the probability that at least one route survives a partial block or outage. When no route from the user's network reaches the Worker/Cloudflare edge at all, no Worker code can create a new route remotely.
+
+## 2.12 regime-driven strategy
+
+The protocol controller now consumes the aggregate regime label (see `AI-ENGINE.md`): `suspected_change` upgrades a calm `stable` strategy to `diversify` (wider transport/protocol spread in the fallback ladder) with the `suspected_regime_change` reason code; the plan fingerprint includes the regime state so the Adaptive Guard can see regime-aware candidates. The label is aggregate statistics only — never a DPI claim.
 
 ## Existing decision stack retained
 

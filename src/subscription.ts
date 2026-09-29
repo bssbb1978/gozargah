@@ -11,12 +11,14 @@
 
 import { toBase64 } from './utils/crypto';
 import { GzUser, listUsers } from './db/users';
-import { loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadProfileHealth, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState } from './db/store';
+import { loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState } from './db/store';
 import { decideResilience, type PathObservation } from './ai/resilience';
 import { buildAdaptiveProtocolPlan } from './ai/protocol-controller';
 import { nextAdaptiveGuardState, reconcileAdaptivePlan } from './ai/adaptive-guard';
 import { EffectiveSettings } from './settings';
 import { DEFAULT_FP, FragPreset, adaptiveProfiles, fpFor, opBranding, resolveOp, SubOpts, AdaptiveProfile } from './sub/operators';
+import { PATH_ROTATION_WINDOW_MS, rotatedPathBase } from './sub/path-rotation';
+import type { RegimeAssessment } from './ai/regime';
 import { ALPN_PROFILES, protocolCatalog, adaptiveProtocolOrder, parseOriginTransports, type ProtocolCapability } from './protocols/catalog';
 import { buildAdaptiveProtocolPolicy, choosePreferredProfiles, policySummary } from './protocols/policy';
 import { Env, VERSION } from './config';
@@ -97,6 +99,11 @@ export function buildAdaptiveClientBundle(host: string, user: { uuid: string; tr
       trojan_ws: buildLinks(host, user, opts).trojan,
       shadowsocks_ws: buildLinks(host, user, opts).shadowsocks,
     },
+    dynamic_path: {
+      rotationMinutes: PATH_ROTATION_WINDOW_MS / 60_000,
+      currentBase: rotatedPathBase(user.uuid),
+      note: 'The WebSocket path rotates deterministically per window; older windows remain valid, so installed clients are never stranded.',
+    },
     dns_forwarding: {
       doh_url: dnsUrl || null,
       client_udp: 'VLESS UDP DNS only (destination port 53)',
@@ -138,16 +145,30 @@ export async function buildLiveAdaptiveClientBundle(
   let userState = null as Awaited<ReturnType<typeof loadUserAdaptiveState>>;
   let learner: ReturnType<typeof JSON.parse> | undefined;
   let pathRows: Awaited<ReturnType<typeof loadPathHealth>> = [];
+  let regime: RegimeAssessment | null = null;
+  let backupHosts: string[] = [];
   if (db) {
     try { networkState = await loadNetworkState(db); } catch { /* optional */ }
     try { profileHealth = await loadProfileHealth(db); } catch { /* optional */ }
     try { pathRows = await loadPathHealth(db); } catch { /* optional */ }
+    try {
+      const s = await loadSettings(db);
+      backupHosts = (s?.backupEntryHosts ?? []).slice(0, 4);
+    } catch { /* optional */ }
     if (user.id && user.id > 0) {
       try { userState = await loadUserAdaptiveState(db, user.id); } catch { /* optional */ }
     }
     try {
       const row = await loadAdaptiveModel(db);
       if (row) learner = JSON.parse(row.stateJson);
+    } catch { /* optional */ }
+    try {
+      const rows = await loadPredictiveStates(db, 'regime');
+      const row = rows.find((r) => r.subjectId === 'global');
+      if (row) {
+        const parsed = JSON.parse(row.stateJson) as RegimeAssessment;
+        if (parsed && typeof parsed.state === 'string' && Number.isFinite(parsed.confidence)) regime = parsed;
+      }
     } catch { /* optional */ }
   }
   const observations: PathObservation[] = pathRows.map(r => ({
@@ -176,6 +197,7 @@ export async function buildLiveAdaptiveClientBundle(
     predictive,
     networkState: networkDecision,
     learner,
+    regime: regime ?? undefined,
     preferredProfileId: userState?.preferredProfileId ?? '',
     limit: 10,
     now,
@@ -203,7 +225,33 @@ export async function buildLiveAdaptiveClientBundle(
     } catch { /* guard is best-effort; candidate remains safe */ }
   }
 
-  base.schema = 'gozargah-live-adaptive-profiles/v7';
+  // 2.12 — emergency ladder: the primary entry plus configured backup entry
+  // hosts, each with last measured health. Honest by construction: this only
+  // helps when at least one entry point is still reachable from the client.
+  const pathBase = rotatedPathBase(user.uuid);
+  const entries: Array<Record<string, unknown>> = [{
+    host, role: 'primary', url: 'wss://' + host + pathBase,
+    status: 'primary', latencyMs: null,
+  }];
+  for (const bh of backupHosts) {
+    const row = pathRows.find((r) => r.pathId === 'entry:' + bh);
+    entries.push({
+      host: bh, role: 'backup', url: 'wss://' + bh + pathBase,
+      status: row ? (row.ok ? 'measured_ok' : 'measured_failed') : 'unmeasured',
+      latencyMs: row?.latencyMs ?? null,
+      checkedAt: row?.checkedAt ?? null,
+    });
+  }
+  base.emergency_ladder = {
+    schema: 'gozargah-emergency-ladder/v1',
+    network_state: networkDecision?.state ?? (networkState ? networkState.state : 'unknown'),
+    entries,
+    honest_limit: {
+      fa: 'اگر از شبکهٔ شما هیچ مسیری تا این Worker/کلادفلر باقی نمانده باشد، هیچ نرم‌افزاری نمی‌تواند از راه دور مسیر تازه‌ای بسازد؛ این پله فقط وقتی کمک می‌کند که دست‌کم یکی از نقاط ورود هنوز قابل‌رسو باشد.',
+      en: 'If no route from your network reaches this Worker/Cloudflare edge, no software can create a new route remotely; this ladder only helps when at least one entry point is still reachable.',
+    },
+  };
+  base.schema = 'gozargah-live-adaptive-profiles/v8';
   base.generated_at = now;
   base.live_policy = {
     ...activePlan,
@@ -245,7 +293,8 @@ export function buildLinks(
   opts: BuildOpts | null | undefined,
 ): ClientLinks {
   const port = opts?.port && opts.port !== 443 ? opts.port : 443;
-  const wsPath = '/' + user.uuid + '?ed=2048&gz_profile=standard';
+  // 2.12 — deterministic 6h-rotating path; the Worker accepts any path.
+  const wsPath = rotatedPathBase(user.uuid) + '?ed=2048&gz_profile=standard';
   const fp = fpFor(opts);
   const ech = opts?.ech ? '&ech=' : '';
   const tag = encodeURIComponent(remarkFor(user, opts));
@@ -293,9 +342,10 @@ export function buildClashYaml(
   user: { uuid: string; trojanPass: string; name: string },
   opts: BuildOpts | null | undefined,
   dnsUrl?: string,
+  backupHosts?: string[],
 ): string {
   const port = opts?.port && opts.port !== 443 ? opts.port : 443;
-  const wsPath = '/' + user.uuid + '?ed=2048&gz_profile=standard';
+  const wsPath = rotatedPathBase(user.uuid) + '?ed=2048&gz_profile=standard';
   const fp = fpFor(opts);
   const brand = opBranding(opts);
   const vName = 'Gozargah-VLESS-' + (brand ? brand.en.split(' ')[0] + '-' : '') + user.name;
@@ -303,6 +353,30 @@ export function buildClashYaml(
   const ech = opts?.ech
     ? '    ech-opts:\n      enabled: true\n'
     : '';
+  // 2.12 — backup entry hosts: same credentials, different domain/edge.
+  const backupNames: string[] = [];
+  const backupBlocks: string[] = (backupHosts ?? []).slice(0, 2).map((bh, i) => {
+    const bName = 'Gozargah-VLESS-BK' + (i + 1) + '-' + user.name;
+    backupNames.push(bName);
+    return [
+      '  - name: "' + bName + '"',
+      '    type: vless',
+      '    server: ' + bh,
+      '    port: ' + port,
+      '    uuid: ' + user.uuid,
+      '    tls: true',
+      '    servername: ' + bh,
+      '    client-fingerprint: ' + fp,
+      '    network: ws',
+      '    udp: true',
+      '    ws-opts:',
+      '      path: "' + wsPath + '"',
+      '      headers:',
+      '        Host: ' + bh,
+      '      max-early-data: 2048',
+      '      early-data-header-name: Sec-WebSocket-Protocol',
+    ].join('\n');
+  });
   const ssName = 'Gozargah-Shadowsocks-' + (brand ? brand.en.split(' ')[0] + '-' : '') + user.name;
   const proxy = (name: string, kind: 'vless' | 'trojan'): string[] => [
     '  - name: "' + name + '"',
@@ -355,6 +429,7 @@ export function buildClashYaml(
     ...proxy(tName, 'trojan'),
     ech,
     ...shadowsocksProxy,
+    ...backupBlocks,
     'proxy-groups:',
     '  - name: Gozargah',
     '    type: select',
@@ -362,6 +437,7 @@ export function buildClashYaml(
     '      - ' + vName,
     '      - ' + tName,
     '      - ' + ssName,
+    ...backupNames.map((n) => '      - ' + n),
     'rules:',
     '  - MATCH,Gozargah',
     '',
@@ -373,9 +449,10 @@ export function buildSingBoxJson(
   user: { uuid: string; trojanPass: string; name: string },
   opts: BuildOpts | null | undefined,
   dnsUrl?: string,
+  backupHosts?: string[],
 ): string {
   const port = opts?.port && opts.port !== 443 ? opts.port : 443;
-  const wsPath = '/' + user.uuid + '?ed=2048&gz_profile=standard';
+  const wsPath = rotatedPathBase(user.uuid) + '?ed=2048&gz_profile=standard';
   const fp = fpFor(opts);
   const tls: Record<string, unknown> = {
     enabled: true,
@@ -428,7 +505,17 @@ export function buildSingBoxJson(
         plugin_opts: 'mode=websocket;tls;host=' + host + ';path=/ss/' + user.uuid,
         network: 'tcp',
       },
-      { type: 'selector', tag: 'gozargah-select', outbounds: [vName, tName, ssName], default: vName },
+      // 2.12 — backup entry outbounds: same credentials on alternate domains.
+      ...(backupHosts ?? []).slice(0, 2).map((bh, i) => ({
+        type: 'vless',
+        tag: vName + '-bk' + (i + 1),
+        server: bh,
+        server_port: port,
+        uuid: user.uuid,
+        tls: { ...tls, server_name: bh },
+        transport: { ...transport, headers: { Host: bh } },
+      })),
+      { type: 'selector', tag: 'gozargah-select', outbounds: [vName, tName, ssName, ...(backupHosts ?? []).slice(0, 2).map((_, i) => vName + '-bk' + (i + 1))], default: vName },
       { type: 'direct', tag: 'direct' },
     ],
     route: { final: 'gozargah-select' },
@@ -456,9 +543,12 @@ export function buildXrayJson(
   user: { uuid: string; trojanPass: string; name: string },
   opts: BuildOpts | null | undefined,
   env?: Env,
+  backupHosts?: string[],
 ): string {
   const profiles = adaptiveProfiles(opts);
-  const wsPath = (profileId: string) => '/' + user.uuid + '?ed=2048&gz_profile=' + profileId;
+  // 2.12 — deterministic 6h-rotating path base (all profiles share it).
+  const wsPathBase = rotatedPathBase(user.uuid);
+  const wsPath = (profileId: string) => wsPathBase + '?ed=2048&gz_profile=' + profileId;
   const brand = opBranding(opts);
   const suffix = brand ? '-' + brand.key : '';
   const outbounds: Array<Record<string, unknown>> = [];
@@ -562,6 +652,25 @@ export function buildXrayJson(
     }
     appTags.push(...originTags);
   }
+
+  // 2.12 — backup entry outbounds (same credentials on alternate domains).
+  // They join the auto-best balancer so Xray's observatory probes them and
+  // routes to whichever entry is reachable/fastest.
+  (backupHosts ?? []).slice(0, 2).forEach((bh, i) => {
+    const bTag = 'gz-bk' + (i + 1) + '-vless' + suffix;
+    outbounds.push({
+      tag: bTag,
+      protocol: 'vless',
+      settings: { vnext: [{ address: bh, port: 443, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] },
+      streamSettings: {
+        network: 'ws',
+        security: 'tls',
+        tlsSettings: { serverName: bh, allowInsecure: false, fingerprint: 'chrome' },
+        wsSettings: { path: wsPath('standard'), headers: { Host: bh } },
+      },
+    });
+    appTags.push(bTag);
+  });
 
   const cfg = {
     log: { loglevel: 'warning' },
@@ -670,14 +779,27 @@ export function subHeaders(
   return h;
 }
 
-export function renderSub(app: string, host: string, user: GzUser, opts: SubOpts | null | undefined, env?: Env, dnsUrl?: string): { body: string; app: string } {
-  if (app === 'clash') return { body: buildClashYaml(host, user, opts, dnsUrl), app };
-  if (app === 'singbox') return { body: buildSingBoxJson(host, user, opts, dnsUrl), app };
-  if (app === 'xray') return { body: buildXrayJson(host, user, opts, env), app };
+export async function renderSub(app: string, host: string, user: GzUser, opts: SubOpts | null | undefined, env?: Env, dnsUrl?: string): Promise<{ body: string; app: string }> {
+  // 2.12 — configured backup entry hosts (cached; best-effort).
+  let backupHosts: string[] = [];
+  if (env?.GZ_DB) {
+    try {
+      const s = await loadSettings(env.GZ_DB);
+      backupHosts = (s?.backupEntryHosts ?? [])
+        .map((x) => String(x).trim().toLowerCase())
+        .filter((x) => /^[a-z0-9][a-z0-9.-]{2,252}$/.test(x) && x.includes('.'))
+        .slice(0, 4);
+    } catch { /* best-effort; ladder simply stays primary-only */ }
+  }
+  if (app === 'clash') return { body: buildClashYaml(host, user, opts, dnsUrl, backupHosts), app };
+  if (app === 'singbox') return { body: buildSingBoxJson(host, user, opts, dnsUrl, backupHosts), app };
+  if (app === 'xray') return { body: buildXrayJson(host, user, opts, env, backupHosts), app };
   if (app === 'profiles') return { body: buildAdaptiveClientBundle(host, user, opts, env, dnsUrl), app };
   if (app === 'capabilities') return { body: JSON.stringify(buildProtocolMatrix(env, host), null, 2), app };
   const links = buildLinks(host, user, opts);
-  return { body: buildBase64([links]), app: 'v2ray' };
+  const lines = [links.vless, links.trojan, links.shadowsocks];
+  for (const bh of backupHosts.slice(0, 2)) lines.push(buildLinks(bh, user, opts).vless);
+  return { body: toBase64(lines.join('\n')), app: 'v2ray' };
 }
 
 export { DEFAULT_FP };

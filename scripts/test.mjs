@@ -21,6 +21,8 @@ const entries = [
   'dns-wire',
   'dns-resolver',
   'vless-dns',
+  'regime',
+  'path-rotation',
 ];
 
 for (const name of entries) {

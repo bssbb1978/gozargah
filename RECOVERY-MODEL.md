@@ -15,9 +15,16 @@ The scheduler runs the condition estimator over configured Worker-egress TCP che
 
 On `UPSTREAM_UNAVAILABLE`, the diagnostic recommends retaining last-known-good and bounded recovery probes. It does not instruct the controller to rotate profiles endlessly or declare service restored. The core controller still uses the existing network quorum and guard.
 
+## 2.12 additions
+
+- The five-minute scheduler also probes configured `backupEntryHosts` on port 443 (`entry:<host>` rows), so the emergency ladder's entries carry measured health in the live bundle and the user status page.
+- The aggregate regime label (`suspected_change`) upgrades a calm policy to `diversify`, widening the fallback ladder across transport/protocol families during a suspected fresh filtering regime. This is aggregate statistics, not a detection claim.
+- Client formats emit same-credentials outbounds for backup hosts; Xray-core's observatory/leastPing balancer probes their reachability client-side.
+
 ## Exact limits
 
 - This release has not introduced a new explicit `OFFLINE` mode in the profile controller; `UPSTREAM_UNAVAILABLE` is an observational condition, and existing `recovery/no_healthy_path` modes remain.
+- The emergency ladder only helps while at least one entry point (primary or backup domain) is still reachable from the client network.
 - D1 failure behavior remains existing best-effort/worker error handling; no new generic D1 retry framework was added.
 - No Xray/sing-box process is controlled by the Worker, and no origin health check adapter is deployed.
 - Client-side fragmentation settings are not dynamically tuned. Existing opt-in/static client profile behavior is unchanged.

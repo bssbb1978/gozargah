@@ -8,7 +8,7 @@ import { Env, GzError, VERSION } from '../config';
 import { EffectiveSettings } from '../settings';
 import {
   addEvent, recentEvents, saveSettings, SettingsBlob, loadSettings, invalidateCache,
-  consumeAiDiagnosticQuota, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState, saveHealthSample, loadLatestPathSamples,
+  consumeAiDiagnosticQuota, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState, saveHealthSample, loadLatestPathSamples, loadPredictiveStates,
 } from '../db/store';
 import {
   createUser, deleteUser, GzUser, invalidateUsers, listUsers, updateUser, flushUsage,
@@ -153,10 +153,19 @@ export async function handlePanelApi(
         }
       }
       const condition = classifyNetworkCondition(configuredPaths, observations);
+      // 2.12 — aggregate regime label (internal AI, deterministic).
+      let regime: { state: string; confidence: number; baselineSuccess: number; recentSuccess: number; reasonCodes: string[] } | null = null;
+      try {
+        const rows = await loadPredictiveStates(db, 'regime');
+        const row = rows.find((r) => r.subjectId === 'global');
+        if (row) regime = JSON.parse(row.stateJson) as typeof regime;
+      } catch { /* optional */ }
       return json({
         ok: true,
         state,
         condition,
+        regime,
+        backupEntryHosts: settings?.backupEntryHosts ?? [],
         source: 'configured Worker-egress path telemetry only',
         physicalUpstreamDisconnectionProven: false,
         dpiProven: false,
@@ -318,6 +327,7 @@ export async function handlePanelApi(
         panelPath: s?.panelPath ?? eff.panelPath,
         subPath: s?.subPath ?? eff.subPath,
         proxyIPs: s?.proxyIPs ?? eff.proxyIPs,
+        backupEntryHosts: s?.backupEntryHosts ?? eff.backupEntryHosts ?? [],
         resetCycle: s?.resetCycle ?? eff.resetCycle ?? 'none',
         isDefaultPassword: s?.isDefaultPassword ?? eff.isDefaultPassword,
         dbOk: eff.dbOk,
@@ -359,6 +369,13 @@ export async function handlePanelApi(
             .filter((x) => /^[a-z0-9.\-:]+$/i.test(x) && x.length <= 253);
           if (ips.length > 32) throw new GzError('too many proxyIPs', 'validation');
           out.proxyIPs = ips.length ? ips : ['proxyip.cmliussss.net'];
+        }
+        if (Array.isArray(body.backupEntryHosts)) {
+          const hosts = (body.backupEntryHosts as unknown[])
+            .map((x) => String(x).trim().toLowerCase())
+            .filter((x) => /^[a-z0-9][a-z0-9.-]{2,252}$/.test(x) && x.includes('.'));
+          if (hosts.length > 4) throw new GzError('too many backupEntryHosts (max 4)', 'validation');
+          out.backupEntryHosts = hosts;
         }
         if (typeof body.newPassword === 'string' && body.newPassword.length > 0) {
           const pw = body.newPassword;

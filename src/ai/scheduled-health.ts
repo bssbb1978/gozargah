@@ -7,12 +7,13 @@
 
 import { connect } from 'cloudflare:sockets';
 import { Env } from '../config';
-import { addEvent, loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadProfileHealth, loadSettings, saveAdaptiveGuardState, saveNetworkState, savePathHealth, saveProtocolPolicyState, loadHealthSamples, saveHealthSample, savePredictiveState, savePolicySignalState } from '../db/store';
+import { addEvent, loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadProfileHealth, loadSettings, loadRecentHealthSamples, saveAdaptiveGuardState, saveNetworkState, savePathHealth, saveProtocolPolicyState, loadHealthSamples, loadPredictiveStates, saveHealthSample, savePredictiveState, savePolicySignalState } from '../db/store';
 import { classifyNetworkState } from './network-state';
 import { classifyNetworkCondition, normalizeSocketFailure } from './network-intelligence';
 import { updateObservation } from './resilience';
 import { buildAdaptiveProtocolPlan } from './protocol-controller';
 import { assessHealth } from './predictive-mesh';
+import { assessRegime, emptyRegime, type RegimeAssessment } from './regime';
 import { nextAdaptiveGuardState, reconcileAdaptivePlan } from './adaptive-guard';
 import { buildProtocolMatrix } from '../subscription';
 
@@ -104,6 +105,44 @@ export async function runScheduledHealth(env: Env): Promise<void> {
     });
   }
 
+  // 2.12 — emergency entry ladder: probe alternate Worker domains (max 4)
+  // on port 443. They share the worker's credentials; a block of one domain
+  // does not have to mean a block of the service.
+  const backupHosts = [...new Set(settings?.backupEntryHosts ?? [])]
+    .map((x) => String(x).trim().toLowerCase())
+    .filter((x) => /^[a-z0-9][a-z0-9.-]{2,252}$/.test(x) && x.includes('.'))
+    .slice(0, 4);
+  for (const host of backupHosts) {
+    const pathId = 'entry:' + host;
+    const result = await probeEndpoint(host, 443);
+    const previous = byId.get(pathId);
+    const next = updateObservation(previous ? {
+      id: previous.pathId,
+      latencyMs: previous.latencyMs,
+      ok: previous.ok,
+      checkedAt: previous.checkedAt,
+      failures: previous.failures,
+      successes: previous.successes,
+      quarantineUntil: previous.quarantineUntil,
+      consecutiveFailures: previous.consecutiveFailures,
+      consecutiveSuccesses: previous.consecutiveSuccesses,
+      lastError: previous.lastError,
+    } : undefined, result.ok, result.latencyMs, Date.now(), result.error);
+    next.id = pathId;
+    await savePathHealth(env.GZ_DB, {
+      pathId, latencyMs: next.latencyMs, ok: next.ok, failures: next.failures, successes: next.successes,
+      quarantineUntil: next.quarantineUntil, checkedAt: next.checkedAt, lastError: next.lastError,
+      consecutiveFailures: next.consecutiveFailures, consecutiveSuccesses: next.consecutiveSuccesses,
+    });
+    await saveHealthSample(env.GZ_DB, { kind: 'path_tcp', subjectId: pathId, ts: next.checkedAt, ok: next.ok, latencyMs: next.latencyMs });
+    byId.set(pathId, {
+      pathId, latencyMs: next.latencyMs, ok: next.ok,
+      failures: next.failures, successes: next.successes, quarantineUntil: next.quarantineUntil,
+      checkedAt: next.checkedAt, lastError: next.lastError,
+      consecutiveFailures: next.consecutiveFailures, consecutiveSuccesses: next.consecutiveSuccesses,
+    });
+  }
+
   const state = classifyNetworkState([...byId.values()].map((r) => ({
     id: r.pathId, latencyMs: r.latencyMs, ok: r.ok, checkedAt: r.checkedAt,
     failures: r.failures, successes: r.successes, quarantineUntil: r.quarantineUntil,
@@ -147,6 +186,31 @@ export async function runScheduledHealth(env: Env): Promise<void> {
     }).slice(0, 1400));
   }
 
+  // 2.12 — regime intelligence: one bounded assessment of the global aggregate
+  // outcome stream. Aggregate statistics only; never a DPI or censor claim.
+  let regime: RegimeAssessment = emptyRegime(state.generatedAt);
+  try {
+    const stream = await loadRecentHealthSamples(env.GZ_DB, 60);
+    regime = assessRegime(stream, state.generatedAt);
+    const previousRegimeRows = await loadPredictiveStates(env.GZ_DB, 'regime');
+    const previousRegime = previousRegimeRows.find((r) => r.subjectId === 'global');
+    await savePredictiveState(env.GZ_DB, { kind: 'regime', subjectId: 'global', stateJson: JSON.stringify(regime), updatedAt: state.generatedAt });
+    let previousState: string | null = null;
+    if (previousRegime) {
+      try { previousState = (JSON.parse(previousRegime.stateJson) as RegimeAssessment).state ?? null; } catch { previousState = null; }
+    }
+    if (previousState && previousState !== regime.state) {
+      await addEvent(env.GZ_DB, 'network_regime_changed', JSON.stringify({
+        from: previousState,
+        to: regime.state,
+        confidence: regime.confidence,
+        baselineSuccess: regime.baselineSuccess,
+        recentSuccess: regime.recentSuccess,
+        reasonCodes: regime.reasonCodes.slice(0, 4),
+      }).slice(0, 800));
+    }
+  } catch { /* regime intelligence is best-effort and must never block health */ }
+
   // Refresh the live protocol policy at the same cadence. This keeps the D1
   // fallback ladder warm even when no client is actively requesting a manifest.
   try {
@@ -177,6 +241,7 @@ export async function runScheduledHealth(env: Env): Promise<void> {
       },
       learner,
       predictive,
+      regime,
       limit: 10,
       now: state.generatedAt,
     });
@@ -217,6 +282,8 @@ export async function runScheduledHealth(env: Env): Promise<void> {
         confidence: plan.confidence,
         strategy: plan.strategy,
         selected: plan.selected,
+        regimeState: plan.regimeState,
+        regimeConfidence: plan.regimeConfidence,
         reasonCodes: plan.reasonCodes.slice(0, 20),
       }),
       updatedAt: plan.generatedAt,

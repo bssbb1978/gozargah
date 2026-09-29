@@ -13,6 +13,7 @@ import { bayesianReliability, riskAdjustedReliability } from './ensemble';
 import type { PredictiveAssessment } from './predictive-mesh';
 import { combineForecast } from './predictive-mesh';
 import { fusePolicySignals, type FusionResult } from './signal-fusion';
+import type { RegimeAssessment, RegimeState } from './regime';
 
 export interface ControllerProfileHealth {
   profileId: string;
@@ -26,7 +27,7 @@ export interface ControllerProfileHealth {
 }
 
 export interface AdaptiveProtocolPlan {
-  version: '2.8-consensus-mesh-v1';
+  version: '2.12-regime-mesh-v1';
   selected: string | null;
   fallbackLadder: string[];
   confidence: number;
@@ -45,6 +46,9 @@ export interface AdaptiveProtocolPlan {
   signalAgreement: number;
   switchRisk: number;
   fusionMode: FusionResult['mode'];
+  /** 2.12 — aggregate-statistics regime label (never a DPI claim). */
+  regimeState: RegimeState;
+  regimeConfidence: number;
 }
 
 
@@ -88,6 +92,8 @@ export function buildAdaptiveProtocolPlan(args: {
   learner?: EdgeLearnerState;
   preferredProfileId?: string;
   predictive?: Record<string, PredictiveAssessment>;
+  /** 2.12 — aggregate regime intelligence from scheduled health + dial outcomes. */
+  regime?: RegimeAssessment;
   limit?: number;
   now?: number;
 }): AdaptiveProtocolPlan {
@@ -95,11 +101,16 @@ export function buildAdaptiveProtocolPlan(args: {
   const limit = Math.max(2, Math.min(args.limit ?? 8, 12));
   const healthMap = new Map((args.health ?? []).map((h) => [h.profileId, h]));
   const net = args.networkState;
+  const regime = args.regime;
 
   const samplesTotal = (args.health ?? []).reduce((n, h) => n + h.failures + h.successes, 0);
-  const strategy: AdaptiveProtocolPlan['strategy'] =
+  let strategy: AdaptiveProtocolPlan['strategy'] =
     net?.state === 'no_healthy_path' || net?.signalClass === 'broad_degradation' ? 'safe' :
     net?.state === 'recovery' || net?.signalClass === 'selective_degradation' ? 'diversify' : 'stable';
+  // 2.12: a suspected aggregate regime change (e.g. a freshly applied filter
+  // list) upgrades a calm 'stable' policy to 'diversify' so the emitted
+  // fallback ladder spans more transport/protocol families. 'safe' stays.
+  if (regime?.state === 'suspected_change' && strategy === 'stable') strategy = 'diversify';
 
   const familyStats = new Map<string, { samples: number; failures: number; successes: number }>();
   for (const p of args.profiles) {
@@ -220,6 +231,9 @@ export function buildAdaptiveProtocolPlan(args: {
   if (strategy === 'safe') reasonCodes.push('safe_mode');
   if (strategy === 'diversify') reasonCodes.push('diversification_mode');
   if (riskyFamilies.length) reasonCodes.push('failure_domain_penalty');
+  if (regime?.state === 'suspected_change') reasonCodes.push('suspected_regime_change');
+  else if (regime?.state === 'recovering') reasonCodes.push('regime_recovering');
+  else if (regime?.state === 'watch') reasonCodes.push('regime_watch');
   if (drift === 'degrading') reasonCodes.push('predictive_drift_penalty');
   else if (drift === 'improving') reasonCodes.push('predictive_improvement_bonus');
   if (volatility > 0.85) reasonCodes.push('latency_volatility_guard');
@@ -234,7 +248,7 @@ export function buildAdaptiveProtocolPlan(args: {
     transports: [...new Set(ladder.map(x => x.p.transport))],
     securities: [...new Set(ladder.map(x => x.p.security))],
   };
-  const fingerprint = hash32(JSON.stringify({ v: '2.8-consensus-mesh-v1', strategy, selected: selectedId, ladder: ladder.map(x => x.p.id), diversity, riskyFamilies, net: net?.state ?? 'unknown' }));
+  const fingerprint = hash32(JSON.stringify({ v: '2.12-regime-mesh-v1', strategy, selected: selectedId, ladder: ladder.map(x => x.p.id), diversity, riskyFamilies, net: net?.state ?? 'unknown', regime: regime?.state ?? 'stable' }));
 
   let mode: AdaptiveProtocolPlan['mode'] = 'normal';
   if (!selected) mode = 'no_healthy_path';
@@ -242,7 +256,7 @@ export function buildAdaptiveProtocolPlan(args: {
   else if (confidence < 0.55 || selected.score < 55) mode = 'degraded';
 
   return {
-    version: '2.8-consensus-mesh-v1',
+    version: '2.12-regime-mesh-v1',
     selected: selectedId,
     fallbackLadder: ladder.map(x => x.p.id),
     confidence: Math.round(confidence * 100) / 100,
@@ -261,5 +275,7 @@ export function buildAdaptiveProtocolPlan(args: {
     signalAgreement: Math.round(signalAgreement * 100) / 100,
     switchRisk: Math.round(switchRisk * 100) / 100,
     fusionMode,
+    regimeState: regime?.state ?? 'stable',
+    regimeConfidence: regime ? Math.round(regime.confidence * 100) / 100 : 0,
   };
 }

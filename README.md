@@ -1,4 +1,22 @@
-# Gozargah 2.11.0 — AEAD, DNS64 & Evidence-Scoped Adaptation
+# Gozargah 2.12.0 — Dynamic Intelligence, Rotating Paths & Emergency Ladder
+
+## 2.12.0 — Fully dynamic adaptive layer
+
+### Highlights
+- **Internal AI regime detection** (`src/ai/regime.ts`): a bounded, deterministic change-point detector (dual-timescale windows + step-change rule + one-sided CUSUM) over the aggregate probe/dial outcome stream. A suspected regime change automatically upgrades the protocol controller from `stable` to `diversify` so the emitted fallback ladder spans more transport/protocol families. States are `stable | watch | suspected_change | recovering` with confidence and reason codes; persisted in D1 and audited via the `network_regime_changed` event.
+- **Dynamic rotating WebSocket path**: every generated link uses a deterministic 6-hour-rotating path base (`/<uuid>/g/<16hex>`). The Worker accepts any path, so previous windows stay valid — installed clients are never stranded — while static path fingerprints go stale each window. All client formats (raw, Base64, Clash-Meta, Sing-box, Xray-core) rotate at generation time.
+- **Emergency entry ladder**: up to four `backupEntryHosts` (other domains pointing at the same Worker) configured in the panel. The scheduled health loop probes them on 443; the live bundle publishes `emergency_ladder` with measured status and an explicit honest-limit statement; every client format emits same-credentials outbounds for the backup hosts (Xray-core joins the `auto-best` balancer so its observatory probes reachability); the user status page lists per-host tokens/links and shows an honest network alert in `recovery`/`no_healthy_path`.
+- **Read-only advisor extended**: the optional Workers AI advisor now receives `regimeState`, `regimeConfidence` and `backupEntryCount` (aggregate only) and is explicitly instructed not to interpret the regime label as DPI detection; local rule-based advice gains honest regime/backup notes.
+- **Panel**: `/api/network/state` returns the regime label and configured backup entries; the settings form gains the backup-entry field (fa/en).
+
+### Honest platform boundary (unchanged, restated)
+The regime label is aggregate statistics — not a DPI classifier, not a censorship proof; no payload is inspected and no bypass is guaranteed. Rotating paths and entry diversity raise the odds a route survives a partial block or outage. The emergency ladder only helps while at least one entry point (primary or backup domain) is still reachable from the client network: if no route to the Worker/Cloudflare edge remains, no Worker code can create a new route remotely. Shadowsocks remains TCP-only `aes-256-gcm`/SIP004 over WebSocket, VLESS UDP remains DNS-only on port 53, and DNS64 still requires a reachable NAT64 translator.
+
+### Engineering documents
+- [Test Report 2.12.0](TEST-REPORT-2.12.0.md)
+- [Persian Upgrade Report 2.12.0](UPGRADE-REPORT-FA-2.12.0.md)
+- [Adaptive Engine](ADAPTIVE-ENGINE.md)
+- [AI Engine and limits](AI-ENGINE.md)
 
 ## 2.11.0 — Protocol and DNS data-plane additions
 
@@ -76,7 +94,7 @@ New endpoints:
 
 **گذرگاه** یک پنل پروکسی چندکاربرهٔ کامل است که به‌صورت بومی روی Cloudflare Workers زندگی می‌کند: یک فایل جاوااسکریپت که همه‌چیز داخلش تعبیه شده — پنل مدیریت، موتور پروکسی، اشتراک‌ساز، صفحهٔ وضعیت کاربر و تمام دارایی‌های رابط کاربری. نه سرور می‌خواهد، نه نصب، نه هزینه؛ یک اکانت رایگان کلودفلر و پنج دقیقه وقت کافی است تا یک پنل کامل با دیتابیس اختصاصی، داشبورد فارسی/انگلیسی و لینک اشتراک برای هر کاربر داشته باشید.
 
-طراحی گذرگاه از روز اول با سه قاعده پیش رفته: **امنیت واقعی به‌جای نمایشی**، **حسابداری دقیق به‌جای تخمین**، و **تصمیم‌گیری محلیِ قابل‌توضیح**. قابلیت‌های قدیمی‌تر مانند پریست اپراتورها، کانفیگ تطبیقی و صفحهٔ وضعیت حفظ شده‌اند. در نسخهٔ **2.11.0**، Shadowsocks AEAD روی WebSocket/TLS، DNS-over-HTTPS احراز هویت‌شده، فوروارد DNS از VLESS UDP پورت ۵۳ و DNS64 اضافه شده‌اند. این قابلیت‌ها مرزهای واقعی Worker را تغییر نمی‌دهند: UDP عمومی و NAT64 gateway ارائه نمی‌شود و هیچ مدل AI نمی‌تواند مسیر شبکه‌ای ازدست‌رفته یا عبور تضمینی از DPI ایجاد کند.
+طراحی گذرگاه از روز اول با سه قاعده پیش رفته: **امنیت واقعی به‌جای نمایشی**، **حسابداری دقیق به‌جای تخمین**، و **تصمیم‌گیری محلیِ قابل‌توضیح**. قابلیت‌های قدیمی‌تر مانند پریست اپراتورها، کانفیگ تطبیقی و صفحهٔ وضعیت حفظ شده‌اند. در نسخهٔ **2.12.0**، لایهٔ داینامیک و پویا اضافه شده: تشخیص تغییر رژیم با هوش مصنوعی داخلی (آمار تجمیعی، بدون payload)، مسیر چرخشی WebSocket هر ۶ ساعت، و پلهٔ اضطراری نقاط ورود جایگزین — که در قطع‌های موضعی شانس بقای مسیر را بالا می‌برند اما قطع کامل مسیر را از راه دور رفع نمی‌کنند. در نسخهٔ **2.11.0**، Shadowsocks AEAD روی WebSocket/TLS، DNS-over-HTTPS احراز هویت‌شده، فوروارد DNS از VLESS UDP پورت ۵۳ و DNS64 اضافه شده‌اند. این قابلیت‌ها مرزهای واقعی Worker را تغییر نمی‌دهند: UDP عمومی و NAT64 gateway ارائه نمی‌شود و هیچ مدل AI نمی‌تواند مسیر شبکه‌ای ازدست‌رفته یا عبور تضمینی از DPI ایجاد کند.
 
 ## ✨ چرا گذرگاه؟
 
@@ -338,6 +356,9 @@ npm run build        # اعتبارسنجی و باندل Worker با Wrangler 4
 - [x] ECH به‌صورت opt-in در فرمت‌های پشتیبانی‌شده — v1.2
 - [x] Shadowsocks AEAD به‌عنوان پروتکل سوم (SIP004 AES-256-GCM + v2ray-plugin) — 2.11
 - [x] فوروارد DNS با VLESS UDP روی پورت ۵۳، DoH و DNS64 — 2.11
+- [x] هوش مصنوعی داخلیِ تشخیص تغییر رژیم + استراتژی پویای diversify — 2.12
+- [x] مسیر چرخشی deterministicِ WebSocket (هر ۶ ساعت، سازگار با عقب) — 2.12
+- [x] پلهٔ اضطراری: نقاط ورود جایگزین با پروب سلامت و آوتباند در همهٔ قالب‌ها — 2.12
 
 ## 📄 لایسنس
 
@@ -361,7 +382,7 @@ MIT — آزاد برای استفاده، تغییر و توسعه. جزئیا�
 - The classifier is observational and does not claim to prove DPI or an international outage.
 
 
-## Protocol capability matrix (current: 2.11.0)
+## Protocol capability matrix (current: 2.12.0)
 
 Every protocol/transport pair is returned with an explicit boundary: `WORKER_NATIVE`, `ORIGIN_ENGINE_REQUIRED`, or `UNSUPPORTED`. The matrix is conservative: a profile is `ready` only if this repository has a matching generator. `ORIGIN_ENGINE_HOST` is a declaration, not a remote validation or health check. VLESS/Trojan WebSocket and Shadowsocks AEAD WebSocket profiles are Worker-native; Shadowsocks uses the v2ray-plugin and is TCP-only. UDP-only WireGuard/Hysteria2, generic Shadowsocks UDP, generic HTTP proxying, and unimplemented transports remain `UNSUPPORTED`. Separately, VLESS UDP is supported only for DNS destination port 53 via the DoH adapter; it is not a generic UDP capability.
 
