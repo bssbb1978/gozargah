@@ -146,6 +146,9 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
     reconnect: {
       strategy: 'observe_and_failover',
       probe_interval_ms: 90_000,
+      // 2.17 — width (ms) of the per-client uniform offset (deterministic
+      // per UUID) the client adds to the probe cadence; 0 = fleet-synchronized.
+      probe_jitter_ms: 0,
       backoff_ms: [1000, 2000, 5000, 15000, 30000],
       on_route_reopen: 'immediate_resume',
     },
@@ -199,6 +202,12 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
         (out.reconnect as Record<string, unknown>).probe_interval_ms = Math.min(pressure.probeIntervalMs, 30_000);
         (out.flow_profile as Record<string, unknown>).mode = 'video';
       }
+      // 2.17 — probe de-synchronization: fleet-wide phase-locked probing is
+      // itself a visible fingerprint, so each client offsets its cadence by
+      // a uniform draw (deterministic per UUID) within this width. Kept
+      // <= the applied interval (at most one cycle wide).
+      const appliedInterval = (out.reconnect as Record<string, unknown>).probe_interval_ms as number;
+      (out.reconnect as Record<string, unknown>).probe_jitter_ms = Math.min(pressure.probeJitterMs, appliedInterval);
       if (signal) {
         try {
           const sig = JSON.parse(signal.stateJson) as Record<string, unknown>;
@@ -273,7 +282,9 @@ export function frontingHint(raw: string | undefined): string {
  * entries (host:role, sorted), clean_ip_hints, fronting_hint,
  * flow_profile.mode, reconnect.probe_interval_ms. Deliberately NOT
  * covered: generated_at (time-dependent), honest_limit (display text),
- * regime/network_state (server intelligence the client only observes).
+ * regime/network_state (server intelligence the client only observes),
+ * reconnect.probe_jitter_ms (advisory de-sync width — tampering with it
+ * is harmless, so it rides outside the signature like backoff_ms).
  */
 export function manifestCanonical(out: Record<string, unknown>): string {
   const str = (v: unknown): string => (typeof v === 'string' ? v : '');

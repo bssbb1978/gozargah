@@ -469,6 +469,7 @@ describe('Cloudflare Worker + D1 integration', () => {
     expect(m.pressure.reasons).toContain('canary_fleet_failures');
     // Dynamic levers: faster probes + highest-entropy outflow profile.
     expect(m.reconnect.probe_interval_ms).toBe(15_000);
+    expect(m.reconnect.probe_jitter_ms).toBe(15_000); // one-cycle de-sync width
     expect(m.flow_profile.mode).toBe('video');
     // The canary host is NOT in the manifest (env not configured here) and
     // the signature still verifies over the (now higher) pressure dynamics.

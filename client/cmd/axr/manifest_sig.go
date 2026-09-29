@@ -47,6 +47,11 @@ type manifestV3 struct {
 	} `json:"flow_profile"`
 	Reconnect struct {
 		ProbeIntervalMS float64 `json:"probe_interval_ms"`
+		// 2.17 — width (ms) of the per-client uniform probe-cadence offset
+		// (deterministic per UUID) — fleet de-synchronization. Advisory:
+		// deliberately OUTSIDE the canonical (like backoff_ms); tampering
+		// with it is harmless.
+		ProbeJitterMS float64 `json:"probe_jitter_ms"`
 	} `json:"reconnect"`
 	ManifestSig string `json:"manifest_sig"`
 	// 2.17 — canary liveness target (convenience mirror; the authoritative

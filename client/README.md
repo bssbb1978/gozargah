@@ -134,6 +134,14 @@ international entries (priority 50 → 10, and to 0 under a full cut) — so
 during a net-e-melli window the core spends its budget on the domestic
 route instead of the dead international one, automatically.
 
+**Probe de-synchronization (2.17):** fleet-wide phase-locked probing is
+itself a fingerprint, so the pressure engine also emits a jitter WIDTH
+(`reconnect.probe_jitter_ms`: 0/5/10/15 s at levels 0–3, advisory —
+outside the HMAC canonical like `backoff_ms`). The core draws its OWN
+offset once, deterministically from its UUID (FNV-32a → uniform in
+`[0, width]`, stable across restarts, decorrelated across the fleet) and
+adds it to every probe cadence (normal and aggressive).
+
 ## Scan subcommand (2.16)
 
 `axr scan` is the client-side clean-Cloudflare-edge scanner (the Rust

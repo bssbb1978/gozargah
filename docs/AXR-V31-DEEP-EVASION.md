@@ -125,12 +125,20 @@ fraction over the last 30 min (3-sample floor), canary age, harvest age
 with no canary/harvest yet stays at level 0), and the aggregate regime
 label.
 
-| Level | Rule | probe cadence | flow profile | backup entries |
-| --- | --- | --- | --- | --- |
-| 0 baseline | none | 90 s | web | 4 |
-| 1 watch | regime watch OR canary configured-but-stale > 30 min | 60 s | chat | 4 |
-| 2 elevated | regime step-change OR harvest stale > 6 h | 30 s | video | 6 |
-| 3 critical | fleet canary fail-fraction ≥ 50 % (recent) | 15 s | video | 6 |
+| Level | Rule | probe cadence | probe jitter | flow profile | backup entries |
+| --- | --- | --- | --- | --- | --- |
+| 0 baseline | none | 90 s | 0 ms | web | 4 |
+| 1 watch | regime watch OR canary configured-but-stale > 30 min | 60 s | 5 s | chat | 4 |
+| 2 elevated | regime step-change OR harvest stale > 6 h | 30 s | 10 s | video | 6 |
+| 3 critical | fleet canary fail-fraction ≥ 50 % (recent) | 15 s | 15 s | video | 6 |
+
+The **probe jitter** is the width of a uniform offset each client adds to
+its probe cadence, drawn deterministically from its own UUID (stable
+across restarts, decorrelated across the fleet) — fleet-wide phase-locked
+probing is itself a visible fingerprint, so the width grows with pressure
+(at critical, a 15 s offset fully decorrelates a 15 s cadence). The width
+rides in `reconnect.probe_jitter_ms`, deliberately outside the canonical
+(advisory, like `backoff_ms` — tampering is harmless).
 
 The manifest's `path_rotation_minutes` stays the **real** deterministic
 window — the manifest never advertises a rotation faster than the path
@@ -199,18 +207,20 @@ manifest wiring, HMAC coverage of the canary entry; integration: canary
 harvest auth/shape, fleet-failure → level 3 → dynamic levers, signature
 still verifies).
 
-Go (deploy gate — the authoring sandbox has no Go toolchain; run before
-any distribution):
+Go (deploy gate — the authoring sandbox has no Go toolchain; the CI
+workflow below is the live gate, and the same commands run before any
+distribution):
 
 ```sh
 cd client
-go vet ./...
+go vet ./... && go vet -tags axr_utls ./...
 go build ./...
-go test -race ./...          # full suite (109 test fns): bandit (20),
-                             # netstate (7), surgery (14), flowprofile (15),
-                             # cfscan (7), measure (10), failover (14),
-                             # sockopt (4), vlessws (12),
-                             # cmd/axr (6, manifest HMAC vector)
+go test -race -count=1 -tags axr_utls ./...   # production uTLS identity
+go test -race -count=1 ./...                  # stdlib-TLS variant
+# full suite (110 test fns): bandit (20), netstate (7), surgery (14),
+# flowprofile (15), cfscan (7), measure (11, incl. the concurrent
+# Feed/Vector race regression), failover (14), sockopt (4), vlessws (12),
+# cmd/axr (6, manifest HMAC vector)
 
 # cross-compile matrix (full details in docs/AXR-DEPLOY.md)
 GOOS=linux   GOARCH=amd64 go build -tags axr_utls -o axr-linux-amd64   ./cmd/axr
@@ -220,6 +230,16 @@ GOOS=darwin  GOARCH=amd64 go build -tags axr_utls -o axr-darwin-amd64  ./cmd/axr
 GOOS=windows GOARCH=amd64 go build -tags axr_utls -o axr-windows-amd64.exe ./cmd/axr
 GOOS=windows GOARCH=arm64 go build -tags axr_utls -o axr-windows-arm64.exe ./cmd/axr
 ```
+
+**Automated gate (CI):** `.github/workflows/ci-v31.yml` — two job suites:
+(A) Go client matrix (ubuntu → linux/amd64+arm64+android/arm64 with the
+official NDK r26b toolchain path; macos → darwin/arm64+amd64; windows →
+amd64) with `go mod verify`, `go vet` + `staticcheck` on BOTH TLS
+identities (default stdlib / `-tags axr_utls` production uTLS),
+`go test -race -count=1` on the native arch, and stripped
+(`-s -w -trimpath`) cross-builds; (B) Worker (Node 20 + npm cache, tsc,
+engine, integration, wrangler bundle). Full matrix, local CLI and the
+self-healing race-fix protocol: `docs/CI-EXECUTION-CHECKLIST.md`.
 
 ---
 

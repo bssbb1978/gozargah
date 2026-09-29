@@ -29,6 +29,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"math/big"
@@ -224,6 +225,11 @@ type server struct {
 	canaryHost   string             // manifest canary host ("" = disabled)
 	canaryInt    time.Duration      // canary probe cadence
 	flowFloor    int                // manifest flow-profile floor (Rank units)
+	// probeJitterOffset: the per-client deterministic draw (UUID-derived,
+	// uniform in [0, probe_jitter_ms]) added to every probe cadence —
+	// fleet de-synchronization (2.17). Written once during manifest
+	// bootstrap (before any goroutine starts), read by the probe loop.
+	probeJitterOffset time.Duration
 
 	// churnMu guards the last-good dial-address pair (entry-churn feature).
 	churnMu      sync.Mutex
@@ -453,6 +459,16 @@ func (s *server) refreshManifest() {
 	if p := m.Reconnect.ProbeIntervalMS; p >= 15_000 && p <= 90_000 {
 		s.probeInt[1] = time.Duration(p) * time.Millisecond
 	}
+	// 2.17 — probe de-synchronization: the manifest carries the uniform
+	// offset WIDTH (wider under pressure); the client draws ITS OWN offset
+	// deterministically from the UUID — stable across restarts, uniform in
+	// [0, width], decorrelated across the fleet (phase-locked probing is
+	// itself a fingerprint).
+	if j := m.Reconnect.ProbeJitterMS; j >= 0 && j <= 30_000 {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(s.cfg.UUID))
+		s.probeJitterOffset = time.Duration(j) * time.Duration(h.Sum32()%1024) / 1024
+	}
 	s.flowFloor = flowprofile.Rank(flowprofile.ProfileID(m.FlowProfile.Mode))
 	// 2.17 — canary liveness target (authoritative source: the signed
 	// entries field; this pointer is the convenience mirror).
@@ -633,6 +649,9 @@ func (s *server) startProbes() {
 			if s.failover.State() == failover.StateAggressive || s.netstate.IsStressed() {
 				interval = s.probeInt[1]
 			}
+			// 2.17 — per-client de-sync offset (UUID-derived, set at
+			// bootstrap; 0 when the manifest carries no jitter width).
+			interval += s.probeJitterOffset
 			time.Sleep(interval)
 			healthy := s.failover.ProbeRound(time.Now())
 			mode := s.failover.State()

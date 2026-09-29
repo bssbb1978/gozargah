@@ -2,6 +2,7 @@ package measure
 
 import (
 	"math"
+	"sync"
 	"testing"
 )
 
@@ -166,5 +167,45 @@ func TestWindowSlides(t *testing.T) {
 	v := tr.Vector()
 	if v.DropRate != 0 {
 		t.Fatalf("sliding window should have forgotten the failures, drop=%v", v.DropRate)
+	}
+}
+
+// 2.17 CI — the per-entry Tracker is shared across tunnel goroutines
+// (trackerFor hands out the same *Tracker for one host while several
+// SOCKS connections pump at once). Concurrent Feed + Vector must be
+// race-free; this is what `go test -race` verifies in the CI matrix.
+func TestConcurrentFeedVector(t *testing.T) {
+	tr := NewTracker()
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				tr.Feed(Sample{
+					OK:         (i+g)%3 != 0,
+					RTTMS:      float64(50 + i%50),
+					Throughput: 1_000_000,
+					ErrClass:   ErrRST,
+					Transport:  "ws",
+					UnixMS:     int64(i),
+				})
+			}
+		}(g)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			v := tr.Vector()
+			if v.Observations < 0 || v.Observations > windowSize {
+				t.Errorf("Vector(): observations %d outside [0,%d]", v.Observations, windowSize)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	if v := tr.Vector(); v.Observations != windowSize {
+		t.Fatalf("window should be full after 1600 feeds, got %d observations", v.Observations)
 	}
 }

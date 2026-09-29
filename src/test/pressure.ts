@@ -75,6 +75,24 @@ async function main() {
     assert.equal(p.flowProfile, 'chat');
   });
 
+  await ok('probe jitter widens with pressure and is always <= interval (de-sync)', () => {
+    // Per-client uniform offset width: 0 (synchronized) at baseline up to a
+    // full cycle at critical — fleet phase-locking is itself a fingerprint.
+    const at = (failFrac: number | null, regime: string) =>
+      assessPressure({ canaryConfigured: true, canaryFailFrac: failFrac, canaryAgeMin: 1, harvestAgeMin: 5, regimeState: regime });
+    const b = at(null, 'stable');
+    const w = at(null, 'watch');
+    const e = at(null, 'suspected_change');
+    const c = at(0.67, 'stable');
+    assert.equal(b.probeJitterMs, 0);
+    assert.equal(w.probeJitterMs, 5_000);
+    assert.equal(e.probeJitterMs, 10_000);
+    assert.equal(c.probeJitterMs, 15_000);
+    for (const p of [b, w, e, c]) {
+      assert.ok(p.probeJitterMs <= p.probeIntervalMs, `jitter ${p.probeJitterMs} <= interval ${p.probeIntervalMs}`);
+    }
+  });
+
   await ok('canary failure dominates a stale harvest (level = max, not sum)', () => {
     // Two independent level-2/3 signals: level is the MAX (3), not a sum.
     const p = assessPressure({ canaryConfigured: true, canaryFailFrac: 0.5, canaryAgeMin: 0, harvestAgeMin: 900, regimeState: 'stable' });
@@ -154,6 +172,7 @@ async function main() {
       'host.example.com', USER, {} as never, 'token-xyz',
     )) as Record<string, any>;
     assert.equal(manifest.reconnect.probe_interval_ms, 90_000);
+    assert.equal(manifest.reconnect.probe_jitter_ms, 0); // baseline = fleet-synchronized
     assert.equal(manifest.flow_profile.mode, 'web');
   });
 

@@ -18,6 +18,7 @@ package measure
 import (
 	"fmt"
 	"math"
+	"sync"
 )
 
 const (
@@ -90,8 +91,13 @@ type obs struct {
 	tr   string
 }
 
-// Tracker is the sliding-window state machine.
+// Tracker is the sliding-window state machine. Safe for concurrent use:
+// Feed may run from several tunnel goroutines at once (per-entry trackers
+// are shared), and Vector reads the same window — all state lives behind
+// the mutex.
 type Tracker struct {
+	mu sync.Mutex
+
 	win  []obs
 	head int
 	full bool
@@ -114,6 +120,13 @@ func NewTracker() *Tracker { return &Tracker{} }
 
 // Feed records one observation.
 func (t *Tracker) Feed(s Sample) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.feedLocked(s)
+}
+
+// feedLocked records one observation (caller holds t.mu).
+func (t *Tracker) feedLocked(s Sample) {
 	o := obs{ok: s.OK, tr: s.Transport}
 	if !s.OK {
 		switch s.ErrClass {
@@ -197,6 +210,13 @@ func boolFloat(b bool) float64 {
 
 // Vector computes the current state vector + regime label.
 func (t *Tracker) Vector() Vector {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.vectorLocked()
+}
+
+// vectorLocked computes the vector under t.mu (Feed cannot interleave).
+func (t *Tracker) vectorLocked() Vector {
 	n := t.windowN()
 	v := Vector{Observations: n}
 	if n == 0 {

@@ -145,6 +145,14 @@ performed.
 - **No Go compilation, `go vet`, or `go test -race` execution** in the
   authoring sandbox (no toolchain). The Go core is a **deliverable, not a
   verified build** — the deploy gate is mandatory before distribution.
+  Since this round the gate is automated: `.github/workflows/ci-v31.yml`
+  runs `go mod verify` + `go vet` + `staticcheck` (both TLS identities),
+  `go test -race -count=1` on the native arch, stripped cross-builds for
+  linux/amd64+arm64, darwin/arm64+amd64, windows/amd64, and the Android
+  NDK arm64 toolchain path, plus the full Worker suite (matrix details:
+  `docs/CI-EXECUTION-CHECKLIST.md`). The first CI run is the authoritative
+  Go verification; failures are fixed under the documented
+  race-fix-never-suppress protocol.
 - **No live Cloudflare deployment** and no real net-e-melli window
   exercised; the canary/pressure loop is verified end-to-end against
   Miniflare D1 with synthetic reports, and the netstate/ensemble behavior
