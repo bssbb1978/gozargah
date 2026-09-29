@@ -333,6 +333,24 @@ job consumes them and:
 All four branches were exercised locally (missing leg → exit 1; failing leg →
 exit 1; arch mismatch → exit 1; cancelled → exit 0).
 
+### 3.3a Final state: the whole matrix is green
+
+Run `36633324894` (commit `375f8d9`) — **5/5 jobs success, zero annotations**:
+
+| job | result |
+|-----|--------|
+| Go client — ubuntu-24.04 → linux/amd64, linux/arm64, android/arm64 | success (incl. the NDK r26b CGO path) |
+| Go client — macos-15-intel → darwin/amd64 darwin/arm64 | success |
+| Go client — windows-latest → windows/amd64 | success |
+| Worker — Cloudflare edge relay | success |
+| Gate coverage — consolidated matrix report | success (4/4 attestations, native arch matched on every leg) |
+
+Getting there took three rounds of real runs, each of which found a genuine
+defect in the pipeline rather than a flake: the CRLF gofmt false positive, the
+attestation filename collision, and the worker's declared-vs-actual arch
+format mismatch. Every one of them is now regression-locked by an executed
+check (see 3.3b and 3.4).
+
 ### 3.3b Two real CI defects found by running it
 
 **Line endings.** Gate 1 passed on ubuntu and macos and failed on
@@ -343,6 +361,16 @@ the same file is clean as LF and flagged as CRLF. Fixed with a repository
 `.gitattributes` (`* text=auto eol=lf` plus explicit binary markers), which
 makes the gate platform-independent instead of runner-config-dependent:
 proved by cloning with `core.autocrlf=true` before and after.
+
+**The worker's arch declaration could never match.** With all four legs
+green, the consolidated gate still failed and said exactly why:
+`leg-without-clean-coverage: worker (ubuntu-24.04, node 22)`. The worker
+declared `node22/linux-x64` while its runner reported `linux-x64`, and the
+summary compares those fields for equality — a permanent, invisible mismatch
+that no amount of retrying could clear. Both are now written from one
+variable, the leg fails loudly if the runner reports anything else, and the
+local fixture uses the real values (it previously used the same string on
+both sides, which is precisely why the fixture passed while CI failed).
 
 **Attestation filenames.** The first full run had all four legs green and the
 consolidated gate red: `expected 4 gate attestations, found 2`, while the
