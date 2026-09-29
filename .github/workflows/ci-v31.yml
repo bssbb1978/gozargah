@@ -171,6 +171,7 @@ jobs:
         # family and publish the tail, so race reports / linker errors are
         # readable via check-run annotations even if log-zip fetch fails.
         if: failure()
+        working-directory: client
         shell: bash
         run: |
           out=$( { go vet ./...; go vet -tags axr_utls ./...; go test -race -count=1 -tags axr_utls ./...; go test -race -count=1 ./...; } 2>&1 | grep -vE "^(ok|---|===|PASS|FAIL\s+\[build\])" | tail -50 || true)

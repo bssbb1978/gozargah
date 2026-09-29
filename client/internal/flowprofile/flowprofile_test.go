@@ -14,7 +14,7 @@ func meanLength(t *testing.T, id ProfileID) float64 {
 	n := 5000
 	sum := 0
 	for i := 0; i < n; i++ {
-		sum += SampleLength(p, r, 1<<30) // huge remaining: unclamped histogram draw
+		sum += SampleLength(p, r.Float64, 1<<30) // huge remaining: unclamped histogram draw
 	}
 	return float64(sum) / float64(n)
 }
@@ -26,7 +26,7 @@ func meanIPD(t *testing.T, id ProfileID) time.Duration {
 	n := 5000
 	var sum time.Duration
 	for i := 0; i < n; i++ {
-		sum += SampleIPD(p, r)
+		sum += SampleIPD(p, r.Float64)
 	}
 	return sum / time.Duration(n)
 }
@@ -37,7 +37,7 @@ func TestSampleLengthBounds(t *testing.T) {
 		r := rand.New(rand.NewSource(7))
 		for i := 0; i < 2000; i++ {
 			n := 100 + r.Intn(1<<20)
-			v := SampleLength(p, r, n)
+			v := SampleLength(p, r.Float64, n)
 			if v < 1 || v > n {
 				t.Fatalf("%s: length %d out of [1, %d]", id, v, n)
 			}
@@ -67,7 +67,7 @@ func TestSampleIPDBoundsAndOrdering(t *testing.T) {
 		p := Get(id)
 		r := rand.New(rand.NewSource(11))
 		for i := 0; i < 2000; i++ {
-			d := SampleIPD(p, r)
+			d := SampleIPD(p, r.Float64)
 			if d < p.IPDMin || d > p.IPDMax {
 				t.Fatalf("%s: IPD %v outside [%v, %v]", id, d, p.IPDMin, p.IPDMax)
 			}
@@ -88,7 +88,7 @@ func TestSampleLengthDeterministicWithSeed(t *testing.T) {
 		r := rand.New(rand.NewSource(seed))
 		out := make([]int, 20)
 		for i := range out {
-			out[i] = SampleLength(p, r, 5000)
+			out[i] = SampleLength(p, r.Float64, 5000)
 		}
 		return out
 	}
@@ -133,7 +133,7 @@ func TestGetUnknownFallsBackToWeb(t *testing.T) {
 
 func TestSlicerNext(t *testing.T) {
 	r := rand.New(rand.NewSource(1))
-	s := NewSlicer(ProfileChat, r)
+	s := NewSlicer(ProfileChat, r.Float64)
 	for i := 0; i < 500; i++ {
 		n := 100 + r.Intn(10000)
 		size, gap := s.Next(n)

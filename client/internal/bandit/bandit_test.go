@@ -66,7 +66,8 @@ func TestInvertRoundTrip(t *testing.T) {
 	for j := 0; j < dim; j++ {
 		var ej vec
 		ej[j] = 1
-		got := m.matVec(&inv.matVec(&ej))
+		mid := inv.matVec(&ej)
+		got := m.matVec(&mid)
 		for i := 0; i < dim; i++ {
 			want := 0.0
 			if i == j {

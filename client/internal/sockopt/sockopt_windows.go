@@ -16,12 +16,15 @@ func rawControl(conn net.Conn, fn func(fd uintptr) error) error {
 	if err != nil {
 		return err
 	}
-	if cerr := rc.Control(func(fd uintptr) error {
-		return fn(fd)
+	var serr error
+	// Control runs the closure on a dedicated thread with the fd valid;
+	// the callback returns no error — capture it into serr.
+	if cerr := rc.Control(func(fd uintptr) {
+		serr = fn(fd)
 	}); cerr != nil {
 		return cerr
 	}
-	return nil
+	return serr
 }
 
 func setNoNagle(conn net.Conn) error {

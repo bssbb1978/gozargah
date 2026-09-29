@@ -274,7 +274,7 @@ func PlanCuts(n, cuts int, lo, hi float64, rng Rng) []int {
 				break
 			}
 			for _, q := range pts {
-				if abs(p-q) < minSegBytes {
+				if abs(p, q) < minSegBytes {
 					ok = false
 					break
 				}

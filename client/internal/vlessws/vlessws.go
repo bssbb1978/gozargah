@@ -310,7 +310,7 @@ func DialConn(ctx context.Context, conn net.Conn, opts DialOptions) (*Client, er
 
 // Close closes the tunnel (best-effort WS close frame first).
 func (c *Client) Close() error {
-	_ = c.SendControl(opClose, []byte{1000, 0})
+	_ = c.SendControl(opClose, []byte{0x03, 0xE8}) // close code 1000, big-endian
 	return c.conn.Close()
 }
 
@@ -421,17 +421,28 @@ func (c *Client) readFrame() (byte, []byte, error) {
 	return opcode, payload, nil
 }
 
+func readBytes(r io.ByteReader, e []byte) error {
+	for i := range e {
+		c, err := r.ReadByte()
+		if err != nil {
+			return err
+		}
+		e[i] = c
+	}
+	return nil
+}
+
 func extLen(r io.ByteReader, b byte) (int, error) {
 	switch b {
 	case 126:
 		var e [2]byte
-		if _, err := io.ReadFull(r, e[:]); err != nil {
+		if err := readBytes(r, e[:]); err != nil {
 			return 0, err
 		}
 		return int(binary.BigEndian.Uint16(e[:])), nil
 	case 127:
 		var e [8]byte
-		if _, err := io.ReadFull(r, e[:]); err != nil {
+		if err := readBytes(r, e[:]); err != nil {
 			return 0, err
 		}
 		return int(binary.BigEndian.Uint64(e[:])), nil

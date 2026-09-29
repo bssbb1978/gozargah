@@ -210,7 +210,7 @@ func TestPolicyTable(t *testing.T) {
 		p := c.r.Policy()
 		if p.Fronting != c.front || p.Primary != c.primary || p.Backup != c.backup || p.Aggressive != c.aggr {
 			t.Errorf("policy(%s) = %+v, want {Fronting:%d Primary:%d Backup:%d Aggressive:%v}",
-				c.r, p, c.front, c.primary, c.Backup, c.aggr)
+				c.r, p, c.front, c.primary, c.backup, c.aggr)
 		}
 	}
 }
