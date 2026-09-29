@@ -1,0 +1,11 @@
+Gozargah 2.9.0 — Verified Capability Boundaries
+
+Core: explicit protocol/transport/security matrix tied to actual profile generators.
+Changed: src/protocols/catalog.ts, src/protocols/policy.ts, src/subscription.ts, src/test/protocol-catalog.ts, src/test/engine.ts, scripts/test.mjs.
+Behavior: native Worker profiles remain VLESS/Trojan over WebSocket; origin templates are transport-allowlisted and marked declared-not-tested; metadata-only UDP/WireGuard/Hysteria2/Shadowsocks/HTTP claims are removed.
+API: no new routes; existing capabilities/policy/adaptive manifest schemas report stricter capability boundaries.
+D1 schema: 14; no migration required.
+Tests: TypeScript typecheck PASS; engine + predictive + capability + controller tests PASS; Worker/D1 integration 11/11 PASS; Cloudflare dry-run build PASS; npm audit PASS (0 vulnerabilities).
+Production deployment / live origin validation: NOT RUN.
+Known limits: Worker has no raw inbound TCP/UDP; origin profiles need a deployed compatible engine; Worker-egress probes do not measure a client ISP; complete upstream disconnection cannot be bypassed by software.
+Version: 2.9.0

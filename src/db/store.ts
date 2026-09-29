@@ -418,7 +418,8 @@ export async function saveProfileHealth(db: D1Database, row: ProfileHealthRow): 
 
 
 
-export interface HealthSampleRow { kind: 'path' | 'profile'; subjectId: string; ts: number; ok: boolean; latencyMs: number | null; }
+export type HealthSampleKind = 'path' | 'profile' | 'path_tcp' | 'path_dial' | 'path_https';
+export interface HealthSampleRow { kind: HealthSampleKind; subjectId: string; ts: number; ok: boolean; latencyMs: number | null; }
 
 export async function saveHealthSample(db: D1Database, row: HealthSampleRow): Promise<void> {
   await ensureSchema(db);
@@ -429,8 +430,41 @@ export async function saveHealthSample(db: D1Database, row: HealthSampleRow): Pr
 export async function loadHealthSamples(db: D1Database, kind: 'path' | 'profile', subjectId: string, limit = 24): Promise<Array<{ ts:number; ok:boolean; latencyMs:number|null }>> {
   await ensureSchema(db);
   const n = Math.max(1, Math.min(48, limit));
-  const res = await db.prepare('SELECT ts, ok, latency_ms FROM health_samples WHERE kind = ?1 AND subject_id = ?2 ORDER BY ts DESC LIMIT ' + String(n)).bind(kind,subjectId).all<{ts:number;ok:number;latency_ms:number|null}>();
+  const kinds = kind === 'path' ? ['path', 'path_tcp', 'path_dial', 'path_https'] : ['profile'];
+  const placeholders = kinds.map((_, index) => '?' + String(index + 1)).join(',');
+  const statement = 'SELECT ts, ok, latency_ms FROM health_samples WHERE kind IN (' + placeholders + ') AND subject_id = ?' + String(kinds.length + 1) + ' ORDER BY ts DESC LIMIT ' + String(n);
+  const res = await db.prepare(statement).bind(...kinds, subjectId).all<{ts:number;ok:number;latency_ms:number|null}>();
   return (res.results ?? []).reverse().map(r => ({ ts:r.ts, ok:r.ok === 1, latencyMs:r.latency_ms }));
+}
+
+export interface LatestPathSample {
+  kind: Exclude<HealthSampleKind, 'profile'>;
+  subjectId: string;
+  ts: number;
+  ok: boolean;
+  latencyMs: number | null;
+}
+
+/** One bounded D1 query: at most one recent observation per source and configured endpoint. */
+export async function loadLatestPathSamples(db: D1Database, subjectIds: string[]): Promise<LatestPathSample[]> {
+  await ensureSchema(db);
+  const ids = [...new Set(subjectIds)].filter(Boolean).slice(0, 32);
+  if (!ids.length) return [];
+  const placeholders = ids.map((_, index) => '?' + String(index + 1)).join(',');
+  const sql = `SELECT kind, subject_id, ts, ok, latency_ms FROM (
+    SELECT kind, subject_id, ts, ok, latency_ms,
+      ROW_NUMBER() OVER (PARTITION BY kind, subject_id ORDER BY ts DESC) AS rank
+    FROM health_samples
+    WHERE kind IN ('path', 'path_tcp', 'path_dial', 'path_https') AND subject_id IN (${placeholders})
+  ) WHERE rank = 1`;
+  const result = await db.prepare(sql).bind(...ids).all<{kind: LatestPathSample['kind'];subject_id:string;ts:number;ok:number;latency_ms:number|null}>();
+  return (result.results ?? []).map((row) => ({
+    kind: row.kind,
+    subjectId: row.subject_id,
+    ts: row.ts,
+    ok: row.ok === 1,
+    latencyMs: row.latency_ms,
+  }));
 }
 
 export interface PredictiveStateRow { kind:'path'|'profile'; subjectId:string; stateJson:string; updatedAt:number; }

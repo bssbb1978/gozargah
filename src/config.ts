@@ -2,7 +2,7 @@
  * Gozargah — global config, types and shared errors.
  */
 
-export const VERSION = '2.8.0';
+export const VERSION = '2.10.0';
 export const SCHEMA_VERSION = 14;
 
 /** D1 binding name (see wrangler.toml) */

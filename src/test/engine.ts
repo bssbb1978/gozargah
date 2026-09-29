@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict';
 import {
-  buildBase64, buildClashYaml, buildLinks, buildSingBoxJson, buildXrayJson,
+  buildAdaptiveClientBundle, buildBase64, buildClashYaml, buildLinks, buildProtocolMatrix, buildSingBoxJson, buildXrayJson,
   isBrowserUa, renderSub, resolveApp, sniffApp, subHeaders,
 } from '../subscription';
 import { DEFAULT_FP, OPERATORS, TLS_PORTS, fpFor, opBranding, resolveOp, resolveOpts } from '../sub/operators';
@@ -162,6 +162,36 @@ async function main() {
     const sh = JSON.parse(buildXrayJson(HOST, USER, { opKey: 'shatel' }));
     assert.equal(sh.outbounds.length, 4);
     assert.ok(!JSON.stringify(sh).includes('fragment'));
+  });
+
+  await ok('capability matrix: exact profile generation, origin declaration, and UDP honesty', () => {
+    const native = buildProtocolMatrix({}, HOST);
+    assert.equal(native.capabilities.filter((x) => x.boundary === 'WORKER_NATIVE' && x.ready).length, 2);
+    const vlessXhttp = native.capabilities.find((x) => x.protocol === 'vless' && x.transport === 'xhttp');
+    assert.equal(vlessXhttp?.boundary, 'ORIGIN_ENGINE_REQUIRED');
+    assert.equal(vlessXhttp?.ready, false);
+    for (const protocol of ['wireguard', 'hysteria2']) {
+      const udp = native.capabilities.find((x) => x.protocol === protocol && x.transport === 'udp');
+      assert.equal(udp?.boundary, 'UNSUPPORTED');
+      assert.equal(udp?.ready, false);
+    }
+    const origin = { ORIGIN_ENGINE_HOST: 'origin.example', ORIGIN_ENGINE_TRANSPORTS: 'grpc' };
+    const matrix = buildProtocolMatrix(origin, HOST);
+    assert.equal(matrix.capabilities.find((x) => x.protocol === 'vless' && x.transport === 'grpc')?.deploymentValidation, 'declared-not-tested');
+    assert.equal(matrix.capabilities.find((x) => x.protocol === 'vless' && x.transport === 'xhttp')?.ready, false);
+    const bundle = JSON.parse(buildAdaptiveClientBundle(HOST, USER, {}, origin));
+    const templates = bundle.origin.protocol_templates as Record<string, unknown>;
+    assert.deepEqual(Object.keys(templates), ['vless_grpc']);
+    assert.equal(bundle.origin.engine_validation, 'declared_not_tested');
+    const invalidPort = buildProtocolMatrix({ ORIGIN_ENGINE_HOST: 'origin.example', ORIGIN_ENGINE_PORT: '70000' }, HOST);
+    assert.equal(invalidPort.origin.configured, false);
+    assert.equal(invalidPort.origin.validation, 'invalid_port');
+    assert.equal(invalidPort.capabilities.filter((x) => x.ready && x.mode === 'origin-engine').length, 0);
+    const invalidPortXray = JSON.parse(buildXrayJson(HOST, USER, {}, { ORIGIN_ENGINE_HOST: 'origin.example', ORIGIN_ENGINE_PORT: '0' }));
+    assert.ok(!(invalidPortXray.outbounds as Array<{ tag: string }>).some((x) => x.tag.startsWith('origin-')));
+    assert.ok(!JSON.stringify(templates).includes('wireguard'));
+    assert.ok(!JSON.stringify(templates).includes('hysteria2'));
+    assert.ok(!JSON.stringify(templates).includes('shadowsocks'));
   });
 
   /* ---------------- quota semantics ---------------- */

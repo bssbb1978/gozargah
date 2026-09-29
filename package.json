@@ -1,6 +1,6 @@
 {
   "name": "gozargah",
-  "version": "2.8.0",
+  "version": "2.10.0",
   "private": true,
   "description": "Gozargah - adaptive multi-protocol Cloudflare Worker panel with D1, local online learning, live protocol policy, self-healing, Bayesian/UCB local ensemble, canary rollback, failure-domain isolation and origin-engine orchestration",
   "main": "src/index.ts",
@@ -28,5 +28,9 @@
     "vite": "^8.3.1",
     "vitest": "^5.0.2",
     "wrangler": "^4.143.0"
+  },
+  "overrides": {
+    "undici": "^7.29.1",
+    "sharp": "^0.35.4"
   }
 }

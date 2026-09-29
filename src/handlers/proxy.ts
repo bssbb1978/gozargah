@@ -11,6 +11,7 @@ import { connect } from 'cloudflare:sockets';
 import { GzError } from '../config';
 import { withTimeout } from '../utils/crypto';
 import { glog } from '../utils/log';
+import { normalizeSocketFailure } from '../ai/network-intelligence';
 
 const DIAL_TIMEOUT_MS = 6000;
 
@@ -55,7 +56,7 @@ export async function dialWithFallback(
     } catch (e) {
       lastErr = e;
       const latencyMs = Date.now() - started;
-      try { onAttempt?.({ pathId: cand.split(':')[0], ok: false, latencyMs, error: String(e) }); } catch { /* telemetry is best effort */ }
+      try { onAttempt?.({ pathId: cand.split(':')[0], ok: false, latencyMs, error: normalizeSocketFailure(e) }); } catch { /* telemetry is best effort */ }
       try { sock?.close(); } catch { /* ignore */ }
     }
   }

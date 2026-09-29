@@ -1,33 +1,40 @@
 /**
- * Gozargah — test runner: bundles src/test/engine.ts with esbuild (so TS +
- * ESM deps resolve) and executes it under Node. Zero extra devDeps needed.
- *
- * Usage: npm test
+ * Bundle and run the repository's pure-logic test entrypoints with esbuild.
+ * The Worker/D1 integration suite runs separately through Vitest.
  */
 
 import { build } from 'esbuild';
 import { spawnSync } from 'node:child_process';
-import { writeFileSync, rmSync } from 'node:fs';
+import { rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const outfile = join(here, '.test-build.mjs');
+const root = join(here, '..');
+const entries = [
+  'engine',
+  'predictive-mesh',
+  'protocol-catalog',
+  'protocol-controller',
+  'network-intelligence',
+];
 
-await build({
-  entryPoints: [join(here, '..', 'src', 'test', 'engine.ts')],
-  bundle: true,
-  format: 'esm',
-  platform: 'node',
-  outfile,
-  logLevel: 'warning',
-  // qrcode uses node builtins (fs for the png renderer) — keep it external;
-  // node resolves it from node_modules at runtime (bundle lives in the repo).
-  external: ['qrcode'],
-});
-
-const res = spawnSync(process.execPath, [outfile], { stdio: 'inherit' });
-try { rmSync(outfile, { force: true }); } catch { /* ignore */ }
-process.exit(res.status ?? 1);
-
-// predictive mesh smoke test is run via src/test/predictive-mesh.ts
+for (const name of entries) {
+  const outfile = join(here, '.test-build.mjs');
+  try {
+    await build({
+      entryPoints: [join(root, 'src', 'test', name + '.ts')],
+      bundle: true,
+      format: 'esm',
+      platform: 'node',
+      outfile,
+      logLevel: 'warning',
+      external: ['qrcode'],
+    });
+    const result = spawnSync(process.execPath, [outfile], { stdio: 'inherit' });
+    if (result.status !== 0) process.exitCode = result.status ?? 1;
+  } finally {
+    try { rmSync(outfile, { force: true }); } catch { /* cleanup is best effort */ }
+  }
+  if (process.exitCode) process.exit(process.exitCode);
+}
