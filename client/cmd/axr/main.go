@@ -36,6 +36,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -210,8 +211,8 @@ type server struct {
 
 	mu       sync.Mutex
 	trackers map[string]*measure.Tracker // per-entry client state vector
-	pathBase string                       // rotated ws path base from the manifest
-	probeInt [2]time.Duration             // [normal, aggressive]
+	pathBase string                      // rotated ws path base from the manifest
+	probeInt [2]time.Duration            // [normal, aggressive]
 
 	// 2.16 — AXR-v3 state.
 	startedAt time.Time // session-age feature
@@ -232,6 +233,23 @@ type server struct {
 	// fleet de-synchronization (2.17). Written once during manifest
 	// bootstrap (before any goroutine starts), read by the probe loop.
 	probeJitterOffset time.Duration
+	// probeJitterWidth is the manifest's de-sync width W (ms). The probe
+	// loop adds a FRESH uniform draw in [0, min(W, probeRedrawCap)] on top
+	// of the stable phase each round (2.21): a fixed per-client phase is
+	// itself a constant, learnable inter-arrival signature, so the width is
+	// re-drawn every round while the phase keeps clients mutually
+	// decorrelated. Written at bootstrap; read by the probe loop.
+	probeJitterWidth time.Duration
+
+	// manifestBootstrap records how the manifest was obtained (live URL,
+	// domestic mirror, or the persisted last-known-good copy) — the honest
+	// provenance line for the audit log and for the blackout diagnosis.
+	manifestBootstrap string
+	// lastGoodMirrors are the manifest URLs derived from the last-known-good
+	// manifest's fronting host — tried in order when the primary URL is
+	// unreachable (net-e-melli: the international route is gone, the
+	// domestic CDN still answers).
+	lastGoodMirrors []string
 
 	// 2.20 — stable per-client upgrade-shape identity (UUID-derived,
 	// like the probe-jitter offset): one locale/UA/origin per user.
@@ -245,7 +263,7 @@ type server struct {
 	lastGoodDial string
 
 	// frameMu guards the outflow frame-size histogram (flow-KL feature).
-	frameMu  sync.Mutex
+	frameMu   sync.Mutex
 	frameHist []int // counts per flowprofile.FrameBucketEdges bucket
 
 	warmMu sync.Mutex
@@ -362,6 +380,13 @@ func newServer(cfg Config, l *logger, timeout time.Duration) (*server, error) {
 	}
 	// Best-effort manifest bootstrap (path base, backup entries, cadence).
 	if cfg.ManifestURL != "" {
+		// 2.21 — seed the domestic mirror ladder from the cached
+		// last-known-good manifest FIRST, so the very first fetch of this
+		// session already has the domestic CDN as a fallback. Without this
+		// a cold start during an international cut wastes the whole 8 s
+		// fetch timeout on a dead route before trying the one host that
+		// still answers.
+		s.seedMirrorsFromCache()
 		s.refreshManifest()
 	}
 	if cfg.WSPath == "" && s.pathBase == "" {
@@ -383,22 +408,87 @@ func (s *server) trackerFor(host string) *measure.Tracker {
 	return t
 }
 
-func (s *server) refreshManifest() {
+// manifestMirrorURL returns the same manifest path on another host (the
+// domestic-CDN fronting relay). Scheme, path and token are preserved, so the
+// HMAC the client verifies is bound to the same subscription token — a
+// mirror can serve the manifest but can never forge one.
+func manifestMirrorURL(manifestURL, host string) string {
+	u, err := url.Parse(manifestURL)
+	if err != nil || host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + host + u.Path
+}
+
+// manifestLadder is the fetch order for the signed manifest:
+//
+//  1. the configured manifest URL (the international route),
+//  2. every last-known-good fronting host — the domestic CDN mirror of the
+//     SAME path/token. Under net-e-melli the international URL is dead while
+//     the domestic mirror still answers, so the client can keep receiving
+//     fresh regime/pressure intelligence through the blackout instead of
+//     falling back to static local state.
+func (s *server) manifestLadder() []string {
+	out := []string{}
+	if s.cfg.ManifestURL != "" {
+		out = append(out, s.cfg.ManifestURL)
+	}
+	for _, m := range s.lastGoodMirrors {
+		if m != "" && m != s.cfg.ManifestURL {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// fetchManifestBody performs one HTTP GET of a manifest URL.
+func fetchManifestBody(url string) ([]byte, error) {
 	client := &http.Client{Timeout: 8 * time.Second}
-	resp, err := client.Get(s.cfg.ManifestURL)
+	resp, err := client.Get(url)
 	if err != nil {
-		s.log.logf("manifest fetch failed: %v", err)
-		return
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		s.log.logf("manifest HTTP %d", resp.StatusCode)
-		return
+		return nil, fmt.Errorf("manifest HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		s.log.logf("manifest read failed: %v", err)
-		return
+	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+}
+
+// refreshManifest fetches, verifies and applies the AXR manifest. It is the
+// net-e-melli bootstrap path as much as the online path:
+//
+//	try each URL in the ladder (primary, then domestic mirrors)
+//	-> on total failure, fall back to the persisted last-known-good copy
+//	-> verify the HMAC of whichever body won
+//	-> apply it, and persist it as the new last-known-good
+//
+// The last-known-good fallback is what makes a COLD START during an
+// international cut work at all: without it the core would fall back to a
+// bare `ws_path` and never learn the rotated path base, the domestic
+// fronting relay, or the canary target — precisely the facts it needs to
+// cross the blackout.
+func (s *server) refreshManifest() {
+	token := subTokenFromURL(s.cfg.ManifestURL)
+	var body []byte
+	var source string
+	for _, u := range s.manifestLadder() {
+		b, err := fetchManifestBody(u)
+		if err != nil {
+			s.log.logf("manifest fetch %s failed: %v", u, err)
+			continue
+		}
+		body, source = b, u
+		break
+	}
+	if body == nil {
+		cached, src, err := loadLastGoodManifest(s.cfg.CacheDir)
+		if err != nil {
+			s.log.logf("manifest unreachable and no last-known-good copy (%v); running on config alone", err)
+			return
+		}
+		body, source = cached, src+" (last-known-good)"
+		s.log.logf("manifest unreachable: bootstrapping from the cached last-known-good copy (this is the net-e-melli path)")
 	}
 	var m manifestV3
 	if err := json.Unmarshal(body, &m); err != nil {
@@ -409,10 +499,12 @@ func (s *server) refreshManifest() {
 	// field. A tampered/altered manifest is rejected outright and the core
 	// keeps its last-known-good state (already in memory; the last-good raw
 	// JSON is persisted for audit). An absent signature (older worker)
-	// degrades to unverified mode with a one-time note.
-	if valid, present := verifyManifestSig(&m, subTokenFromURL(s.cfg.ManifestURL)); !valid {
+	// degrades to unverified mode with a one-time note. The CACHED copy is
+	// re-verified here too: a tampered cache file is exactly as untrusted as
+	// a tampered network response.
+	if valid, present := verifyManifestSig(&m, token); !valid {
 		if present {
-			s.log.logf("manifest REJECTED: manifest_sig mismatch (keeping last-known-good state)")
+			s.log.logf("manifest REJECTED: manifest_sig mismatch from %s (keeping last-known-good state)", source)
 			return
 		}
 		if !s.sigWarned {
@@ -420,9 +512,62 @@ func (s *server) refreshManifest() {
 			s.log.logf("note: manifest carries no signature (pre-2.16 worker); running unverified")
 		}
 	}
-	if err := os.WriteFile(s.cfg.CacheDir+"/manifest-lastgood.json", body, 0o600); err != nil {
-		s.log.logf("last-good manifest persist failed: %v", err)
+	// A verified body becomes the new last-known-good, and its fronting host
+	// becomes tomorrow's domestic mirror.
+	if fromCache := strings.HasSuffix(source, "(last-known-good)"); !fromCache {
+		if err := os.WriteFile(s.cfg.CacheDir+"/manifest-lastgood.json", body, 0o600); err != nil {
+			s.log.logf("last-good manifest persist failed: %v", err)
+		}
 	}
+	s.manifestBootstrap = source
+	s.applyManifest(&m)
+}
+
+// seedMirrorsFromCache pre-loads the domestic manifest-mirror ladder from
+// the persisted last-known-good manifest. The cached fronting hint is only
+// used as a FETCH TARGET (its response is HMAC-verified before any field is
+// applied), but it is still authenticated first: a cached copy that carries a
+// signature which does not verify under this subscription token contributes
+// nothing to the ladder. The cache is 0600 inside a 0700 directory, so this
+// is defence in depth rather than the primary control.
+func (s *server) seedMirrorsFromCache() {
+	body, _, err := loadLastGoodManifest(s.cfg.CacheDir)
+	if err != nil {
+		return
+	}
+	var m manifestV3
+	if json.Unmarshal(body, &m) != nil {
+		return
+	}
+	if valid, present := verifyManifestSig(&m, subTokenFromURL(s.cfg.ManifestURL)); present && !valid {
+		s.log.logf("cached manifest failed signature re-check; ignoring its fronting hint")
+		return
+	}
+	if m.FrontingHint == "" {
+		return
+	}
+	if mu := manifestMirrorURL(s.cfg.ManifestURL, m.FrontingHint); mu != "" {
+		s.setMirrors([]string{mu})
+		s.log.logf("domestic manifest mirror armed from cache: %s", mu)
+	}
+}
+
+// loadLastGoodManifest reads the persisted last-known-good manifest body.
+func loadLastGoodManifest(cacheDir string) ([]byte, string, error) {
+	data, err := os.ReadFile(filepath.Join(cacheDir, "manifest-lastgood.json"))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) == 0 {
+		return nil, "", fmt.Errorf("cached manifest is empty")
+	}
+	return data, "manifest-lastgood.json", nil
+}
+
+// applyManifest applies a verified manifest to the running core. Every field
+// is advisory: a malformed or out-of-range value is ignored rather than
+// propagated, and the last-known-good state stays in force.
+func (s *server) applyManifest(m *manifestV3) {
 	if m.WSPathBase != "" {
 		s.pathBase = m.WSPathBase
 	}
@@ -458,6 +603,14 @@ func (s *server) refreshManifest() {
 	// priority inversion is applied to it (fronting-first under stress).
 	if m.FrontingHint != "" {
 		s.frontingHost = m.FrontingHint
+		// 2.21 — and it is the DOMESTIC MIRROR for the next manifest fetch:
+		// the same path/token on the domestic CDN. During an international
+		// cut this is the only channel that can still deliver fleet
+		// intelligence, and it is HMAC-bound to the same subscription token,
+		// so it can serve the manifest but cannot forge one.
+		if mu := manifestMirrorURL(s.cfg.ManifestURL, m.FrontingHint); mu != "" {
+			s.setMirrors([]string{mu})
+		}
 	}
 	for _, e := range m.Entries {
 		// role "canary" is a PROBE TARGET, never a tunnel arm: it is
@@ -482,10 +635,20 @@ func (s *server) refreshManifest() {
 	// deterministically from the UUID — stable across restarts, uniform in
 	// [0, width], decorrelated across the fleet (phase-locked probing is
 	// itself a fingerprint).
+	//
+	// 2.21 — the width is now ALSO re-drawn per probe round (see
+	// probeInterval). A single fixed offset per client is a constant: a
+	// classifier that has seen two probes can predict the third. Keeping
+	// the UUID phase preserves the deterministic per-client component the
+	// 2.17 design relies on for fleet decorrelation, while the per-round
+	// draw removes the fixed-phase signature from any single client's
+	// inter-arrival series.
 	if j := m.Reconnect.ProbeJitterMS; j >= 0 && j <= 30_000 {
+		w := time.Duration(j) * time.Millisecond
 		h := fnv.New32a()
 		_, _ = h.Write([]byte(s.cfg.UUID))
-		s.probeJitterOffset = time.Duration(j) * time.Duration(h.Sum32()%1024) / 1024
+		s.probeJitterOffset = w * time.Duration(h.Sum32()%1024) / 1024
+		s.probeJitterWidth = w
 	}
 	s.flowFloor = flowprofile.Rank(flowprofile.ProfileID(m.FlowProfile.Mode))
 	// 2.17 — canary liveness target (authoritative source: the signed
@@ -497,7 +660,27 @@ func (s *server) refreshManifest() {
 		}
 		s.log.logf("manifest canary target: %s (every %v)", s.canaryHost, s.canaryInt)
 	}
-	s.log.logf("manifest loaded (path_base=%s fp=%s sig=%v)", m.WSPathBase, fp, m.ManifestSig != "")
+	s.log.logf("manifest loaded from %s (path_base=%s fp=%s sig=%v canary=%s fronting=%s)",
+		s.manifestBootstrap, m.WSPathBase, fp, m.ManifestSig != "", s.canaryHost, s.frontingHost)
+	// The regime policy is (re)applied after every manifest change: a
+	// cold start that recovered its state from the cache must immediately
+	// honour a persisted net-e-melli blackout instead of waiting for the
+	// first probe round to re-derive it.
+	s.applyPolicy()
+}
+
+// setMirrors replaces the domestic manifest-mirror ladder (deduped, capped).
+func (s *server) setMirrors(urls []string) {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(urls))
+	for _, u := range urls {
+		if u == "" || seen[u] || len(out) >= 4 {
+			continue
+		}
+		seen[u] = true
+		out = append(out, u)
+	}
+	s.lastGoodMirrors = out
 }
 
 func (s *server) hasEntry(host string) bool {
@@ -650,7 +833,8 @@ func (s *server) noteGoodDial(addr string) {
 
 // wsPath is the full WebSocket request target. With a manifest, the token
 // and sub path live in the manifest URL, so the WS path is derived from it:
-//   https://host/sub/<token>/axr-manifest  ->  /sub/<token>/<pathbase>?ed=2048
+//
+//	https://host/sub/<token>/axr-manifest  ->  /sub/<token>/<pathbase>?ed=2048
 func (s *server) wsPath() string {
 	if s.cfg.WSPath != "" {
 		return s.cfg.WSPath
@@ -681,19 +865,46 @@ func (s *server) wsPathFor(transport string) string {
 	return p
 }
 
+// probeRedrawCap bounds the PER-ROUND de-synchronization component. The
+// mandate band is "0 to 15 seconds" of dynamic, client-specific jitter: the
+// stable FNV-32a phase may use the manifest's full width, but the fresh
+// per-round draw is capped here so a wide width cannot stretch the aggressive
+// cadence into uselessness.
+const probeRedrawCap = 15 * time.Second
+
+// probeInterval returns the sleep before the next probe round: the cadence in
+// force (normal/aggressive) plus the de-synchronization budget.
+//
+//	|-- cadence --|-- FNV32a(UUID) phase --|-- fresh per-round draw --|
+//
+// The phase is the 2.17 per-client component: stable across restarts, so two
+// clients never share a probe instant in expectation. The per-round draw is
+// the 2.21 addition: a single fixed offset is a CONSTANT, and an adaptive
+// classifier that observes a handful of probe instants can extrapolate the
+// next one. Re-drawing inside the same width keeps each client's inter-arrival
+// series unpredictable while preserving the fleet-level decorrelation the
+// phase provides.
+func (s *server) probeInterval() time.Duration {
+	interval := s.probeInt[0]
+	// 2.17 — netstate stress (degraded/cut) forces the aggressive
+	// cadence too, not just the failover engine's own state.
+	if s.failover.State() == failover.StateAggressive || s.netstate.IsStressed() {
+		interval = s.probeInt[1]
+	}
+	interval += s.probeJitterOffset
+	if w := s.probeJitterWidth; w > 0 {
+		if w > probeRedrawCap {
+			w = probeRedrawCap
+		}
+		interval += time.Duration(randFloat() * float64(w))
+	}
+	return interval
+}
+
 func (s *server) startProbes() {
 	go func() {
 		for {
-			interval := s.probeInt[0]
-			// 2.17 — netstate stress (degraded/cut) forces the aggressive
-			// cadence too, not just the failover engine's own state.
-			if s.failover.State() == failover.StateAggressive || s.netstate.IsStressed() {
-				interval = s.probeInt[1]
-			}
-			// 2.17 — per-client de-sync offset (UUID-derived, set at
-			// bootstrap; 0 when the manifest carries no jitter width).
-			interval += s.probeJitterOffset
-			time.Sleep(interval)
+			time.Sleep(s.probeInterval())
 			healthy := s.failover.ProbeRound(time.Now())
 			mode := s.failover.State()
 			if len(healthy) == 0 {
@@ -817,8 +1028,14 @@ func (s *server) handleSOCKS(conn net.Conn) {
 		socksReply(conn, 0x07) // command not supported (CONNECT only)
 		return
 	}
-	socksReply(conn, 0x00) // success; tunnel follows
-	s.openTunnel(conn, host, dstPort)
+	// RFC 1928 §6: the REPLY is the result of the CONNECT, so it is sent when
+	// the upstream tunnel is established — not before. Replying 0x00 first
+	// makes every application see a successful connect and then a silent EOF
+	// when no candidate works (curl reports "empty reply" instead of a
+	// connection failure, and retry logic never triggers). The reply is
+	// emitted by openTunnel exactly once: 0x00 on success, 0x05 (connection
+	// refused) when every candidate failed.
+	s.openTunnel(conn, host, dstPort, func(code byte) { socksReply(conn, code) })
 }
 
 func readSocksAddr(conn net.Conn, atyp byte) (string, error) {
@@ -898,12 +1115,18 @@ func (s *server) banditContext(v measure.Vector, now int64, profile flowprofile.
 // openTunnel picks a bandit arm, walks the failover candidates for it,
 // establishes one VLESS-WS tunnel (or adopts a warm one), pumps traffic,
 // and feeds every learner.
-func (s *server) openTunnel(client net.Conn, host string, port int) {
+//
+// reply is the SOCKS5 CONNECT reply hook. It is called EXACTLY once: with
+// 0x00 as soon as a tunnel carries (including a re-used warm session), or
+// 0x05 when every candidate failed. Until it is called the application is
+// still waiting for its CONNECT result, so nothing is consumed from it.
+func (s *server) openTunnel(client net.Conn, host string, port int, reply func(byte)) {
 	l := s.log
 	uuidBytes, _ := vlessws.UUIDFromString(s.cfg.UUID)
 	header, err := vlessws.BuildVLESSHeader(uuidBytes, host, uint16(port), false)
 	if err != nil {
 		l.logf("vless header: %v", err)
+		reply(0x01) // general SOCKS server failure
 		return
 	}
 
@@ -936,6 +1159,9 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 	// the first pump error and we fall through to a fresh dial.
 	if w := s.takeWarm(host, port); w != nil {
 		l.logf("adopting warm session for %s:%d (age %v)", host, port, time.Since(time.UnixMilli(w.endedAt)))
+		// The adopted session is already past its handshake and its VLESS
+		// OK, so the CONNECT is successful the moment we take it.
+		reply(0x00)
 		meta := warmMeta{arm: w.arm, profile: w.profile, dstHost: host, dstPort: port}
 		pr := s.pumpTunnel(w.ws, client, true, meta)
 		if pr.clean {
@@ -999,10 +1225,19 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 
 	var last tunnelResult
 	var tried []string
+	replied := false
 	for _, cand := range cands {
 		tag := cand.Endpoint.Host + "/" + cand.DialAddr + "[" + cand.Endpoint.Transport + "]"
 		tried = append(tried, tag)
-		res := s.attemptTunnel(ctx, client, cand, header, profile, esc, host, port)
+		// replyOnce is handed to every attempt; only the first call wins, so
+		// a candidate that reaches VLESS-OK emits the SOCKS5 success exactly
+		// once even if a later one is tried after a stream-level failure.
+		res := s.attemptTunnel(ctx, client, cand, header, profile, esc, host, port, func(code byte) {
+			if !replied {
+				replied = true
+				reply(code)
+			}
+		})
 		last = res
 		if res.ok {
 			break
@@ -1011,6 +1246,12 @@ func (s *server) openTunnel(client net.Conn, host string, port int) {
 	}
 	if last.reason == "" {
 		last = tunnelResult{reason: "no_candidates"}
+	}
+	if !replied {
+		// Nothing carried: tell the application the truth (RFC 1928 §6,
+		// REP=0x05 connection refused) instead of closing a "successful"
+		// connection with no data.
+		reply(0x05)
 	}
 
 	// Credit the arm that actually carried (or last tried) the tunnel —
@@ -1086,7 +1327,7 @@ type tunnelResult struct {
 // attemptTunnel dials one candidate, performs the full VLESS-WS handshake
 // (with surgery), and hands the open tunnel to pumpTunnel. dstHost/dstPort
 // are the SOCKS destination (label the warm session for reuse).
-func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failover.Candidate, header []byte, profile flowprofile.ProfileID, esc evade.Escalation, dstHost string, dstPort int) tunnelResult {
+func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failover.Candidate, header []byte, profile flowprofile.ProfileID, esc evade.Escalation, dstHost string, dstPort int, reply func(byte)) tunnelResult {
 	res := tunnelResult{entry: cand.Endpoint, dialAddr: cand.DialAddr}
 	start := time.Now()
 
@@ -1149,6 +1390,10 @@ func (s *server) attemptTunnel(ctx context.Context, client net.Conn, cand failov
 		return res
 	}
 	res.rttMS = time.Since(start).Seconds() * 1000
+	// The upstream stream is live end-to-end (Worker connected to the
+	// destination and answered VLESS 0x00): THIS is the moment the SOCKS5
+	// CONNECT succeeded, and the only correct moment to say so.
+	reply(0x00)
 
 	// Pump both directions; a clean local close may keep the session warm.
 	// A fresh tunnel is established (ok) once the handshake succeeded — the
@@ -1363,7 +1608,10 @@ func regimeRank(label string) int {
 	switch label {
 	case "cut":
 		return 3
-	case "degraded", "suspected_change":
+	// "netemelli" is the declared national-intranet window: as severe as
+	// degraded for the ladder and the bandit (the international class is
+	// down), but with its own priority table and the blackout-quiet gate.
+	case "degraded", "suspected_change", "netemelli":
 		return 2
 	case "watch", "recovering":
 		return 1
@@ -1422,8 +1670,22 @@ func (s *server) applyPolicy() {
 			s.failover.AddEntry(up)
 		}
 	}
-	s.log.logf("netstate regime -> %s (priority: fronting=%d primary=%d backup=%d, aggressive=%v)",
-		r.Label(), pol.Fronting, pol.Primary, pol.Backup, pol.Aggressive)
+	// 2.21 — blackout-quiet gate. The regime decides the WIDTH of the
+	// per-dial-address quiet window; the failover engine decides WHEN an
+	// address goes quiet (3 consecutive failures) and a success always
+	// clears it. During a declared net-e-melli window the international
+	// classes are known-dead, so re-dialing them only produces a dense,
+	// fleet-synchronised burst of failed TLS handshakes — the width grows
+	// and the ladder keeps probing a single candidate per round instead.
+	qp := failover.DefaultQuietPolicy()
+	if pol.QuietPrimary || pol.QuietBackup {
+		qp = failover.QuietPolicy{BaseMS: 120_000, MaxMS: 30 * 60_000}
+	}
+	s.failover.SetQuietPolicy(qp)
+	q := s.failover.Quiet()
+	s.log.logf("netstate regime -> %s (priority: fronting=%d primary=%d backup=%d, aggressive=%v quiet=%v %d/%d)",
+		r.Label(), pol.Fronting, pol.Primary, pol.Backup, pol.Aggressive,
+		q.Enabled, q.Quiet, q.Total)
 }
 
 func classErr(reason string) string {
@@ -1492,20 +1754,20 @@ func loadConfig(path string) (Config, error) {
 // the arm the LinUCB picked, the score table, the candidates tried, and the
 // outcome. Best-effort: logging must never break a tunnel.
 type decisionRec struct {
-	Ts          int64           `json:"ts"`
-	Regime      string          `json:"regime"`
-	FlowProfile string          `json:"flow_profile"`
-	Ctx         bandit.Context  `json:"ctx"`
-	Arm         bandit.Arm      `json:"arm"`
-	Warm        bool            `json:"warm,omitempty"`
-	Model       string          `json:"model,omitempty"` // 2.17 — ensemble member that chose the arm
-	Scores      []bandit.Score  `json:"scores,omitempty"`
-	Tries       []string        `json:"tries,omitempty"`
-	OK          bool            `json:"ok"`
-	RTTMS       float64         `json:"rtt_ms"`
-	Through     float64         `json:"through"`
-	Reason      string          `json:"reason"`
-	DialAddr    string          `json:"dial_addr,omitempty"`
+	Ts          int64          `json:"ts"`
+	Regime      string         `json:"regime"`
+	FlowProfile string         `json:"flow_profile"`
+	Ctx         bandit.Context `json:"ctx"`
+	Arm         bandit.Arm     `json:"arm"`
+	Warm        bool           `json:"warm,omitempty"`
+	Model       string         `json:"model,omitempty"` // 2.17 — ensemble member that chose the arm
+	Scores      []bandit.Score `json:"scores,omitempty"`
+	Tries       []string       `json:"tries,omitempty"`
+	OK          bool           `json:"ok"`
+	RTTMS       float64        `json:"rtt_ms"`
+	Through     float64        `json:"through"`
+	Reason      string         `json:"reason"`
+	DialAddr    string         `json:"dial_addr,omitempty"`
 }
 
 // logDecision appends rec to the audit log, rotating once the file passes

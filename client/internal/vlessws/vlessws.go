@@ -47,6 +47,18 @@ const (
 
 const maxFrame = 1 << 20 // 1 MiB guard per (re)assembled message
 
+// errFrameTooLarge is returned when a peer declares a payload length beyond
+// maxFrame. The client refuses to allocate for it: RFC 6455 §5.2 allows the
+// 64-bit length form up to 2^63-1, which is far more memory than a tunnel
+// endpoint should ever be able to make this process reserve.
+var errFrameTooLarge = errors.New("ws: frame too large")
+
+// errOrphanContinuation is returned when a message STARTS with a
+// continuation opcode. RFC 6455 §5.4 forbids it, and readFrame already
+// reassembles legitimately fragmented messages, so delivering such a frame
+// as a complete message would silently desynchronise the VLESS stream.
+var errOrphanContinuation = errors.New("ws: orphan continuation frame")
+
 // BuildVLESSHeader assembles the VLESS v1 request header for a TCP stream
 // (cmd 0x01) or UDP association (cmd 0x02) to host:port.
 func BuildVLESSHeader(uuid []byte, host string, port uint16, udp bool) ([]byte, error) {
@@ -250,7 +262,7 @@ func (f *Fragmenter) Split(n int) []int {
 	}
 	kmax := f.maxFrag
 	if kmax > (n-1)/f.min+1 { // fragments allowed so each can reach min
-		kmax = (n - 1) / f.min + 1
+		kmax = (n-1)/f.min + 1
 	}
 	if kmin > kmax {
 		return []int{n}
@@ -261,7 +273,7 @@ func (f *Fragmenter) Split(n int) []int {
 	for i := 0; i < k-1; i++ {
 		remaining := n - used
 		// Later full fragments (>= min) plus a 1-byte tail must still fit.
-		reserve := (k - 2 - i) * f.min + 1
+		reserve := (k-2-i)*f.min + 1
 		hi := f.max
 		if lim := remaining - reserve; lim < hi {
 			hi = lim
@@ -696,7 +708,11 @@ func (c *Client) RecvBinary() ([]byte, error) {
 			_ = c.SendControl(opClose, payload)
 			return nil, io.EOF
 		case opContinuation:
-			return payload, nil
+			// readFrame reassembles a fragmented message and reports the
+			// opcode of its FIRST frame, so a continuation here can only be
+			// an orphan (RFC 6455 §5.4). Returning it as a complete message
+			// would hand the caller half a VLESS payload.
+			return nil, errOrphanContinuation
 		default:
 			return nil, fmt.Errorf("vlessws: unexpected frame opcode %d", opcode)
 		}
@@ -751,7 +767,7 @@ func (c *Client) readFrame() (byte, []byte, error) {
 				return 0, nil, err
 			}
 			if l2 > maxFrame {
-				return 0, nil, errors.New("ws: fragment too large")
+				return 0, nil, errFrameTooLarge
 			}
 			chunk := make([]byte, l2)
 			if _, err := io.ReadFull(c.r, chunk); err != nil {
@@ -793,7 +809,16 @@ func extLen(r io.ByteReader, b byte) (int, error) {
 		if err := readBytes(r, e[:]); err != nil {
 			return 0, err
 		}
-		return int(binary.BigEndian.Uint64(e[:])), nil
+		v := binary.BigEndian.Uint64(e[:])
+		// Bound BEFORE the int conversion: on 32-bit targets the matrix
+		// builds (android/arm64 is 64-bit, but the same code compiles for
+		// 386/arm) a 64-bit length can wrap into a small or negative int —
+		// and make([]byte, negative) panics. A remote peer must never be
+		// able to turn a length field into an allocation or a panic.
+		if v > maxFrame {
+			return 0, errFrameTooLarge
+		}
+		return int(v), nil
 	default:
 		return int(b), nil
 	}

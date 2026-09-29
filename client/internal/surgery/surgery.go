@@ -23,6 +23,7 @@
 package surgery
 
 import (
+	"io"
 	"net"
 	"time"
 )
@@ -110,25 +111,32 @@ func (s *SplitConn) Write(b []byte) (int, error) {
 	if !s.done {
 		s.done = true // only the very first write is ever split
 		if off, ok := PlanHelloSplit(len(b), s.rng); ok {
-			if _, err := s.inner.Write(b[:off]); err != nil {
-				return 0, err
+			n, err := s.inner.Write(b[:off])
+			if err != nil {
+				return n, err
+			}
+			if n != off {
+				// net.Conn's contract: a short write with no error must be
+				// reported. Swallowing it would let the TLS handshake hang
+				// waiting for bytes that were never pushed.
+				return n, io.ErrShortWrite
 			}
 			if gap := DefaultGap(s.rng, s.gapMin, s.gapMax); gap > 0 {
 				time.Sleep(gap)
 			}
-			n, err := s.inner.Write(b[off:])
-			return off + n, err
+			n2, err := s.inner.Write(b[off:])
+			return off + n2, err
 		}
 	}
 	return s.inner.Write(b)
 }
 
-func (s *SplitConn) Close() error                                   { return s.inner.Close() }
-func (s *SplitConn) LocalAddr() net.Addr                            { return s.inner.LocalAddr() }
-func (s *SplitConn) RemoteAddr() net.Addr                           { return s.inner.RemoteAddr() }
-func (s *SplitConn) SetDeadline(t time.Time) error                  { return s.inner.SetDeadline(t) }
-func (s *SplitConn) SetReadDeadline(t time.Time) error              { return s.inner.SetReadDeadline(t) }
-func (s *SplitConn) SetWriteDeadline(t time.Time) error             { return s.inner.SetWriteDeadline(t) }
+func (s *SplitConn) Close() error                       { return s.inner.Close() }
+func (s *SplitConn) LocalAddr() net.Addr                { return s.inner.LocalAddr() }
+func (s *SplitConn) RemoteAddr() net.Addr               { return s.inner.RemoteAddr() }
+func (s *SplitConn) SetDeadline(t time.Time) error      { return s.inner.SetDeadline(t) }
+func (s *SplitConn) SetReadDeadline(t time.Time) error  { return s.inner.SetReadDeadline(t) }
+func (s *SplitConn) SetWriteDeadline(t time.Time) error { return s.inner.SetWriteDeadline(t) }
 
 // Slicer decides the size and pre-gap of each chunk (flowprofile implements
 // this interface for app-class morphing). Next must return a size in
@@ -199,20 +207,26 @@ func (k *ChunkConn) Write(b []byte) (int, error) {
 		if total > 0 && gap > 0 {
 			time.Sleep(gap)
 		}
-		if _, err := k.inner.Write(b[total : total+size]); err != nil {
+		n, err := k.inner.Write(b[total : total+size])
+		total += n
+		if err != nil {
 			return total, err
 		}
-		total += size
+		if n != size {
+			// Short write: report it rather than looping forever on the
+			// remaining bytes (the caller's TLS layer must see the error).
+			return total, io.ErrShortWrite
+		}
 	}
 	return total, nil
 }
 
-func (k *ChunkConn) Close() error                        { return k.inner.Close() }
-func (k *ChunkConn) LocalAddr() net.Addr                 { return k.inner.LocalAddr() }
-func (k *ChunkConn) RemoteAddr() net.Addr                { return k.inner.RemoteAddr() }
-func (k *ChunkConn) SetDeadline(t time.Time) error       { return k.inner.SetDeadline(t) }
-func (k *ChunkConn) SetReadDeadline(t time.Time) error   { return k.inner.SetReadDeadline(t) }
-func (k *ChunkConn) SetWriteDeadline(t time.Time) error  { return k.inner.SetWriteDeadline(t) }
+func (k *ChunkConn) Close() error                       { return k.inner.Close() }
+func (k *ChunkConn) LocalAddr() net.Addr                { return k.inner.LocalAddr() }
+func (k *ChunkConn) RemoteAddr() net.Addr               { return k.inner.RemoteAddr() }
+func (k *ChunkConn) SetDeadline(t time.Time) error      { return k.inner.SetDeadline(t) }
+func (k *ChunkConn) SetReadDeadline(t time.Time) error  { return k.inner.SetReadDeadline(t) }
+func (k *ChunkConn) SetWriteDeadline(t time.Time) error { return k.inner.SetWriteDeadline(t) }
 
 // ---- 2.16 — multi-segment ClientHello surgery (fragA/fragB style) ----
 //
@@ -386,6 +400,12 @@ func (m *MultiSplitConn) Write(b []byte) (int, error) {
 				if err != nil {
 					return total, err
 				}
+				if n != bounds[i]-bounds[i-1] {
+					// Short write: report it (see ChunkConn.Write). A partial
+					// ClientHello segment that looks complete would corrupt the
+					// TLS record stream.
+					return total, io.ErrShortWrite
+				}
 			}
 			return total, nil
 		}
@@ -393,9 +413,9 @@ func (m *MultiSplitConn) Write(b []byte) (int, error) {
 	return m.inner.Write(b)
 }
 
-func (m *MultiSplitConn) Close() error                                   { return m.inner.Close() }
-func (m *MultiSplitConn) LocalAddr() net.Addr                            { return m.inner.LocalAddr() }
-func (m *MultiSplitConn) RemoteAddr() net.Addr                           { return m.inner.RemoteAddr() }
-func (m *MultiSplitConn) SetDeadline(t time.Time) error                  { return m.inner.SetDeadline(t) }
-func (m *MultiSplitConn) SetReadDeadline(t time.Time) error              { return m.inner.SetReadDeadline(t) }
-func (m *MultiSplitConn) SetWriteDeadline(t time.Time) error             { return m.inner.SetWriteDeadline(t) }
+func (m *MultiSplitConn) Close() error                       { return m.inner.Close() }
+func (m *MultiSplitConn) LocalAddr() net.Addr                { return m.inner.LocalAddr() }
+func (m *MultiSplitConn) RemoteAddr() net.Addr               { return m.inner.RemoteAddr() }
+func (m *MultiSplitConn) SetDeadline(t time.Time) error      { return m.inner.SetDeadline(t) }
+func (m *MultiSplitConn) SetReadDeadline(t time.Time) error  { return m.inner.SetReadDeadline(t) }
+func (m *MultiSplitConn) SetWriteDeadline(t time.Time) error { return m.inner.SetWriteDeadline(t) }
