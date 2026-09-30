@@ -2,10 +2,11 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
 import type { D1Database } from '@cloudflare/workers-types';
-import { VERSION } from '../config';
+import { SCHEMA_VERSION, VERSION } from '../config';
 import { createUser, getUserByIdFresh, isUserAllowed, recordUsageDelta, updateUser } from '../db/users';
-import { consumeAiDiagnosticQuota, consumeDnsQueryQuota, loadHealthSamples, loadLatestPathSamples, saveHealthSample } from '../db/store';
-import { subTokenFor } from '../subscription';
+import { consumeAiDiagnosticQuota, consumeDnsQueryQuota, loadHealthSamples, loadLatestPathSamples, loadNetworkState, loadSettings, saveHealthSample, saveNetworkState, saveSettings } from '../db/store';
+import { buildLiveAdaptiveClientBundle, subTokenFor } from '../subscription';
+import { defaultAdvisorApplication, setAdvisorApplicationControls } from '../ai/advisor-application';
 import { createDiagnostics, getAiModelCandidates, rankCatalogModels } from '../ai/diagnostics';
 
 let mf: Miniflare;
@@ -217,6 +218,21 @@ describe('Cloudflare Worker + D1 integration', () => {
       return mf.dispatchFetch(base + path, { ...init, headers });
     };
 
+    const advisorEnabled = await adminCall('/settings', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ aiAdvisorEnabled: true }),
+    });
+    expect(advisorEnabled.status).toBe(200);
+    expect(await (await adminCall('/settings')).json()).toMatchObject({ aiAdvisorEnabled: true, aiAdvisorKilled: false });
+    const advisorKilled = await adminCall('/settings', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ aiAdvisorKilled: true }),
+    });
+    expect(advisorKilled.status).toBe(200);
+    expect(await (await adminCall('/settings')).json()).toMatchObject({ aiAdvisorEnabled: true, aiAdvisorKilled: true, aiAdvisorStatus: 'killed' });
+    await adminCall('/settings', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ aiAdvisorEnabled: false, aiAdvisorKilled: false }),
+    });
+    expect(await (await adminCall('/settings')).json()).toMatchObject({ aiAdvisorEnabled: false, aiAdvisorKilled: false, aiAdvisorStatus: 'disabled' });
+
     const expires = Date.now() + 5 * 86_400_000;
     const changed = await adminCall('/users/' + userA.id, {
       method: 'PATCH',
@@ -350,6 +366,35 @@ describe('Cloudflare Worker + D1 integration', () => {
       expect(requests[0].authorization).toBe('Bearer test-catalog-token-value');
       expect(JSON.stringify(result)).not.toContain('test-catalog-token-value');
     } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('uses an expired cached model catalog when live discovery fails', async () => {
+    const account = '22222222222222222222222222222222';
+    const model = '@cf/cache-test/recent';
+    const start = Date.now();
+    let discovery = 0;
+    vi.stubGlobal('fetch', async () => {
+      discovery++;
+      if (discovery > 1) throw new Error('catalog offline');
+      return Response.json({ result: [{ id: model, task: 'Text Generation', updated_at: '2026-09-01' }] });
+    });
+    const ai = { run: async () => ({ response: JSON.stringify({
+      schema: 'axr-strategy-advice/v1', transport: 'ws', profile: 'standard', entry: 'primary', sniChoice: 'primary',
+      fragment: { enabled: false, minBytes: 256, maxBytes: 1200, gapMs: 0 },
+      retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 5000 },
+    }) }) };
+    try {
+      const env = { GZ_DB: db, AI_CATALOG_ACCOUNT_ID: account, AI_CATALOG_API_TOKEN: 'test-catalog-token-value', AI: ai };
+      const first = await createDiagnostics(env, 'en');
+      expect(first.model).toBe(model);
+      vi.setSystemTime(start + 7 * 60 * 60_000);
+      const fallback = await createDiagnostics(env, 'en');
+      expect(fallback.model).toBe(model);
+      expect(discovery).toBe(2);
+    } finally {
+      vi.useRealTimers();
       vi.unstubAllGlobals();
     }
   });
@@ -579,5 +624,64 @@ describe('Cloudflare Worker + D1 integration', () => {
       String(m.flow_profile.mode), String(m.reconnect.probe_interval_ms),
     ].join('|');
     expect(m.manifest_sig).toBe(createHmac('sha256', token).update(canonical, 'utf8').digest('hex'));
+  });
+
+  it('applies only the opted-in transport hint to the live adaptive policy', async () => {
+    const now = Date.now();
+    const previousSettings = await loadSettings(db);
+    const previousNetwork = await loadNetworkState(db);
+    await saveSettings(db, (prev) => ({
+      ...(prev ?? {
+        schemaVersion: SCHEMA_VERSION, panelPath: 'gozargah', subPath: 'sub', proxyIPs: [], resetCycle: 'none' as const,
+        passwordSalt: 'test-salt', passwordHash: 'test-hash', pwIterations: 1000, isDefaultPassword: false, createdAt: now,
+      }),
+      aiAdvisorApplication: setAdvisorApplicationControls(prev?.aiAdvisorApplication ?? defaultAdvisorApplication(), { enabled: true, killed: false }, now),
+    }));
+    await saveNetworkState(db, {
+      state: 'healthy', quorum: 1, failureRate: 0.05, selectedPath: 'test-path', reasonCodes: [],
+      confidence: 0.9, anomalyScore: 0.05, signalClass: 'normal', updatedAt: now,
+    });
+    try {
+      const result = await createDiagnostics({
+        GZ_DB: db,
+        AI_MODELS: '@cf/test/advisor-transport',
+        AI: { run: async () => ({ response: JSON.stringify({
+          schema: 'axr-strategy-advice/v1', transport: 'ws', profile: 'standard', entry: 'primary', sniChoice: 'primary',
+          fragment: { enabled: false, minBytes: 256, maxBytes: 1200, gapMs: 0 },
+          retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 5000 },
+        }) }) },
+      }, 'en');
+      expect(result.advisorApplicationStatus).toBe('applied');
+      const settings = await loadSettings(db);
+      expect(settings?.aiAdvisorApplication).toMatchObject({ enabled: true, activeTransport: 'ws', status: 'applied' });
+      const bundle = JSON.parse(await buildLiveAdaptiveClientBundle(
+        'gozargah.test',
+        { uuid: '00000000-0000-4000-8000-000000000000', trojanPass: 'test-pass', name: 'advisor-test' },
+        null,
+        { GZ_DB: db },
+      )) as { live_policy: { advisor_application: Record<string, unknown> } };
+      expect(bundle.live_policy.advisor_application).toMatchObject({
+        status: 'applied', active_transport: 'ws', applied_scope: 'bounded_adaptive_transport_preference',
+        axr_native_transport_boundary: 'websocket_only',
+      });
+
+      vi.setSystemTime(now + 6 * 60_000);
+      await saveNetworkState(db, {
+        state: 'degraded', quorum: 0.5, failureRate: 0.3, selectedPath: 'test-path', reasonCodes: ['success_drop'],
+        confidence: 0.8, anomalyScore: 0.4, signalClass: 'selective_degradation', updatedAt: now + 6 * 60_000,
+      });
+      const rolledBundle = JSON.parse(await buildLiveAdaptiveClientBundle(
+        'gozargah.test',
+        { uuid: '00000000-0000-4000-8000-000000000000', trojanPass: 'test-pass', name: 'advisor-test' },
+        null,
+        { GZ_DB: db },
+      )) as { live_policy: { advisor_application: Record<string, unknown> } };
+      expect(rolledBundle.live_policy.advisor_application).toMatchObject({ status: 'rolled_back', active_transport: null });
+      expect((await loadSettings(db))?.aiAdvisorApplication).toMatchObject({ activeTransport: null, status: 'rolled_back' });
+    } finally {
+      vi.useRealTimers();
+      if (previousSettings) await saveSettings(db, () => previousSettings);
+      if (previousNetwork) await saveNetworkState(db, previousNetwork);
+    }
   });
 });

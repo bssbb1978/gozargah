@@ -91,6 +91,8 @@ export function buildAdaptiveProtocolPlan(args: {
   networkState?: NetworkStateDecision | null;
   learner?: EdgeLearnerState;
   preferredProfileId?: string;
+  /** Opt-in Workers AI hint, applied only to capability-ready candidates. */
+  preferredTransport?: string;
   predictive?: Record<string, PredictiveAssessment>;
   /** 2.12 — aggregate regime intelligence from scheduled health + dial outcomes. */
   regime?: RegimeAssessment;
@@ -156,6 +158,7 @@ export function buildAdaptiveProtocolPlan(args: {
     score += posterior.mean * 6;
     score += strategy === 'diversify' ? exploration * 0.45 : strategy === 'safe' ? -exploration * 0.3 : exploration * 0.25;
     if (args.preferredProfileId && p.id === args.preferredProfileId) score += 6;
+    if (args.preferredTransport && p.transport === args.preferredTransport) score += 6;
     if (strategy === 'diversify' && p.transport !== 'ws') score += 6;
     if (strategy === 'safe' && h.known && h.failureRate < 0.25) score += 9;
     const family = p.protocol + ':' + p.transport;
@@ -223,6 +226,7 @@ export function buildAdaptiveProtocolPlan(args: {
 
   const reasonCodes: string[] = [];
   if (args.preferredProfileId && selectedId === args.preferredProfileId) reasonCodes.push('per_user_preference');
+  if (args.preferredTransport && selected?.p.transport === args.preferredTransport) reasonCodes.push('ai_advisor_transport_preference');
   if (ladder.length > 1) reasonCodes.push('diverse_fallback_ladder');
   if (net?.state === 'recovery' || net?.state === 'no_healthy_path') reasonCodes.push('network_recovery_bias');
   if (ladder.some(x => x.p.mode === 'origin-engine')) reasonCodes.push('origin_engine_available');

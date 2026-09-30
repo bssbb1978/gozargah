@@ -11,11 +11,12 @@
 
 import { toBase64 } from './utils/crypto';
 import { GzUser, listUsersFresh } from './db/users';
-import { loadAdaptiveGuardState, loadAdaptiveModel, loadCanaryState, loadCleanIPHarvest, loadNetworkState, loadPathHealth, loadPolicySignalState, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState } from './db/store';
+import { loadAdaptiveGuardState, loadAdaptiveModel, loadCanaryState, loadCleanIPHarvest, loadNetworkState, loadPathHealth, loadPolicySignalState, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState, saveSettings } from './db/store';
 import { decideResilience, type PathObservation } from './ai/resilience';
 import { assessPressure, canaryEvidence } from './ai/pressure';
 import { buildAdaptiveProtocolPlan } from './ai/protocol-controller';
 import { nextAdaptiveGuardState, reconcileAdaptivePlan } from './ai/adaptive-guard';
+import { advisorKillSwitchEnabled, defaultAdvisorApplication, normalizeAdvisorApplication, observeAdvisorSuccessRate, setAdvisorApplicationControls } from './ai/advisor-application';
 import { EffectiveSettings } from './settings';
 import { DEFAULT_FP, FragPreset, adaptiveProfiles, fpFor, opBranding, resolveOp, SubOpts, AdaptiveProfile } from './sub/operators';
 import { PATH_ROTATION_WINDOW_MS, rotatedPathBase } from './sub/path-rotation';
@@ -395,13 +396,16 @@ export async function buildLiveAdaptiveClientBundle(
   let pathRows: Awaited<ReturnType<typeof loadPathHealth>> = [];
   let regime: RegimeAssessment | null = null;
   let backupHosts: string[] = [];
+  let settingsSnapshot: Awaited<ReturnType<typeof loadSettings>> = null;
+  let advisorApplication = defaultAdvisorApplication();
   if (db) {
     try { networkState = await loadNetworkState(db); } catch { /* optional */ }
     try { profileHealth = await loadProfileHealth(db); } catch { /* optional */ }
     try { pathRows = await loadPathHealth(db); } catch { /* optional */ }
     try {
-      const s = await loadSettings(db);
-      backupHosts = (s?.backupEntryHosts ?? []).slice(0, 4);
+      settingsSnapshot = await loadSettings(db);
+      backupHosts = (settingsSnapshot?.backupEntryHosts ?? []).slice(0, 4);
+      advisorApplication = normalizeAdvisorApplication(settingsSnapshot?.aiAdvisorApplication);
     } catch { /* optional */ }
     if (user.id && user.id > 0) {
       try { userState = await loadUserAdaptiveState(db, user.id); } catch { /* optional */ }
@@ -432,6 +436,30 @@ export async function buildLiveAdaptiveClientBundle(
     total: observations.length, failureRate: networkState.failureRate, confidence: networkState.confidence, anomalyScore: networkState.anomalyScore, signalClass: networkState.signalClass as import('./ai/network-state').NetworkSignalClass,
     selectedPath: networkState.selectedPath || null, reasonCodes: networkState.reasonCodes, generatedAt: networkState.updatedAt,
   } : null;
+  const workerAdvisorKill = advisorKillSwitchEnabled(env?.AI_ADVISOR_KILL_SWITCH);
+  if (workerAdvisorKill) {
+    advisorApplication = setAdvisorApplicationControls(advisorApplication, { killed: true }, now);
+    advisorApplication = { ...advisorApplication, reason: 'worker_kill_switch' };
+    if (db && settingsSnapshot && !settingsSnapshot.aiAdvisorApplication?.killed) {
+      try { await saveSettings(db, (prev) => ({ ...(prev ?? settingsSnapshot!), aiAdvisorApplication: advisorApplication })); }
+      catch { /* the Worker-level kill still applies to this response */ }
+    }
+  } else if (db && settingsSnapshot && networkState && advisorApplication.activeTransport) {
+    const observed = observeAdvisorSuccessRate(advisorApplication, {
+      successRate: Math.max(0, Math.min(1, 1 - networkState.failureRate)),
+      updatedAt: networkState.updatedAt,
+    }, now);
+    if (JSON.stringify(observed) !== JSON.stringify(advisorApplication)) {
+      advisorApplication = observed;
+      try {
+        await saveSettings(db, (prev) => ({ ...(prev ?? settingsSnapshot!), aiAdvisorApplication: observed }));
+      } catch { /* rollback state persistence is best-effort; the current response still uses the rolled-back state */ }
+    }
+  }
+  const advisorTransport = !workerAdvisorKill && advisorApplication.enabled && !advisorApplication.killed &&
+    (advisorApplication.status === 'applied' || advisorApplication.status === 'rolled_back')
+    ? advisorApplication.activeTransport
+    : null;
   const predictive = Object.fromEntries(profileHealth.map((row) => [row.profileId, {
     sampleCount: row.successes + row.failures,
     reliability: (row.successes + row.failures) ? row.successes / (row.successes + row.failures) : 0.5,
@@ -439,6 +467,9 @@ export async function buildLiveAdaptiveClientBundle(
     successSlope: 0, latencySlope: 0, drift: (row.drift ?? 'stable') as 'improving'|'stable'|'degrading',
     forecastSuccess: row.forecastSuccess ?? 0.5, confidence: Math.min(1, (row.successes + row.failures) / 12),
   }]));
+  const effectiveAdvisorTransport = advisorTransport && matrix.adaptivePolicy.profiles.some((profile) => profile.ready && profile.transport === advisorTransport)
+    ? advisorTransport
+    : null;
   const controllerPlan = buildAdaptiveProtocolPlan({
     profiles: matrix.adaptivePolicy.profiles,
     health: profileHealth,
@@ -447,6 +478,7 @@ export async function buildLiveAdaptiveClientBundle(
     learner,
     regime: regime ?? undefined,
     preferredProfileId: userState?.preferredProfileId ?? '',
+    preferredTransport: effectiveAdvisorTransport ?? undefined,
     limit: 10,
     now,
   });
@@ -504,6 +536,13 @@ export async function buildLiveAdaptiveClientBundle(
   base.live_policy = {
     ...activePlan,
     guard: guardMeta,
+    advisor_application: {
+      status: advisorApplication.status,
+      active_transport: effectiveAdvisorTransport,
+      applied_scope: 'bounded_adaptive_transport_preference',
+      rollback_source: 'aggregate_worker_egress_success_rate',
+      axr_native_transport_boundary: 'websocket_only',
+    },
     path_selection: resilience ? {
       selected: resilience.selectedPath,
       mode: resilience.mode,

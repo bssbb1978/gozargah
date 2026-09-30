@@ -5,9 +5,10 @@
  */
 import { Env, VERSION } from '../config';
 import { listUsers } from '../db/users';
-import { loadSettings, loadPathHealth, loadProfileHealth, loadAiModelHealth, saveAiModelHealth, loadNetworkState, loadPredictiveStates } from '../db/store';
+import { loadSettings, saveSettings, loadPathHealth, loadProfileHealth, loadAiModelHealth, saveAiModelHealth, loadNetworkState, loadPredictiveStates } from '../db/store';
 import { decideResilience, localResilienceAdvice, PathObservation } from './resilience';
-import { parseOriginTransports } from '../protocols/catalog';
+import { parseOriginTransports, protocolCatalog } from '../protocols/catalog';
+import { applyAdvisorTransport, advisorKillSwitchEnabled, defaultAdvisorApplication, normalizeAdvisorApplication, type AdvisorApplicationStatus } from './advisor-application';
 import { parseStrategyRecommendation, StrategyConstraints, StrategyRecommendation } from './strategy-recommendation';
 import type { RegimeAssessment } from './regime';
 
@@ -85,6 +86,7 @@ async function discoverModels(env: Env): Promise<string[]> {
   const account = env.AI_CATALOG_ACCOUNT_ID || '';
   const token = env.AI_CATALOG_API_TOKEN || '';
   if (!/^[a-f0-9]{32}$/i.test(account) || token.length < 12) return [];
+  const stale = catalogCache?.account === account ? catalogCache.models : [];
   if (catalogCache?.account === account && catalogCache.expiresAt > Date.now()) return catalogCache.models;
   if (catalogPromise) return catalogPromise;
   catalogPromise = (async () => {
@@ -100,13 +102,16 @@ async function discoverModels(env: Env): Promise<string[]> {
         redirect: 'error',
         signal: AbortSignal.timeout(5000),
       });
-      if (!response.ok) return [];
+      if (!response.ok) return stale;
       const payload = await response.json() as unknown;
       const models = rankCatalogModels(payload);
-      if (models.length) catalogCache = { account, expiresAt: Date.now() + CATALOG_TTL_MS, models };
-      return models;
+      if (models.length) {
+        catalogCache = { account, expiresAt: Date.now() + CATALOG_TTL_MS, models };
+        return models;
+      }
+      return stale;
     } catch {
-      return [];
+      return stale;
     } finally {
       catalogPromise = null;
     }
@@ -205,7 +210,7 @@ function outputText(result: unknown): string {
   return '';
 }
 
-function strategyAdvice(recommendation: StrategyRecommendation, language: 'fa' | 'en'): string {
+function strategyAdvice(recommendation: StrategyRecommendation, language: 'fa' | 'en', status: AdvisorApplicationStatus): string {
   const fragment = recommendation.fragment.enabled
     ? `${recommendation.fragment.minBytes}-${recommendation.fragment.maxBytes}B/${recommendation.fragment.gapMs}ms`
     : 'off';
@@ -217,9 +222,24 @@ function strategyAdvice(recommendation: StrategyRecommendation, language: 'fa' |
     `fragment=${fragment}`,
     `retry=${recommendation.retry.maxAttempts}x/${recommendation.retry.baseDelayMs}-${recommendation.retry.maxDelayMs}ms`,
   ];
-  return language === 'fa'
-    ? '\n\nپیشنهاد پارامتریِ اعتبارسنجی‌شده (فقط راهنما؛ خودکار اعمال نشده): ' + fields.join('، ')
-    : '\n\nValidated parameter suggestion (advisory only; not auto-applied): ' + fields.join(', ');
+  const note = status === 'applied'
+    ? (language === 'fa'
+      ? 'اولویت ترنسپورت به‌صورت محدود در سیاست تطبیقی اعمال شد؛ امتیازدهی محلی و بازگشت خودکار همچنان حاکم‌اند. سایر فیلدها فقط راهنما هستند.'
+      : 'The transport preference was applied as a bounded adaptive-policy hint; local scoring and automatic rollback remain authoritative. Other fields are advisory only.')
+    : status === 'rolled_back'
+      ? (language === 'fa'
+        ? 'اولویت ترنسپورت قبلی پس از افت نرخ موفقیت تجمیعی بازگردانده شد؛ پیشنهادهای دیگر فقط راهنما هستند.'
+        : 'The transport preference was rolled back after an aggregate success-rate drop; other fields remain advisory only.')
+      : status === 'killed'
+        ? (language === 'fa' ? 'کلید توقف فعال است؛ هیچ پیشنهاد AI اعمال نمی‌شود.' : 'The kill switch is active; no AI advice is applied.')
+        : status === 'baseline_missing'
+          ? (language === 'fa' ? 'خط پایهٔ تازهٔ سلامت Worker موجود نیست؛ این پیشنهاد اعمال نشد.' : 'No fresh Worker-health baseline is available; this suggestion was not applied.')
+          : status === 'unsupported_transport'
+            ? (language === 'fa' ? 'ترنسپورت پیشنهادی در قابلیت‌های فعال مجاز نیست؛ اعمال نشد.' : 'The suggested transport is not an enabled capability; it was not applied.')
+            : status === 'disabled'
+              ? (language === 'fa' ? 'اعمال خودکار خاموش است؛ پیشنهاد فقط راهنماست.' : 'Auto-application is off; this remains advisory only.')
+              : (language === 'fa' ? 'پیشنهاد فقط راهنماست؛ خودکار اعمال نشده است.' : 'This remains advisory only; it was not auto-applied.');
+  return (language === 'fa' ? '\n\nپیشنهاد پارامتریِ اعتبارسنجی‌شده: ' : '\n\nValidated parameter suggestion: ') + fields.join(language === 'fa' ? '، ' : ', ') + '\n' + note;
 }
 
 export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promise<{
@@ -228,6 +248,7 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
   ai: boolean;
   summary: Record<string, number | string>;
   strategyRecommendation: StrategyRecommendation | null;
+  advisorApplicationStatus: AdvisorApplicationStatus;
 }> {
   const users = env.GZ_DB ? await listUsers(env.GZ_DB) : [];
   const enabled = users.filter((u) => u.enabled).length;
@@ -235,15 +256,25 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
   // hostnames or per-user data).
   let regime: RegimeAssessment | null = null;
   let backupEntryCount = 0;
+  let settingsSnapshot: Awaited<ReturnType<typeof loadSettings>> = null;
   if (env.GZ_DB) {
-    try { backupEntryCount = (await loadSettings(env.GZ_DB))?.backupEntryHosts?.length ?? 0; } catch { /* optional */ }
+    try {
+      settingsSnapshot = await loadSettings(env.GZ_DB);
+      backupEntryCount = settingsSnapshot?.backupEntryHosts?.length ?? 0;
+    } catch { /* optional */ }
     try {
       const rows = await loadPredictiveStates(env.GZ_DB, 'regime');
       const row = rows.find((r) => r.subjectId === 'global');
       if (row) regime = JSON.parse(row.stateJson) as RegimeAssessment;
     } catch { /* optional */ }
   }
-  const networkState = env.GZ_DB ? ((await loadNetworkState(env.GZ_DB))?.state ?? 'unknown') : 'unknown';
+  const networkSnapshot = env.GZ_DB ? await loadNetworkState(env.GZ_DB) : null;
+  const networkState = networkSnapshot?.state ?? 'unknown';
+  const killSwitch = advisorKillSwitchEnabled(env.AI_ADVISOR_KILL_SWITCH);
+  let advisorApplication = normalizeAdvisorApplication(settingsSnapshot?.aiAdvisorApplication ?? defaultAdvisorApplication());
+  if (killSwitch && advisorApplication.activeTransport) {
+    advisorApplication = { ...advisorApplication, activeTransport: null, status: 'killed', reason: 'worker_kill_switch' };
+  }
   const profileRows = env.GZ_DB ? await loadProfileHealth(env.GZ_DB) : [];
   const now = Date.now();
   const profileObservations = profileRows
@@ -262,8 +293,12 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
       };
     });
   const entryChoices = ['primary', ...Array.from({ length: Math.max(0, Math.min(4, Math.floor(backupEntryCount))) }, (_, i) => `backup_${i + 1}`)];
+  const readyTransports = new Set(protocolCatalog(
+    Boolean(env.ORIGIN_ENGINE_HOST?.trim()),
+    env.ORIGIN_ENGINE_HOST ? parseOriginTransports(env.ORIGIN_ENGINE_TRANSPORTS) : [],
+  ).filter((capability) => capability.ready && capability.generatorAvailable).map((capability) => capability.transport));
   const constraints: StrategyConstraints = {
-    transports: [...new Set(['ws', ...(env.ORIGIN_ENGINE_HOST ? parseOriginTransports(env.ORIGIN_ENGINE_TRANSPORTS) : [])])],
+    transports: [...readyTransports].filter((transport) => ['ws', 'grpc', 'httpupgrade', 'xhttp'].includes(transport)),
     entries: entryChoices,
     sniChoices: entryChoices,
   };
@@ -290,7 +325,7 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
     const observations: PathObservation[] = rows.map(r => ({ id:r.pathId, latencyMs:r.latencyMs, ok:r.ok, checkedAt:r.checkedAt, failures:r.failures, successes:r.successes, quarantineUntil:r.quarantineUntil }));
     const decision = decideResilience(observations);
     if (!env.AI) {
-      return { ai:false, model:null, summary, strategyRecommendation: null, text: localResilienceAdvice(decision, language) + '\n\n' + localAdvice(summary, language, false) };
+      return { ai:false, model:null, summary, strategyRecommendation: null, advisorApplicationStatus: advisorApplication.status, text: localResilienceAdvice(decision, language) + '\n\n' + localAdvice(summary, language, false) };
     }
   }
 
@@ -300,6 +335,7 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
       model: null,
       summary,
       strategyRecommendation: null,
+      advisorApplicationStatus: advisorApplication.status,
       text: localAdvice(summary, language, false),
     };
   }
@@ -307,11 +343,11 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
   const models = await selectModels(env);
   const system = [
     'Return exactly one JSON object matching schema axr-strategy-advice/v1; no prose, Markdown, or extra keys.',
-    'You are read-only. Recommend parameters only; never claim DPI detection, guaranteed bypass, or an international-cut diagnosis. Do not change settings.',
+    'You are read-only. Recommend parameters only; never claim DPI detection, guaranteed bypass, or an international-cut diagnosis. The application controller may use only the allow-listed transport as a bounded preference when the operator opted in; you cannot execute tools or change settings.',
     'Use only the anonymized aggregate counters and profile observations in the user message. Never request or invent user IDs, hostnames, IPs, credentials, traffic content, or secrets.',
     'transport must be one of allowed.transports; entry and sniChoice must be aliases from allowed.entries and allowed.sniChoices. Choose only listed profiles and bounded numbers.',
     'Exact object: {schema:"axr-strategy-advice/v1",transport,profile,entry,sniChoice,fragment:{enabled,minBytes,maxBytes,gapMs},retry:{maxAttempts,baseDelayMs,maxDelayMs}}.',
-    'The suggestion is advisory only and is not automatically applied. If evidence is weak, choose conservative settings.',
+    'Only the transport field can ever become a soft adaptive-policy preference, and only after capability checks, opt-in, a fresh measured baseline, and local guard checks. Profile, entry, SNI, fragment, and retry fields always remain advisory. If evidence is weak, choose conservative settings.',
   ].join(' ');
   const prompt = JSON.stringify({
     language,
@@ -342,13 +378,30 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
           await saveAiModelHealth(env.GZ_DB, { modelId: model, failures: h?.failures ?? 0, successes: (h?.successes ?? 0) + 1, quarantineUntil: 0, updatedAt: Date.now() });
         } catch { /* health telemetry is optional */ }
       }
+      let applicationStatus = advisorApplication.status;
+      if (killSwitch) {
+        applicationStatus = 'killed';
+      } else if (env.GZ_DB && settingsSnapshot) {
+        try {
+          await saveSettings(env.GZ_DB, (prev) => {
+            const state = normalizeAdvisorApplication(prev?.aiAdvisorApplication ?? settingsSnapshot?.aiAdvisorApplication ?? defaultAdvisorApplication());
+            const baseline = networkSnapshot && Number.isFinite(networkSnapshot.failureRate)
+              ? { successRate: Math.max(0, Math.min(1, 1 - networkSnapshot.failureRate)), updatedAt: networkSnapshot.updatedAt }
+              : null;
+            const next = applyAdvisorTransport(state, recommendation.transport, constraints.transports, baseline);
+            applicationStatus = next.status;
+            return { ...(prev ?? settingsSnapshot!), aiAdvisorApplication: next };
+          });
+        } catch { /* advisor application is best-effort and never blocks diagnostics */ }
+      }
       return {
         ai: true,
         model,
         summary,
         strategyRecommendation: recommendation,
+        advisorApplicationStatus: applicationStatus,
         // Never return raw model output. Render only the validated enum/numeric fields.
-        text: localAdvice(summary, language, false) + strategyAdvice(recommendation, language),
+        text: localAdvice(summary, language, false) + strategyAdvice(recommendation, language, applicationStatus),
       };
     } catch (error) {
       const now = Date.now();
@@ -372,6 +425,7 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
     model: null,
     summary,
     strategyRecommendation: null,
+    advisorApplicationStatus: advisorApplication.status,
     text: localAdvice(summary, language, true),
   };
 }

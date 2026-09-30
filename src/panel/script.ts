@@ -423,8 +423,39 @@ export const PANEL_JS = String.raw`
       $('#s-subpath').value = s.subPath || '';
       $('#s-panelpath').value = s.panelPath || '';
       $('#s-resetcycle').value = s.resetCycle || 'none';
+      var applyToggle = $('#ai-advisor-apply');
+      var killButton = $('#ai-advisor-kill');
+      var controlStatus = $('#ai-advisor-control-status');
+      if (applyToggle) {
+        applyToggle.checked = !!s.aiAdvisorEnabled;
+        applyToggle.disabled = !!s.aiAdvisorKillSwitch || !!s.aiAdvisorKilled;
+      }
+      if (killButton) {
+        killButton.textContent = s.aiAdvisorKillSwitch ? t('aiAdvisorKillEnv') : (s.aiAdvisorKilled ? t('aiAdvisorUnkill') : t('aiAdvisorKill'));
+        killButton.disabled = !!s.aiAdvisorKillSwitch;
+      }
+      if (controlStatus) controlStatus.textContent = t('aiAdvisorStatus') + ': ' + String(s.aiAdvisorStatus || 'advisory');
       renderDash();
     }).catch(function () {});
+  }
+
+  function saveAdvisorControl(body) {
+    api('/settings', { method: 'POST', body: JSON.stringify(body) })
+      .then(function () { return api('/settings'); })
+      .then(function (s) {
+        S.settings = s;
+        var toggle = $('#ai-advisor-apply');
+        if (toggle) { toggle.checked = !!s.aiAdvisorEnabled; toggle.disabled = !!s.aiAdvisorKillSwitch || !!s.aiAdvisorKilled; }
+        var killButton = $('#ai-advisor-kill');
+        if (killButton) {
+          killButton.textContent = s.aiAdvisorKillSwitch ? t('aiAdvisorKillEnv') : (s.aiAdvisorKilled ? t('aiAdvisorUnkill') : t('aiAdvisorKill'));
+          killButton.disabled = !!s.aiAdvisorKillSwitch;
+        }
+        var status = $('#ai-advisor-control-status');
+        if (status) status.textContent = t('aiAdvisorStatus') + ': ' + String(s.aiAdvisorStatus || 'advisory');
+        toast(t('saved'), 'ok');
+      })
+      .catch(function (e) { toast(e.message, 'err'); loadSettings(); });
   }
 
   function saveSettings() {
@@ -572,6 +603,13 @@ export const PANEL_JS = String.raw`
     $('#add-user-btn').addEventListener('click', openAddUser);
     $('#save-settings').addEventListener('click', saveSettings);
     $('#ai-advisor-btn').addEventListener('click', runAiAdvisor);
+    $('#ai-advisor-apply').addEventListener('change', function (event) {
+      saveAdvisorControl({ aiAdvisorEnabled: !!event.target.checked });
+    });
+    $('#ai-advisor-kill').addEventListener('click', function () {
+      if (!S.settings || S.settings.aiAdvisorKillSwitch) return;
+      saveAdvisorControl({ aiAdvisorKilled: !S.settings.aiAdvisorKilled });
+    });
   });
 })();
 `;

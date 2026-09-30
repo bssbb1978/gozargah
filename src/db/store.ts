@@ -11,6 +11,7 @@
 
 import { DEFAULTS, SCHEMA_VERSION, ResetCycle } from '../config';
 import type { AdaptiveGuardState } from '../ai/adaptive-guard';
+import type { AdvisorApplicationState } from '../ai/advisor-application';
 
 export interface SettingsBlob {
   schemaVersion: number;
@@ -19,6 +20,8 @@ export interface SettingsBlob {
   proxyIPs: string[];
   /** 2.12 — alternate domains pointing at the same Worker (emergency entry ladder). */
   backupEntryHosts?: string[];
+  /** Workers AI transport preference controller; advisory by default. */
+  aiAdvisorApplication?: AdvisorApplicationState;
   /** rolling quota-reset window for every non-admin user */
   resetCycle: ResetCycle;
   passwordSalt: string;

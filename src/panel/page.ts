@@ -160,6 +160,11 @@ ${particles()}
             </div>
             <button class="btn primary sm" id="ai-advisor-btn" type="button" data-i18n="aiAdvisorRun"></button>
           </div>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px">
+            <label class="hint" style="display:flex;align-items:center;gap:8px"><input id="ai-advisor-apply" type="checkbox"><span data-i18n="aiAdvisorApply"></span></label>
+            <button class="btn sm" id="ai-advisor-kill" type="button"></button>
+            <span class="hint" id="ai-advisor-control-status" role="status"></span>
+          </div>
           <div id="ai-advisor-result" role="status" aria-live="polite" style="white-space:pre-wrap;line-height:1.9;margin-top:12px"></div>
         </section>
         <div class="events glass" style="padding-bottom:6px">

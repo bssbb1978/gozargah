@@ -32,6 +32,7 @@ import { classifyFailureDomain, classifyNetworkCondition, normalizeFetchFailure 
 import { buildDecisionView } from '../ai/decision';
 import type { RegimeAssessment } from '../ai/regime';
 import { shapeModeFor } from '../utils/shape';
+import { advisorKillSwitchEnabled, normalizeAdvisorApplication, setAdvisorApplicationControls } from '../ai/advisor-application';
 
 const JSON_CT = 'application/json; charset=utf-8';
 
@@ -404,6 +405,8 @@ export async function handlePanelApi(
 
     if (action === 'settings' && method === 'GET') {
       const s = db ? await loadSettings(db) : null;
+      const advisor = normalizeAdvisorApplication(s?.aiAdvisorApplication);
+      const workerKillSwitch = advisorKillSwitchEnabled(env.AI_ADVISOR_KILL_SWITCH);
       return json({
         panelPath: s?.panelPath ?? eff.panelPath,
         subPath: s?.subPath ?? eff.subPath,
@@ -411,6 +414,11 @@ export async function handlePanelApi(
         backupEntryHosts: s?.backupEntryHosts ?? eff.backupEntryHosts ?? [],
         resetCycle: s?.resetCycle ?? eff.resetCycle ?? 'none',
         isDefaultPassword: s?.isDefaultPassword ?? eff.isDefaultPassword,
+        aiAdvisorEnabled: advisor.enabled,
+        aiAdvisorKilled: advisor.killed,
+        aiAdvisorKillSwitch: workerKillSwitch,
+        aiAdvisorStatus: workerKillSwitch ? 'killed' : advisor.status,
+        aiAdvisorActiveTransport: workerKillSwitch ? null : advisor.activeTransport,
         dbOk: eff.dbOk,
       });
     }
@@ -426,6 +434,13 @@ export async function handlePanelApi(
           pwIterations: eff.pwIterations, isDefaultPassword: eff.isDefaultPassword, createdAt: Date.now(),
         };
         const out: SettingsBlob = { ...cur };
+
+        if (typeof body.aiAdvisorEnabled === 'boolean' || typeof body.aiAdvisorKilled === 'boolean') {
+          out.aiAdvisorApplication = setAdvisorApplicationControls(out.aiAdvisorApplication, {
+            enabled: typeof body.aiAdvisorEnabled === 'boolean' ? body.aiAdvisorEnabled : undefined,
+            killed: typeof body.aiAdvisorKilled === 'boolean' ? body.aiAdvisorKilled : undefined,
+          });
+        }
 
         if (typeof body.panelPath === 'string') {
           const v = body.panelPath.trim().toLowerCase();
@@ -485,6 +500,10 @@ export async function handlePanelApi(
         await addEvent(db, 'password_changed', 'panel password updated');
       }
       invalidateCache();
+      if (typeof body.aiAdvisorEnabled === 'boolean' || typeof body.aiAdvisorKilled === 'boolean') {
+        const state = normalizeAdvisorApplication(next.aiAdvisorApplication);
+        await addEvent(db, 'ai_advisor_control', JSON.stringify({ enabled: state.enabled, killed: state.killed, status: state.status }));
+      }
       return json({ ok: true });
     }
 

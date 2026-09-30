@@ -20,6 +20,8 @@ export interface Env {
   AI?: { run: (model: string, input: unknown) => Promise<unknown> };
   /** Explicit prioritized model IDs; if absent, optional live model discovery is used. */
   AI_MODELS?: string;
+  /** Emergency Worker-level kill switch for all AI-advice application. */
+  AI_ADVISOR_KILL_SWITCH?: string;
   /** Optional Workers AI Read-scoped token for the fixed Cloudflare model-search API. */
   AI_CATALOG_API_TOKEN?: string;
   /** Cloudflare account ID for model discovery; not a secret. */

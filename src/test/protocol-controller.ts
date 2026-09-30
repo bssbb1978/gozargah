@@ -19,6 +19,21 @@ if (plan.diversity.transports.length < 2) throw new Error('transport diversity m
 if (!plan.reasonCodes.includes('network_recovery_bias')) throw new Error('recovery bias missing');
 if (!/^[0-9a-f]{8}$/.test(plan.policyFingerprint)) throw new Error('bad policy fingerprint');
 
+// Opt-in AI transport preference is a score hint, not an override of the plan.
+const wsCapability = profiles.find((p) => p.ready && p.transport === 'ws');
+const grpcCapability = profiles.find((p) => p.ready && p.transport === 'grpc');
+if (!wsCapability || !grpcCapability) throw new Error('transport preference fixture unavailable');
+const preferenceProfiles = [
+  { ...wsCapability, id: 'a-ws', protocol: 'vless' as const, score: 50 },
+  { ...grpcCapability, id: 'z-grpc', protocol: 'vless' as const, score: 50 },
+];
+const preferredPlan = buildAdaptiveProtocolPlan({ profiles: preferenceProfiles, preferredTransport: 'grpc', now: 2_000, limit: 2 });
+if (preferredPlan.selected !== 'z-grpc' || !preferredPlan.reasonCodes.includes('ai_advisor_transport_preference')) {
+  throw new Error('bounded AI transport preference was not applied to the capability-ready candidate');
+}
+const localPlan = buildAdaptiveProtocolPlan({ profiles: preferenceProfiles, now: 2_000, limit: 2 });
+if (localPlan.selected !== 'a-ws') throw new Error('default local ranking should remain authoritative without opt-in preference');
+
 // 2.12 regime: a calm network with a suspected aggregate regime change must
 // upgrade strategy to diversify and carry the reason code.
 const calmNet = { state: 'healthy' as const, quorum: 0.9, healthy: 3, degraded: 0, quarantined: 0, unknown: 0, total: 4, failureRate: 0.05, confidence: 0.8, anomalyScore: 0.1, signalClass: 'normal' as const, selectedPath: 'a', reasonCodes: ['healthy_quorum'], generatedAt: 2_000 };

@@ -30,9 +30,11 @@ This is lightweight statistical learning, not a large language model and not a D
 
 `diagnostics.ts` invokes Workers AI only for an authenticated, rate-limited aggregate operations-advice action. It receives aggregate panel counters and bounded profile-outcome aggregates (sample count, rounded success rate, 100 ms latency bucket, and freshness) — including `regimeState` as an aggregate statistics label — but never user credentials, UUIDs, subscription links, hostnames, IPs, packet contents, or private keys. The advisor is instructed that regime labels are not DPI/censorship diagnoses.
 
-The model is asked for one `axr-strategy-advice/v1` JSON object. `strategy-recommendation.ts` rejects prose, Markdown, unknown fields, unsupported transport/profile/entry aliases, and invalid types; numeric ranges are clamped. Entry and SNI choices are opaque aliases (`primary`, `backup_1`…) rather than hostnames. Only the normalized enum/numeric object is returned, and the panel text is rendered from that normalized object; raw model output is never returned or used by the proxy data path. The recommendation is advisory-only, not auto-applied. Invalid output, model failure, or unavailable AI falls back to deterministic local diagnostics and leaves the existing local adaptive controller in charge.
+The model is asked for one `axr-strategy-advice/v1` JSON object. `strategy-recommendation.ts` rejects prose, Markdown, unknown fields, unsupported transport/profile/entry aliases, and invalid types; numeric ranges are clamped. Entry and SNI choices are opaque aliases (`primary`, `backup_1`…) rather than hostnames. Only the normalized enum/numeric object is returned, and raw model output is never returned or executed.
 
-When `AI_CATALOG_ACCOUNT_ID` and `AI_CATALOG_API_TOKEN` are set, a Cloudflare model-catalog query is cached for six hours and candidate text models are ranked from available catalog metadata. `AI_MODELS` can explicitly prioritize IDs. Existing fallback model IDs remain a compatibility fallback if catalog discovery is unavailable; availability and plan eligibility are not guaranteed. D1 records per-model success/failure/quarantine where available; failures fall back to local deterministic advice.
+Application is **off by default**. When an operator opts in from the authenticated panel, only the validated `transport` enum may add a bounded `+6` preference to capability-ready candidates in the Worker-generated adaptive policy. It still passes local scoring and the adaptive guard. Profile, entry, SNI, fragment, and retry fields remain advisory. A fresh aggregate Worker-egress baseline is required; a ≥15 percentage-point success-rate drop after the five-minute hold rolls the preference back the next time the adaptive bundle is generated. This is not end-user or inside-Iran telemetry. The authenticated panel kill switch and `AI_ADVISOR_KILL_SWITCH=true` both stop application; the Worker variable takes precedence. The AXR Go client remains WebSocket-only, and AI advice does not enable an unsupported capability. Invalid output, model failure, or unavailable AI falls back to deterministic local diagnostics.
+
+When `AI_CATALOG_ACCOUNT_ID` and `AI_CATALOG_API_TOKEN` are set and `AI_MODELS` is absent, a Cloudflare live model-catalog query supplies ranked text-model candidates. Successful catalog results are cached per Worker isolate for six hours; an expired cached catalog is reused if refresh fails or returns no usable rows. After isolate eviction, built-in model IDs are the fallback. `AI_MODELS` explicitly overrides discovery. Model availability and plan eligibility are not guaranteed. D1 records per-model success/failure/quarantine where available; failures fall back to deterministic local advice.
 
 ## 2.11 DNS resolver ranking
 
@@ -41,8 +43,9 @@ DoH upstream ordering uses a bounded isolate-local EWMA latency and smoothed suc
 ## Non-claims
 
 - No AI model identifies DPI or proves censorship.
-- No AI output activates profiles, changes transports or overrides the capability matrix.
-- No AI inference is required for health scoring or recovery; the recommendation schema does not select or rank live network profiles.
-- The optional AI advisor is not on the data path, does not apply returned parameters, and does not prove a recommendation will work in a deployment.
+- AI cannot invent or enable a capability, bypass measured/local guards, or change the AXR Go client's WebSocket-only transport boundary.
+- The opt-in transport preference is a Worker-generated adaptive-policy hint, not proof that an origin engine is deployed, reachable, or healthy.
+- No AI inference is required for health scoring or recovery; deterministic local scoring remains authoritative.
+- The advisor never applies model text, entry/SNI aliases, fragmentation, or retry parameters, and no recommendation proves a deployment will work.
 - This Worker cannot restore connectivity when the user's network has no route to the Worker/Cloudflare edge.
 - DNS64 creates synthetic AAAA answers only; a reachable NAT64 translator is still required.
