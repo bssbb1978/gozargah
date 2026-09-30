@@ -187,8 +187,10 @@ axr validate -config axr.json -network mobile-data -isp "operator label" \
 The report's `simulation:false` means the command performed live socket
 operations, not that the network label or country was independently verified.
 The report contains entry hosts and dial addresses; review before sharing.
-The harness covers the AXR client's `ws`/`ws-alt` handshakes only—not gRPC,
-HTTP/2, XHTTP, or origin-engine listeners.
+The harness JSON declares its native AXR scope as `ws`/`ws-alt` and lists
+gRPC, HTTP/2, and XHTTP as not implemented by this Go client, so it does not
+probe them. Some such profiles are emitted for external Xray origin engines;
+that is separate from AXR client transport support and is not measured here.
 
 ## Honest boundaries
 

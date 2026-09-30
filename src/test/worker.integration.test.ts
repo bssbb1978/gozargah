@@ -10,6 +10,7 @@ import { defaultAdvisorApplication, setAdvisorApplicationControls } from '../ai/
 import { createDiagnostics, getAiModelCandidates, rankCatalogModels } from '../ai/diagnostics';
 
 let mf: Miniflare;
+let workerScript = '';
 let db: D1Database;
 let axrV2User: { uuid: string } | null = null;
 const SECRET = 'test-webhook-secret-should-not-be-used-in-production';
@@ -27,10 +28,11 @@ beforeAll(async () => {
     entryPoints: ['src/index.ts'], bundle: true, format: 'esm', platform: 'browser',
     target: 'es2022', write: false, logLevel: 'silent', external: ['cloudflare:sockets'],
   });
+  workerScript = bundled.outputFiles[0].text;
   mf = new Miniflare({
     workers: [
       {
-        name: 'gozargah-test', script: bundled.outputFiles[0].text, modules: true,
+        name: 'gozargah-test', script: workerScript, modules: true,
         compatibilityDate: '2025-01-15', compatibilityFlags: ['nodejs_compat'],
         d1Databases: ['GZ_DB'],
         bindings: {
@@ -82,6 +84,61 @@ describe('Cloudflare Worker + D1 integration', () => {
     expect(response.status).toBe(200);
     // Compare with the shared constant, not a literal, so version bumps can't leave this test stale.
     expect(await response.json()).toMatchObject({ ok: true, version: VERSION });
+  });
+
+  it('forces a staging first-login password change and blocks panel APIs until completion', async () => {
+    const forceWorker = new Miniflare({
+      workers: [{
+        name: 'gozargah-force-password-test',
+        script: workerScript,
+        modules: true,
+        compatibilityDate: '2025-01-15',
+        compatibilityFlags: ['nodejs_compat'],
+        d1Databases: ['GZ_DB'],
+        bindings: { FORCE_INITIAL_PASSWORD_CHANGE: 'true' },
+      }],
+    });
+    try {
+      const status = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/status');
+      expect(status.status).toBe(200);
+      expect(await status.json()).toMatchObject({ dbOk: true, isDefaultPassword: true, passwordChangeRequired: true });
+
+      const login = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin' }),
+      });
+      expect(login.status).toBe(200);
+      expect(await login.json()).toMatchObject({ ok: true, passwordChangeRequired: true });
+      const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
+      expect(cookie).toMatch(/^gz_session=/);
+
+      const blocked = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/users', {
+        headers: { cookie },
+      });
+      expect(blocked.status).toBe(428);
+      expect(await blocked.json()).toMatchObject({ error: 'password_change_required' });
+
+      const changed = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/password', {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({ newPassword: 'staging-only-new-password' }),
+      });
+      expect(changed.status).toBe(200);
+      expect(changed.headers.get('set-cookie')).toContain('Max-Age=0');
+      expect(await changed.json()).toMatchObject({ ok: true, passwordChanged: true });
+
+      const postChangeStatus = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/status');
+      expect(await postChangeStatus.json()).toMatchObject({ isDefaultPassword: false, passwordChangeRequired: false });
+      const oldPassword = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin' }),
+      });
+      expect(oldPassword.status).toBe(401);
+      const newPassword = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'staging-only-new-password' }),
+      });
+      expect(newPassword.status).toBe(200);
+      expect(await newPassword.json()).toMatchObject({ ok: true, passwordChangeRequired: false });
+    } finally {
+      await forceWorker.dispose();
+    }
   });
 
   it('forwards authenticated DoH requests and synthesizes RFC 6052 DNS64 records', async () => {

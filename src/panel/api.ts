@@ -78,6 +78,7 @@ export async function handlePanelApi(
         version: VERSION,
         dbOk: eff.dbOk,
         isDefaultPassword: eff.isDefaultPassword,
+        passwordChangeRequired: env.FORCE_INITIAL_PASSWORD_CHANGE === 'true' && eff.isDefaultPassword,
         host: new URL(request.url).hostname,
         logs: logRing.slice(-12),
       });
@@ -98,7 +99,10 @@ export async function handlePanelApi(
       }
       if (db) await addEvent(db, 'login_ok', 'panel login');
       const token = await makeSessionToken(eff);
-      return json({ ok: true }, 200, new Headers({ 'set-cookie': sessionCookie(token) }));
+      return json({
+        ok: true,
+        passwordChangeRequired: env.FORCE_INITIAL_PASSWORD_CHANGE === 'true' && eff.isDefaultPassword,
+      }, 200, new Headers({ 'set-cookie': sessionCookie(token) }));
     }
 
     /* 2.16 — clean-IP harvest ingest. Public (no session cookie) but
@@ -169,6 +173,36 @@ export async function handlePanelApi(
     }
 
     await requireAuth(request, eff);
+
+    const passwordChangeRequired = env.FORCE_INITIAL_PASSWORD_CHANGE === 'true' && eff.isDefaultPassword;
+    if (passwordChangeRequired && action === 'password' && method === 'POST') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+      if (Object.keys(body).length !== 1 || typeof body.newPassword !== 'string') {
+        throw new GzError('provide only newPassword', 'validation');
+      }
+      if (body.newPassword.length < 8) throw new GzError('password too short (min 8)', 'validation');
+      const salt = randomHex(16);
+      const hash = await pbkdf2Hex(body.newPassword, salt, eff.pwIterations);
+      await saveSettings(db, (prev) => {
+        if (!prev || !prev.isDefaultPassword) {
+          throw new GzError('initial password change is no longer required', 'conflict');
+        }
+        return {
+          ...prev,
+          passwordSalt: salt,
+          passwordHash: hash,
+          pwIterations: eff.pwIterations,
+          isDefaultPassword: false,
+        };
+      });
+      invalidateCache();
+      await addEvent(db, 'password_changed', 'staging initial panel password changed');
+      // The session signature is derived from the password hash; force a fresh
+      // login with the newly chosen password instead of retaining a stale cookie.
+      return json({ ok: true, passwordChanged: true }, 200, new Headers({ 'set-cookie': clearedCookie() }));
+    }
+    if (passwordChangeRequired) return json({ error: 'password_change_required' }, 428);
 
     const userControlRoute = action === 'users' || action.startsWith('users/') || action === 'user-audit';
     if (userControlRoute && ['GET', 'POST', 'PATCH', 'DELETE'].includes(method)) {
@@ -733,6 +767,9 @@ export async function handlePanelApi(
     }
     if (e instanceof GzError && e.code === 'not_found') {
       return json({ error: e.message }, 404);
+    }
+    if (e instanceof GzError && e.code === 'conflict') {
+      return json({ error: e.message }, 409);
     }
     if (e instanceof GzError && e.code === 'no_db') {
       return json({ error: 'database_not_bound' }, 503);

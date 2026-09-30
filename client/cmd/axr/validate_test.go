@@ -62,7 +62,12 @@ func TestValidationFailurePhasesAreCoarseAndCredentialFree(t *testing.T) {
 func TestValidationReportLabelsRealMeasurementSchema(t *testing.T) {
 	report := validationReport{
 		Schema: validationSchema, EvidenceClass: "live_socket_observation", Simulation: false,
-		NetworkLabel: "mobile", ISPLabel: "carrier", Measurements: []validationMeasurement{{FallbackTier: 1, HandshakeOK: true}},
+		NetworkLabel: "mobile", ISPLabel: "carrier",
+		TransportCoverage: validationTransportCoverage{
+			ClientTransportsProbed: []string{"ws", "ws-alt"},
+			NotImplementedByAXR:    []string{"grpc", "http2", "xhttp"},
+		},
+		Measurements: []validationMeasurement{{FallbackTier: 1, HandshakeOK: true}},
 	}
 	encoded, err := json.Marshal(report)
 	if err != nil {
@@ -78,5 +83,9 @@ func TestValidationReportLabelsRealMeasurementSchema(t *testing.T) {
 	rows, ok := decoded["measurements"].([]any)
 	if !ok || len(rows) != 1 || rows[0].(map[string]any)["fallback_tier"] != float64(1) {
 		t.Fatalf("fallback tier missing from JSON report: %s", encoded)
+	}
+	coverage, ok := decoded["transport_coverage"].(map[string]any)
+	if !ok || len(coverage["client_transports_probed"].([]any)) != 2 || len(coverage["not_implemented_by_axr_client"].([]any)) != 3 {
+		t.Fatalf("report must name supported and unimplemented native transports: %s", encoded)
 	}
 }

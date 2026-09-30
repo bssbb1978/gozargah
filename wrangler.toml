@@ -6,11 +6,12 @@ compatibility_date = "2025-01-15"
 # D1 database (required for panel persistence: users + settings)
 # Create it once, then paste the returned database_id below:
 #     npx wrangler d1 create gozargah
+# Replace the marked all-zero placeholder before any non-dry-run deploy.
 # ---------------------------------------------------------------
 [[d1_databases]]
 binding = "GZ_DB"
 database_name = "gozargah"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "00000000-0000-0000-0000-000000000000" # PLACEHOLDER — production D1 ID required
 
 # Optional, native Cloudflare-hosted inference used only by the read-only
 # aggregate operations advisor. Remove this binding to disable AI entirely.
@@ -23,3 +24,25 @@ enabled = true
 # Periodic health loop. It probes only endpoints saved in D1 settings.
 [triggers]
 crons = ["*/5 * * * *"]
+
+# Isolated staging deployment. Create a dedicated D1 database, then replace
+# the all-zero ID below before deploying. The deploy workflow blocks live
+# deploys while this placeholder remains. Never point staging at production D1.
+[env.staging]
+name = "gozargah-staging"
+workers_dev = true
+
+[[env.staging.d1_databases]]
+binding = "GZ_DB"
+database_name = "gozargah-staging"
+database_id = "00000000-0000-0000-0000-000000000000" # PLACEHOLDER — replace with staging D1 ID
+migrations_dir = "migrations"
+
+[env.staging.ai]
+binding = "AI"
+
+[env.staging.vars]
+FORCE_INITIAL_PASSWORD_CHANGE = "true"
+
+[env.staging.observability]
+enabled = true

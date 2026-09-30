@@ -28,26 +28,33 @@ const validationSchema = "axr-network-validation/v1"
 
 // validationReport is one locally measured run. `simulation` is always false
 // here; tests do not construct/export this report from simulated probe data.
+type validationTransportCoverage struct {
+	ClientTransportsProbed []string `json:"client_transports_probed"`
+	NotImplementedByAXR    []string `json:"not_implemented_by_axr_client"`
+	Note                   string   `json:"note"`
+}
+
 type validationReport struct {
-	Schema               string                  `json:"schema"`
-	EvidenceClass        string                  `json:"evidence_class"`
-	MeasurementScope     string                  `json:"measurement_scope"`
-	Simulation           bool                    `json:"simulation"`
-	RunID                string                  `json:"run_id"`
-	StartedAtUTC         string                  `json:"started_at_utc"`
-	FinishedAtUTC        string                  `json:"finished_at_utc"`
-	NetworkLabel         string                  `json:"network_label"`
-	ISPLabel             string                  `json:"isp_label"`
-	Destination          string                  `json:"destination"`
-	ProbeDefinition      string                  `json:"probe_definition"`
-	FallbackOrder        string                  `json:"fallback_order"`
-	RequestedRepeats     int                     `json:"requested_repeats"`
-	SuccessfulRepeats    int                     `json:"successful_repeats"`
-	TotalHandshakes      int                     `json:"total_handshakes"`
-	SuccessfulHandshakes int                     `json:"successful_handshakes"`
-	FailedHandshakes     int                     `json:"failed_handshakes"`
-	FallbackTierCounts   map[string]int          `json:"fallback_tier_counts"`
-	Measurements         []validationMeasurement `json:"measurements"`
+	Schema               string                      `json:"schema"`
+	EvidenceClass        string                      `json:"evidence_class"`
+	MeasurementScope     string                      `json:"measurement_scope"`
+	Simulation           bool                        `json:"simulation"`
+	RunID                string                      `json:"run_id"`
+	StartedAtUTC         string                      `json:"started_at_utc"`
+	FinishedAtUTC        string                      `json:"finished_at_utc"`
+	NetworkLabel         string                      `json:"network_label"`
+	ISPLabel             string                      `json:"isp_label"`
+	Destination          string                      `json:"destination"`
+	ProbeDefinition      string                      `json:"probe_definition"`
+	FallbackOrder        string                      `json:"fallback_order"`
+	TransportCoverage    validationTransportCoverage `json:"transport_coverage"`
+	RequestedRepeats     int                         `json:"requested_repeats"`
+	SuccessfulRepeats    int                         `json:"successful_repeats"`
+	TotalHandshakes      int                         `json:"total_handshakes"`
+	SuccessfulHandshakes int                         `json:"successful_handshakes"`
+	FailedHandshakes     int                         `json:"failed_handshakes"`
+	FallbackTierCounts   map[string]int              `json:"fallback_tier_counts"`
+	Measurements         []validationMeasurement     `json:"measurements"`
 }
 
 type validationMeasurement struct {
@@ -112,17 +119,22 @@ func runValidate(args []string) {
 	}
 	started := time.Now().UTC()
 	report := validationReport{
-		Schema:             validationSchema,
-		EvidenceClass:      "live_socket_observation",
-		MeasurementScope:   "current host route; network and ISP labels are operator supplied and not independently verified",
-		Simulation:         false,
-		RunID:              uid,
-		StartedAtUTC:       started.Format(time.RFC3339Nano),
-		NetworkLabel:       networkLabel,
-		ISPLabel:           ispLabel,
-		Destination:        net.JoinHostPort(destHost, strconv.Itoa(destPort)),
-		ProbeDefinition:    "TCP dial + TLS + WebSocket upgrade + VLESS OK + Worker-side TCP connect to destination; no application payload",
-		FallbackOrder:      "AXR failover health/priority candidate order; tier is the zero-based attempted candidate index",
+		Schema:           validationSchema,
+		EvidenceClass:    "live_socket_observation",
+		MeasurementScope: "current host route; network and ISP labels are operator supplied and not independently verified",
+		Simulation:       false,
+		RunID:            uid,
+		StartedAtUTC:     started.Format(time.RFC3339Nano),
+		NetworkLabel:     networkLabel,
+		ISPLabel:         ispLabel,
+		Destination:      net.JoinHostPort(destHost, strconv.Itoa(destPort)),
+		ProbeDefinition:  "TCP dial + TLS + WebSocket upgrade + VLESS OK + Worker-side TCP connect to destination; no application payload",
+		FallbackOrder:    "AXR failover health/priority candidate order; tier is the zero-based attempted candidate index",
+		TransportCoverage: validationTransportCoverage{
+			ClientTransportsProbed: []string{"ws", "ws-alt"},
+			NotImplementedByAXR:    []string{"grpc", "http2", "xhttp"},
+			Note:                   "gRPC, HTTP/2, and XHTTP may be emitted in external Xray origin-engine profiles, but the native Go AXR client does not implement them and this command does not probe them.",
+		},
 		RequestedRepeats:   *repeats,
 		FallbackTierCounts: map[string]int{},
 		Measurements:       make([]validationMeasurement, 0, *repeats),

@@ -24,6 +24,16 @@ jobs:
             echo "deploy=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Setup Node 22 for deploy safety checks
+        if: steps.check.outputs.deploy == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Guard target D1 ID before live deploy
+        if: steps.check.outputs.deploy == 'true'
+        run: node scripts/guard-deploy-config.mjs
+
       - name: Deploy
         if: steps.check.outputs.deploy == 'true'
         uses: cloudflare/wrangler-action@v4

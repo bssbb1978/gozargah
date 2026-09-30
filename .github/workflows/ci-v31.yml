@@ -412,6 +412,12 @@ jobs:
       - name: Clean install (npm ci)
         run: npm ci
 
+      - name: Deploy safety guard tests
+        run: node scripts/test-deploy-guard.mjs
+
+      - name: Staging smoke-script tests (mock responses only)
+        run: node scripts/test-smoke-staging.mjs
+
       - name: "Gate 1 — TypeScript type check (npx tsc --noEmit)"
         run: npx tsc --noEmit
 
