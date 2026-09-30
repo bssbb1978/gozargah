@@ -418,6 +418,9 @@ jobs:
       - name: Staging smoke-script tests (mock responses only)
         run: node scripts/test-smoke-staging.mjs
 
+      - name: Cloudflare preflight tests (local mock API, no credentials)
+        run: node scripts/test-cf-preflight.mjs
+
       - name: "Gate 1 — TypeScript type check (npx tsc --noEmit)"
         run: npx tsc --noEmit
 

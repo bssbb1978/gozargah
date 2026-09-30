@@ -21,6 +21,8 @@
 
 **توصیهٔ عملی:** یک توکن پایدار برای CI با `Workers → Editor` (ترجیحاً scoped به همان Worker) و یک توکن موقت با `D1 → Edit` که بعد از راه‌اندازی revoke شود. Global API Key استفاده نکنید و مقدار توکن را در چت نفرستید.
 
+> 🔍 **نوع توکن هم مهم است:** User API Token (پیشوند `cfut_`) روی `GET /user/tokens/verify` تأیید می‌شود و Account-owned token (پیشوند `cfat_`) روی `GET /accounts/{account_id}/tokens/verify`. اگر توکن حساب‌محور را روی endpoint کاربر تست کنید، خطای **کد ۱۰۰۰** می‌گیرید که معنایش «توکن خراب» نیست؛ wrangler 4.143.0 هم دقیقاً از همین کد ۱۰۰۰ برای تشخیص «توکن حساب‌محور» استفاده می‌کند (سورس `getTokenType`). راهنمای گام‌به‌گام و ابزار بررسی: `docs/DEPLOY-RUNBOOK-FA.md` و `npm run preflight:cf`.
+
 > ⚠️ اگر Worker مقصد **هنوز ساخته نشده**، توکن scoped-per-Worker کار نمی‌کند (چون خود Worker وجود ندارد و per-Worker access به Worker ناموجود قابل‌دادن نیست). دو راه: (الف) بار اول با دسترسی سطح محصول بسازید و بعد توکن CI را به Editor محدود کنید، یا (ب) Worker را یک بار از داشبورد بسازید و بعد با توکن Editor دیپلوی کنید.
 
 ---
@@ -207,6 +209,17 @@ gh secret set CLOUDFLARE_ACCOUNT_ID -R bssbb1978/gozargah
 
 ---
 
+## پیوست — یافته‌های دور دوم بررسی (از سورس wrangler 4.143.0 و مستندات تأیید شد)
+
+| یافته | جزئیات | شاهد |
+|---|---|---|
+| تشخیص نوع توکن در wrangler | `getTokenType`: اول `/user/tokens/verify`؛ اگر خطای کد ۱۰۰۰ برگشت، توکن «حساب‌محور» است | `node_modules/wrangler/wrangler-dist/cli.js` |
+| خروجی `wrangler whoami` | «You are logged in with an Account API Token…»، جدول `Account Name`/`Account ID`، پیام «The API Token is read from the CLOUDFLARE_API_TOKEN environment variable» و لینک زندهٔ مجوزها: `https://dash.cloudflare.com/<account_id>/api-tokens` (توکن کاربر: `/profile/api-tokens`) | همان سورس |
+| هشدارهای بی‌ضرر | «Unable to retrieve email… User->User Details->Read» و «Unable to get membership roles… User->Memberships->Read» فقط تشخیصی‌اند و Deploy را متوقف نمی‌کنند | همان سورس |
+| مسیرهای داشبورد | توکن کاربر: My Profile → API Tokens؛ توکن حسابی: Manage account → Account API tokens؛ ساخت توکن حسابی نیازمند Provisioning یا Super Admin و فقط زیرمجموعهٔ مجوزهای خودِ عضو | [مستندات توکن حسابی](https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/) |
+| ابزار جدید | `scripts/cf-preflight.mjs` (+ `scripts/test-cf-preflight.mjs` با mock محلی و `npm run preflight:cf`) توکن، Workerها، D1ها و تطبیق UUID با `wrangler.toml` را فقط‌خواندنی بررسی می‌کند و مقدار توکن را هرگز چاپ نمی‌کند؛ تست آن در CI داخل job همان Worker اجرا می‌شود | اجرای محلی: ۷/۷ تست سبز |
+| محدودیت محیط بررسی | این sandbox به `api.cloudflare.com` دسترسی شبکه ندارد (`SSL_ERROR_SYSCALL`)، پس هیچ تماس واقعی API برای بررسی انجام نشد و شکل پاسخ‌ها از سورس/مستندات نقل شده است | `curl` ناموفق |
+
 ## ۷. شواهد اجراشده در همین جلسه
 
 ```
@@ -222,7 +235,11 @@ npx wrangler d1 migrations apply --help → نیازمند <database> + پرچم
 سورس wrangler 4.143.0                   → triggers: inheritable(…) / d1_databases: notInheritable(…)
 gh run view 36682857775                 → Guard/Deploy = skipped؛ annotation: secrets not configured
 gh pr view 8                            → MERGED (2026-09-30T07:17:28Z)
-gh pr list --state open                 → خالی
+gh pr list --state open                 → خالی (دور اول)
+node scripts/test-cf-preflight.mjs      → Cloudflare preflight tests: 7/7 passed (mock محلی، بدون شبکه)
+npx js-yaml .github/workflows/ci-v31.yml → YAML valid (استپ تست preflight اضافه شد)
+grep سورس wrangler                      → getTokenType + رشته‌های whoami + لینک مجوزها
+curl https://api.cloudflare.com/...     → ناموفق: این محیط دسترسی شبکه به API کلادفلر ندارد
 ```
 
 ## ۸. منابع
