@@ -11,7 +11,7 @@ compatibility_date = "2025-01-15"
 [[d1_databases]]
 binding = "GZ_DB"
 database_name = "gozargah"
-database_id = "00000000-0000-0000-0000-000000000000" # PLACEHOLDER — production D1 ID required
+database_id = "e30094a9-9fac-4335-bc3b-4a146a94ba5a" # PLACEHOLDER — production D1 ID required
 
 # Optional, native Cloudflare-hosted inference used only by the read-only
 # aggregate operations advisor. Remove this binding to disable AI entirely.
@@ -35,7 +35,7 @@ workers_dev = true
 [[env.staging.d1_databases]]
 binding = "GZ_DB"
 database_name = "gozargah-staging"
-database_id = "00000000-0000-0000-0000-000000000000" # PLACEHOLDER — replace with staging D1 ID
+database_id = "e30094a9-9fac-4335-bc3b-4a146a94ba5a" # PLACEHOLDER — replace with staging D1 ID
 migrations_dir = "migrations"
 
 [env.staging.ai]
