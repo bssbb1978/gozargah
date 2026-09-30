@@ -67,7 +67,8 @@ Without the `axr_utls` tag the handshake uses the OS-native Go TLS identity
 ```json
 {
   "uuid": "6b7c6e12-5038-4b4c-a11b-714c9e089d6e",
-  "manifest_url": "https://entry.example.com/sub/<token>/axr-manifest",
+  "manifest_url": "https://entry.example.com/<dynamic-prefix>/<route-key>/axr-manifest",
+  "manifest_dial_ips": [],
   "entries": [
     { "host": "entry.example.com", "priority": 0 },
     { "host": "backup.example.com", "ips": ["104.16.0.1"], "fp": "firefox", "priority": 1 }
@@ -92,7 +93,38 @@ neutral fingerprint, worker-measured backup entries, **clean-IP hints**
 entry). The manifest v3 **`manifest_sig` is verified** (HMAC-SHA256 keyed by
 the token): a tampered feed is rejected and the last-known-good state is
 kept (`~/.axr/manifest-lastgood.json` persists the last verified raw JSON).
-`ws_path` (`"/sub/<token>/<pathbase>?ed=2048"`) is the explicit alternative.
+
+For a hostname URL, `manifest_dial_ips` optionally supplies candidate TCP
+addresses. AXR dials each candidate, then falls back to DNS; TLS SNI,
+certificate verification, and HTTP `Host` remain the hostname in
+`manifest_url`. Existing entry IPs for the same hostname and the signed
+manifest's learned hints are also candidates. This is an AXR-specific dial
+override, not a browser or generic-app URL feature.
+
+A direct-IP manifest URL is also configurable for clients that need it, but
+requires `manifest_host`:
+
+```json
+{
+  "manifest_url": "https://<CLOUDFLARE-IP>/<dynamic-prefix>/<route-key>/axr-manifest",
+  "manifest_host": "<WORKER-HOSTNAME>",
+  "manifest_dial_ips": ["<CLIENT-MEASURED-CLOUDFLARE-IP>"]
+}
+```
+
+AXR sets both TLS SNI and HTTP `Host` to `manifest_host` and still verifies
+the certificate for that hostname. This remains a client-side custom request:
+it is not equivalent to opening the IP URL in an ordinary browser, and a
+Cloudflare edge may still reject or fail to route it. No live Worker hostname
+was available to verify this path in this change; try from the actual client
+network before treating it as usable. Do not put Google, Amazon, OVH, or
+Hetzner server IPs in a Cloudflare edge list: they do not become Worker
+endpoints without a separate proxy/server.
+
+Harvested addresses are best-effort client hints, not globally certified
+“clean” IPs. AXR validates each connection's TLS hostname/certificate; local
+reachability differs by network. `ws_path` (`"/sub/<token>/<pathbase>?ed=2048"`)
+is the explicit alternative.
 
 ```sh
 ./axr -config axr.json -socks 127.0.0.1:1080 -v

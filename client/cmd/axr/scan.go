@@ -185,16 +185,20 @@ func uploadHarvest(cfg Config, ips []string) error {
 	}
 	urlStr := cfg.HarvestURL
 	if urlStr == "" {
-		urlStr = harvestURLFromManifest(cfg.ManifestURL)
+		urlStr = harvestURLFromManifest(cfg.ManifestURL, cfg.ManifestHost)
 	}
 	if urlStr == "" {
 		return fmt.Errorf("no harvest URL (set harvest_url or manifest_url)")
 	}
-	body, err := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"token":  token,
 		"ips":    ips,
 		"source": "client-scan",
-	})
+	}
+	if prefix := subscriptionRoutePrefixFromURL(cfg.ManifestURL); prefix != "" {
+		payload["dynamicPrefix"] = prefix
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -227,17 +231,21 @@ func postCanary(cfg Config, host string, ok bool) error {
 	}
 	urlStr := cfg.HarvestURL
 	if urlStr == "" {
-		urlStr = harvestURLFromManifest(cfg.ManifestURL)
+		urlStr = harvestURLFromManifest(cfg.ManifestURL, cfg.ManifestHost)
 	}
 	if urlStr == "" {
 		return fmt.Errorf("no harvest URL (set harvest_url or manifest_url)")
 	}
-	body, err := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"token":      token,
 		"kind":       "canary",
 		"canaryHost": host,
 		"canaryOk":   ok,
-	})
+	}
+	if prefix := subscriptionRoutePrefixFromURL(cfg.ManifestURL); prefix != "" {
+		payload["dynamicPrefix"] = prefix
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}

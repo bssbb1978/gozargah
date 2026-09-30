@@ -196,7 +196,7 @@ export const PANEL_JS = String.raw`
     setVersion(st.version || GZ.version || '');
     $('#pw-warn').classList.toggle('hidden', !(st.isDefaultPassword || GZ.isDefaultPassword));
     if (admin) {
-      var sub = location.origin + '/' + (S.settings ? S.settings.subPath : 'sub') + '/' + (admin.subToken || '');
+      var sub = location.origin + '/' + (admin.dynamicPrefix || (S.settings ? S.settings.subPath : 'sub')) + '/' + (admin.routeKey || admin.subToken || '');
       $('#admin-sub').textContent = sub;
       $('#admin-sub').setAttribute('data-copy', sub);
     }

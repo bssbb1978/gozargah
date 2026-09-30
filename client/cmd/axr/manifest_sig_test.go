@@ -119,6 +119,15 @@ func TestSubTokenFromURL(t *testing.T) {
 	}
 }
 
+func TestSubscriptionRoutePrefixFromURL(t *testing.T) {
+	if got := subscriptionRoutePrefixFromURL("https://worker.example.com/p-0123456789abcdef01234567/" + strings.Repeat("a", 64) + "/axr-manifest"); got != "p-0123456789abcdef01234567" {
+		t.Fatalf("dynamic route prefix = %q", got)
+	}
+	if got := subscriptionRoutePrefixFromURL("https://worker.example.com/sub/token/axr-manifest"); got != "" {
+		t.Fatalf("legacy subscription must not claim a dynamic prefix: %q", got)
+	}
+}
+
 func TestHarvestURLFromManifest(t *testing.T) {
 	got := harvestURLFromManifest("https://panel.example.com/sub/tok123/axr-manifest")
 	want := "https://panel.example.com/gozargah/api/network/harvest"
@@ -127,6 +136,12 @@ func TestHarvestURLFromManifest(t *testing.T) {
 	}
 	if harvestURLFromManifest("bad") != "" {
 		t.Fatal("bad URL must return empty")
+	}
+	if harvestURLFromManifest("https://104.16.0.1/prefix/key/axr-manifest") != "" {
+		t.Fatal("IP manifest URL without hostname must not create a raw-IP harvest URL")
+	}
+	if got := harvestURLFromManifest("https://104.16.0.1/prefix/key/axr-manifest", "worker.example.com"); got != "https://worker.example.com/gozargah/api/network/harvest" {
+		t.Fatalf("IP manifest harvest URL = %q", got)
 	}
 }
 

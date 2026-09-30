@@ -35,7 +35,6 @@ import (
 	"math/big"
 	mrand "math/rand"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -69,10 +68,16 @@ type Config struct {
 	// UUID is the VLESS user UUID (dashed or plain hex).
 	UUID string `json:"uuid"`
 	// ManifestURL is the worker axr-manifest feed, e.g.
-	// https://host/sub/<token>/axr-manifest. It bootstraps the rotated WS
+	// https://host/<prefix>/<route-key>/axr-manifest. It bootstraps the rotated WS
 	// path, live regime/backup entries, and the probe cadence. Optional when
 	// WSPath is set explicitly.
 	ManifestURL string `json:"manifest_url,omitempty"`
+	// ManifestHost is required only when ManifestURL is an IP URL. It supplies
+	// the TLS SNI/certificate name and HTTP Host for that direct-IP request.
+	ManifestHost string `json:"manifest_host,omitempty"`
+	// ManifestDialIPs are best-effort TCP dial overrides for the manifest URL.
+	// TLS SNI, certificate verification, and HTTP Host remain the URL hostname.
+	ManifestDialIPs []string `json:"manifest_dial_ips,omitempty"`
 	// WSPath is the full WebSocket path incl. query, e.g.
 	// /sub/<token>/<pathbase>?ed=2048. Used when ManifestURL is absent.
 	WSPath string `json:"ws_path,omitempty"`
@@ -480,20 +485,6 @@ func (s *server) manifestLadder() []string {
 	return out
 }
 
-// fetchManifestBody performs one HTTP GET of a manifest URL.
-func fetchManifestBody(url string) ([]byte, error) {
-	client := &http.Client{Timeout: 8 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("manifest HTTP %d", resp.StatusCode)
-	}
-	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-}
-
 // refreshManifest fetches, verifies and applies the AXR manifest. It is the
 // net-e-melli bootstrap path as much as the online path:
 //
@@ -512,9 +503,9 @@ func (s *server) refreshManifest() {
 	var body []byte
 	var source string
 	for _, u := range s.manifestLadder() {
-		b, err := fetchManifestBody(u)
+		b, err := s.fetchManifest(u)
 		if err != nil {
-			s.log.logf("manifest fetch %s failed: %v", u, err)
+			s.log.logf("manifest fetch %s failed: %v", safeManifestLabel(u), err)
 			continue
 		}
 		body, source = b, u
@@ -543,7 +534,7 @@ func (s *server) refreshManifest() {
 	// a tampered network response.
 	if valid, present := verifyManifestSig(&m, token); !valid {
 		if present {
-			s.log.logf("manifest REJECTED: manifest_sig mismatch from %s (keeping last-known-good state)", source)
+			s.log.logf("manifest REJECTED: manifest_sig mismatch from %s (keeping last-known-good state)", safeManifestSourceLabel(source))
 			return
 		}
 		if !s.sigWarned {
@@ -558,7 +549,7 @@ func (s *server) refreshManifest() {
 			s.log.logf("last-good manifest persist failed: %v", err)
 		}
 	}
-	s.manifestBootstrap = source
+	s.manifestBootstrap = safeManifestSourceLabel(source)
 	s.applyManifest(&m)
 }
 
@@ -587,7 +578,7 @@ func (s *server) seedMirrorsFromCache() {
 	}
 	if mu := manifestMirrorURL(s.cfg.ManifestURL, m.FrontingHint); mu != "" {
 		s.setMirrors([]string{mu})
-		s.log.logf("domestic manifest mirror armed from cache: %s", mu)
+		s.log.logf("domestic manifest mirror armed from cache: %s", safeManifestLabel(mu))
 	}
 }
 

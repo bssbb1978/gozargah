@@ -1,151 +1,71 @@
-# Cloudflare-only subscription URLs and clean-IP access
+# Per-user subscriptions and Cloudflare IP dialing
 
-**Decision:** the requested system cannot be implemented exactly as stated. In particular, a Worker cannot turn a generic `https://<Cloudflare-IP>/<path>` subscription URL into a reliable, supported endpoint or guarantee that filtering will not disconnect users. This repository already has per-user bearer-token subscriptions, one configurable deployment-wide prefix, decoy handling, and an AXR-only clean-IP dial path. This guide distinguishes those implemented behaviors from the unsupported proposal.
+## Implemented in this branch
 
-No runtime code or D1 schema was changed for this assessment. A new indexed route-key table or a server-verified IP-pool table would be a D1 migration and a trust-boundary change; those require explicit approval before implementation.
+- New users receive a random, opaque per-user route: `/<dynamic-prefix>/<route-key>`. The path does not expose the VLESS UUID. The prefix is random per account; the route key is a 256-bit random bearer credential.
+- The route key is stored in D1 in plaintext so the authenticated panel can show the same URL again. Treat the D1 binding and admin panel as credential stores. The D1 table is `subscription_route_keys`; the up/down migration is `migrations/0002_subscription_route_keys.*.sql`. There is no route-key rotation control yet. Existing `/{subPath}/{derived-token}` links remain accepted for backwards compatibility, while the panel now emits the new route by default.
+- Dynamic route lookup uses a bounded cache flow: isolate-local `Map` → `caches.default` → indexed D1 lookup. Successful user snapshots have a 30-second TTL, as explicitly selected for this rollout. A change to disable/expiry/quota can therefore take up to 30 seconds to reach a warm cache. Cache misses query the per-user route index instead of scanning the whole users table.
+- AXR has optional `manifest_dial_ips` and `manifest_host` settings. It can dial a candidate IP while preserving TLS SNI, certificate verification, and HTTP `Host`. A direct-IP `manifest_url` requires `manifest_host`.
+- The Worker continues to return its existing decoy for unknown routes and to emit `profile-title`, `profile-update-interval`, and usage headers.
 
-## Feasibility at a glance
+No Worker was deployed, and no real Worker hostname was supplied. Therefore the client-side direct-IP request is implemented and unit-tested for SNI/Host/dial selection, but it has **not** been verified against a live Cloudflare route or from an Iranian network.
 
-| Request | Current status | Important limit |
-|---|---|---|
-| Separate subscription authorization per user | Implemented | URL is `/<subPath>/<derived-token>`, not the raw UUID. |
-| Change the subscription prefix | Implemented globally | `subPath` is one setting for the deployment, not a different prefix per account. |
-| Fetch a subscription as `https://<CF-IP>/<path>` | **Not supported as a general URL** | Cloudflare documents Error 1003 for direct IP access; a Worker cannot run before the edge accepts/routes the request. |
-| Dial a tunnel entry by a measured Cloudflare IP | Implemented for native AXR | AXR keeps the entry hostname for TLS SNI, certificate verification, and WebSocket `Host`, while dialing an IP. This is not the same as fetching the subscription from an IP. |
-| Add more endpoint hostnames | Partially supported | Up to four configured backup entry hosts can point at the same Worker. A hostname under a blocked registrable root still shares that root's DNS/SNI failure domain. |
-| Guarantee free operation at any scale | **Not possible to guarantee** | Cloudflare publishes daily free-tier quotas; traffic and D1 rows read/written must stay within them. |
-| Guarantee bypass of DPI or a complete international route cut | **Not possible** | The Worker cannot create a reachable route when none exists from the client network. Heuristics can rank measured configured paths only. |
+## Important limits
 
-Cloudflare's own [Error 1003 documentation](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1003/) says direct access to a Cloudflare IP is not allowed and directs clients to use a domain name. HTTP `Host` is sent only after TLS is established; it cannot repair a rejected TLS/SNI connection or cause a Worker to execute before Cloudflare routes the request.
+### `https://<IP>/...` is not an ordinary supported URL
 
-## What this checkout actually does
+Cloudflare documents Error 1003 for direct IP access and instructs clients to use a domain name ([Error 1003](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1003/)). A custom client can attempt an IP TCP connection while sending a valid Worker hostname as TLS SNI and HTTP `Host`; this is different from a browser opening a raw IP URL. Cloudflare may still reject or fail to route it. The Worker hostname must be real and attached to the Worker before this can be tested.
 
-### Subscription route and per-user isolation
+For a normal hostname URL, AXR can use `manifest_dial_ips` or matching entry IPs while keeping the URL hostname for TLS and HTTP routing. For an IP URL, AXR requires `manifest_host` and keeps normal certificate verification enabled. Generic v2rayNG, Sing-box, Shadowrocket, and other subscription importers do not inherit AXR's custom fetch transport; client support is app/version-specific.
 
-`src/index.ts` recognizes `/{subPath}/{token}` (and an optional format suffix). `subPath` comes from the settings row and is validated as a deployment-wide path segment in `src/panel/api.ts`. For each hostname and user UUID, `src/subscription.ts::subTokenFor` derives a distinct 20-hex-character bearer token. The UUID is not placed directly in the URL. The request resolves that token to a user, then checks enabled/expiry/quota before issuing a subscription. Unknown tokens fall through to the existing benign decoy behavior.
+### Per-user paths do not create per-user network failure domains
 
-Thus the supported shape is:
+The route credential isolates authorization: leaking one user's opaque route key does not reveal another user's route. It cannot isolate a block of the shared Worker hostname, TLS SNI, or Cloudflare anycast address. A block at those layers can affect every user using the same entry. An IP selected for one user is also not a dedicated address unless Cloudflare explicitly provides such an architecture; unique paths cannot make a shared edge IP unique.
 
-```text
-https://<WORKER_HOST>/<GLOBAL_SUB_PATH>/<USER_TOKEN>
-```
+### RAM and Cache API are not global, durable caches
 
-It is **not** `https://<IP>/sub/<UUID>`, and the prefix is not currently per-user. A path token can isolate authorization and make accidental disclosure of one user's URL affect that user; it does not isolate users from a hostname/SNI block. A block of the common hostname can affect every user using that hostname.
+The module-scope `Map` is local to one Worker isolate; isolates can be created, restarted, or evicted independently. Cloudflare's Cache API is scoped to the originating data center and its contents do not automatically replicate to other data centers ([Cache API docs](https://developers.cloudflare.com/workers/runtime-apis/cache/)). Both are accelerators, not a global consistency layer. Cache eviction or a cold isolate sends lookups back to D1.
 
-### Clean IPs are tunnel dial hints, not subscription hosts
+A 30-second positive cache also means that disabled, expired, quota-exhausted, or changed account data can remain usable/stale for up to that window. The cache stores the authorization/account snapshot (including subscription credentials and usage fields), not only a harmless route pointer. If immediate revocation is required, the auth snapshot must not be positively cached; that would increase D1 reads. The cache is bounded in memory and Cache API errors fall back to D1.
 
-The native AXR client can use explicit or harvested IPs as alternate TCP dial addresses while retaining the configured entry hostname for TLS SNI, certificate verification, and the WebSocket `Host`. Its `axr scan` verifies candidates from the scanning client's network; the repo's design describes certificate verification and optional colo trace checks in `docs/AXR-V3-HYPER-RESILIENCE.md`.
+### Clean-IP hints are best-effort, not independently certified
 
-The Worker merges `CLEAN_EDGE_IPS` and client-submitted harvest data into `clean_ip_hints`; the current pool is a JSON row in `predictive_state` (`kind='harvest'`, `subject_id='clean_ips'`), not a dedicated, independently verified IP inventory. `src/panel/api.ts` checks that submitted values are syntactically IPv4 and token-authorized, but the Worker does not independently prove that every submitted address belongs to Cloudflare or currently serves this Worker. Treat these values as advisory client-measured hints, not a globally certified “clean IP” list. IPv6 is not accepted by this harvest path.
+The existing Worker pool is stored as one JSON row in `predictive_state` (`kind='harvest'`, `subject_id='clean_ips'`). Worker-side validation checks IPv4 syntax and token authorization; it does not independently prove Cloudflare ownership or current reachability. The selected policy is to publish authenticated client scan reports as **best-effort hints**, not label them globally verified. AXR verifies TLS against the configured hostname when using an IP, but a successful probe from one network does not prove reachability from another.
 
-These hints do not rewrite the subscription URL, do not make generic v2rayNG/Sing-box/Shadowrocket subscription fetches use an IP, and do not help the first fetch if the manifest hostname is unreachable and the client has no cached configuration.
+Google, Amazon, OVH, and Hetzner addresses are not Cloudflare edge IPs merely because they are public. They cannot route to this Worker without a proxy/server on those providers, which would violate the Cloudflare-only/no-VPS constraint. If a user submits such an address, TLS/route checks may fail; it must not be described as a Cloudflare IP.
 
-### Headers, formats, and decoys
+## AXR client configuration
 
-The existing response code sets a Base64-prefixed `profile-title` (for Unicode compatibility), `profile-update-interval`, and `subscription-userinfo` when usage/expiry metadata is available. Format selection uses the user agent or explicit app suffix. This is not arbitrary encrypted-JSON obfuscation; HTTPS provides transport encryption, while the generated subscription formats remain their normal client formats.
-
-The unknown-token path uses the existing decoy responses. Decoys reduce information returned by unauthenticated probes; they do not make a blocked hostname reachable or constitute a guarantee against active probing.
-
-## Client guidance
-
-### Ordinary subscription import (supported)
-
-Use the URL produced by the panel, with the actual Worker hostname and the per-user token:
-
-```text
-https://<WORKER_HOST>/<GLOBAL_SUB_PATH>/<USER_TOKEN>
-```
-
-Keep the hostname in the URL so normal TLS SNI and HTTP authority agree. The client-specific import mechanisms for v2rayNG, Sing-box, Shadowrocket, Hiddify, and other apps are not interchangeable; use each client's normal subscription importer and the format already generated for it.
-
-### AXR tunnel entry with an explicit clean-IP dial address (supported by AXR)
-
-Keep `manifest_url` on a hostname that resolves/routes to this Worker. Put candidate IPs on an entry; do not replace the manifest URL with an IP URL:
+Normal hostname URL with optional IP dial candidates:
 
 ```json
 {
-  "manifest_url": "https://<WORKER_HOST>/<GLOBAL_SUB_PATH>/<USER_TOKEN>/axr-manifest",
-  "uuid": "<USER_UUID>",
+  "manifest_url": "https://<WORKER_HOST>/<DYNAMIC_PREFIX>/<ROUTE_KEY>/axr-manifest",
+  "manifest_dial_ips": ["<CLIENT-MEASURED-IP>"],
   "entries": [
-    {
-      "host": "<WORKER_HOST>",
-      "ips": ["<CLIENT-MEASURED-CLOUDFLARE-IP>"],
-      "fp": "chrome"
-    }
+    { "host": "<WORKER_HOST>", "ips": ["<CLIENT-MEASURED-IP>"] }
   ]
 }
 ```
 
-AXR uses the IP as the TCP dial address and keeps `host` for TLS identity, certificate checks, and WebSocket `Host`. This is a client capability, not a universal URL syntax. The IP must be tested from the user's own network; a scan from another ISP/region is not evidence it works for this user. Use the AXR config/manifest documentation and keep the subscription token private.
+Direct-IP subscription fetch, when the client has a configured hostname/SNI anchor:
 
-Some other clients expose separate fields for address, TLS server name/SNI, and WebSocket Host. **Only if a particular client supports all three**, its tunnel node can be configured with the IP as the dial address and the Worker hostname as both TLS SNI and HTTP Host. This does not make a generic `https://<IP>/...` subscription URL work. If the client only accepts one server hostname or offers only an HTTP Host override but no independent TLS SNI/dial address, this method is not supported by that client. Verify against the exact client version before documenting it as supported.
-
-Do not substitute Google, Amazon, OVH, or Hetzner IPs as Cloudflare edge addresses. They do not route to this Worker merely because they are public IPs. A proxy hosted on those providers would be a different architecture and is outside the Cloudflare-only design.
-
-## D1 and free-tier limits
-
-The current D1 `users` table stores UUID, enabled state, expiry/quota, and account data. Deployment settings—including the single `subPath`—are stored separately in `kv_store`. The harvested IP hint list is the generic `predictive_state` JSON row described above.
-
-There is also a scale concern in the current lookup path: `findUserByToken` calls `listUsersFresh`, which reads the full users table and checks derived tokens in application code. That is O(number of users) rows read per subscription lookup, rather than an indexed token lookup. At 100,000 subscription requests/day and 50 rows scanned per request, that alone is about 5 million row reads/day, before other D1 work. An indexed per-host route-key table could reduce reads, but requires a migration, lifecycle updates on user/host changes, and an approval decision about how those bearer keys are stored and rotated.
-
-Cloudflare currently documents Workers Free at 100,000 requests/day and 10 ms CPU per invocation, and D1 Free at 5 million rows read/day, 100,000 rows written/day, and 5 GB total storage; see [Workers and D1 pricing](https://developers.cloudflare.com/workers/platform/pricing/). These are quotas, not a zero-cost guarantee for arbitrary usage. This repository's scheduled probes, client scans, API writes, user count, and request rate must all be included in capacity planning. Quotas and plan terms can change.
-
-## Why the requested guarantee is impossible
-
-- A unique path does not change TLS SNI or make a filtered hostname reachable.
-- If the root hostname/SNI is blocked, every user sharing it can be affected even when each has a unique token path.
-- If the client has no path to Cloudflare or any pre-provisioned reachable mirror, neither Worker code nor a local heuristic can create one remotely.
-- The internal adaptive engine is deterministic policy/decision logic over measured paths; it is not a model that can infer an unseen route or guarantee censorship bypass. Optional Workers AI advice does not change the transport or network boundary.
-- A new per-user domain scheme would require domains/hostnames and routing configuration; random subdomains under one root still share that root's failure domain. It would not meet the requested root-domain independence by itself.
-
-## Proposed D1 design (review only; not applied)
-
-If per-user prefixes and indexed lookups are approved, keep the account UUID/status in the existing `users` table and map each user to a random, revocable bearer path key. Store only a digest of the raw key. The request lookup can then use `(host, path_prefix, token_hash)` directly instead of scanning every user's UUID. The UUID should remain an internal account identifier, not the public bearer credential.
-
-```sql
-CREATE TABLE subscription_route_keys (
-  host TEXT NOT NULL,
-  path_prefix TEXT NOT NULL,
-  token_hash TEXT NOT NULL,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  created_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL DEFAULT 0,
-  revoked_at INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (host, path_prefix, token_hash),
-  CHECK (length(path_prefix) BETWEEN 3 AND 32),
-  CHECK (length(token_hash) = 64)
-);
-CREATE INDEX idx_subscription_route_keys_user_host
-  ON subscription_route_keys(user_id, host, revoked_at, expires_at);
+```json
+{
+  "manifest_url": "https://<CLOUDFLARE-IP>/<DYNAMIC_PREFIX>/<ROUTE_KEY>/axr-manifest",
+  "manifest_host": "<WORKER_HOST>",
+  "manifest_dial_ips": ["<CLIENT-MEASURED-IP>"]
+}
 ```
 
-The raw path key should be generated from a cryptographically secure random source, returned only to that account, and hashed before persistence. A route is eligible only when the key is not revoked/expired and the joined user is enabled and within quota. Multiple rows allow rotation with an explicitly bounded old-key overlap; the migration must define that policy. `host` must be canonicalized before lookup.
+AXR validates every candidate as an IP literal, preserves the hostname for SNI and `Host`, verifies the certificate, tries configured candidates and then DNS (where applicable), and avoids logging the subscription path/key. Use the actual hostname and a candidate measured from the intended client network. No live hostname is currently configured, so the direct-IP example is a client capability to validate after the operator supplies one—not a guarantee that Cloudflare accepts every edge IP.
 
-For edge addresses, keep untrusted reports as candidates, separate from the list that is distributed to clients. This table is a starting point only; it deliberately does not claim a client report is independently verified:
+## Free-tier and availability limits
 
-```sql
-CREATE TABLE clean_ip_candidates (
-  ip TEXT NOT NULL,
-  relay_host TEXT NOT NULL,
-  source TEXT NOT NULL,
-  source_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  first_seen_at INTEGER NOT NULL,
-  last_seen_at INTEGER NOT NULL,
-  probe_report_json TEXT NOT NULL DEFAULT '{}'
-    CHECK (json_valid(probe_report_json)),
-  status TEXT NOT NULL DEFAULT 'candidate'
-    CHECK (status IN ('candidate', 'approved', 'rejected')),
-  approved_at INTEGER NOT NULL DEFAULT 0,
-  approved_by_user_id INTEGER REFERENCES users(id),
-  expires_at INTEGER NOT NULL,
-  PRIMARY KEY (ip, relay_host)
-);
-CREATE INDEX idx_clean_ip_candidates_status_expiry
-  ON clean_ip_candidates(status, expires_at, last_seen_at);
-```
+Cloudflare publishes Workers Free at 100,000 requests/day and D1 Free at 5 million rows read/day and 100,000 rows written/day ([Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/), [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/)). An indexed cold lookup is constant-sized; warm isolate/cache hits can avoid a D1 lookup. But cache locality/eviction, other app queries, writes, scheduled probes, and total traffic prevent a zero-cost guarantee at arbitrary usage. The free-tier thresholds are limits, not a guarantee of availability or zero cost for every account/usage pattern.
 
-Application validation must still parse/validate IPs and canonicalize the SNI anchor. Only explicitly approved, fresh candidates should be published as AXR hints. The approval mechanism must be chosen first: an authenticated client's scan report is useful per-network evidence, but is not cryptographic proof that the address is a Cloudflare edge or globally “clean.” If operator promotion is the policy, it needs an authenticated panel action and audit record. If automatic promotion is desired, the independent verification/quorum and poisoning controls must be specified first.
+The adaptive component remains a deterministic **adaptive policy/decision engine** over measured, configured paths. It is not an autonomous model that can invent a route. If the client's network has no route to Cloudflare or another pre-provisioned reachable hostname, Worker code cannot create one; a complete international route cut cannot be bypassed from the serverless Worker alone. No claim of 100% DPI bypass, total-blackout connectivity, or guaranteed free operation is made.
 
-## Approval needed before implementation
+## Operator action still needed
 
-Applying the above is a D1 migration and changes the trust boundary for bearer keys and client-contributed addresses. Before implementation, approve (1) the per-host route-key table and key-rotation/revocation policy, (2) who may submit IP candidates and what independent verification or operator promotion is required, and (3) which actual Worker hostname clients will use for TLS SNI/Host. A naked IP URL is not a substitute for those decisions, and no claim of 100% bypass or connectivity should be made.
+Provide the real Worker hostname (workers.dev or a custom hostname attached to this Worker) before validating direct-IP access end-to-end. Do not deploy until that hostname and account routing are confirmed. The route-key migration is additive; existing `/sub/` URLs remain supported during transition.

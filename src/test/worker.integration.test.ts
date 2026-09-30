@@ -3,7 +3,7 @@ import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
 import type { D1Database } from '@cloudflare/workers-types';
 import { DEFAULTS, SCHEMA_VERSION, VERSION } from '../config';
-import { createUser, getUserByIdFresh, isUserAllowed, recordUsageDelta, updateUser } from '../db/users';
+import { clearSubscriptionRouteCacheForTests, createUser, findUserBySubscriptionRoute, getOrCreateSubscriptionRoute, getUserByIdFresh, isUserAllowed, recordUsageDelta, updateUser } from '../db/users';
 import { consumeAiDiagnosticQuota, consumeDnsQueryQuota, loadHealthSamples, loadLatestPathSamples, loadNetworkState, loadSettings, saveHealthSample, saveNetworkState, saveSettings } from '../db/store';
 import { buildLiveAdaptiveClientBundle, subTokenFor } from '../subscription';
 import { pbkdf2Hex } from '../utils/crypto';
@@ -88,6 +88,53 @@ describe('Cloudflare Worker + D1 integration', () => {
     expect(response.status).toBe(200);
     // Compare with the shared constant, not a literal, so version bumps can't leave this test stale.
     expect(await response.json()).toMatchObject({ ok: true, version: VERSION });
+  });
+
+  it('issues per-user opaque routes while preserving legacy subscription URLs', async () => {
+    expect(axrV2User).not.toBeNull();
+    const user = axrV2User!;
+    const userRow = await db.prepare('SELECT id FROM users WHERE uuid=?1').bind(user.uuid).first<{ id: number }>();
+    expect(userRow).not.toBeNull();
+    const route = await getOrCreateSubscriptionRoute(db, Number(userRow!.id));
+    expect(route.dynamicPrefix).toMatch(/^p-[0-9a-f]{24}$/);
+    expect(route.routeKey).toMatch(/^[0-9a-f]{64}$/);
+    expect(route.routeKey).not.toBe(user.uuid);
+
+    const modern = await mf.dispatchFetch(`https://gozargah.test/${route.dynamicPrefix}/${route.routeKey}`);
+    expect(modern.status).toBe(200);
+    expect(modern.headers.get('profile-title')).toMatch(/^base64:/);
+    expect(modern.headers.get('profile-web-page-url')).toBe(`https://gozargah.test/${route.dynamicPrefix}/${route.routeKey}`);
+    const manifest = await mf.dispatchFetch(`https://gozargah.test/${route.dynamicPrefix}/${route.routeKey}/axr-manifest`);
+    expect(manifest.status).toBe(200);
+    expect(await manifest.json()).toMatchObject({ schema: 'gozargah-axr-manifest/v3', host: 'gozargah.test' });
+
+    const legacyToken = await subTokenFor('gozargah.test', user.uuid);
+    const legacy = await mf.dispatchFetch(`https://gozargah.test/sub/${legacyToken}`);
+    expect(legacy.status).toBe(200);
+  });
+
+  it('bounds cached per-user route authorization to the approved 30-second window', async () => {
+    expect(axrV2User).not.toBeNull();
+    const row = await db.prepare('SELECT id FROM users WHERE uuid=?1').bind(axrV2User!.uuid).first<{ id: number }>();
+    const userId = Number(row?.id);
+    const route = await getOrCreateSubscriptionRoute(db, userId);
+    clearSubscriptionRouteCacheForTests();
+    const now = Date.now();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      expect((await findUserBySubscriptionRoute(db, route.dynamicPrefix, route.routeKey))?.enabled).toBe(true);
+      await updateUser(db, userId, { enabled: false });
+      // A positive cache may retain the prior state only within the explicitly
+      // approved 30-second revocation window.
+      expect((await findUserBySubscriptionRoute(db, route.dynamicPrefix, route.routeKey))?.enabled).toBe(true);
+      vi.setSystemTime(now + 30_001);
+      expect((await findUserBySubscriptionRoute(db, route.dynamicPrefix, route.routeKey))?.enabled).toBe(false);
+    } finally {
+      await updateUser(db, userId, { enabled: true });
+      clearSubscriptionRouteCacheForTests();
+      vi.useRealTimers();
+    }
   });
 
   it('disables the production gate only when the emergency rollback binding is explicit', async () => {
@@ -761,6 +808,15 @@ describe('Cloudflare Worker + D1 integration', () => {
       String(m.flow_profile.mode), String(m.reconnect.probe_interval_ms),
     ].join('|');
     expect(m.manifest_sig).toBe(createHmac('sha256', token).update(canonical, 'utf8').digest('hex'));
+
+    const userRow = await db.prepare('SELECT id FROM users WHERE uuid=?1').bind(axrV2User!.uuid).first<{ id: number }>();
+    const route = await getOrCreateSubscriptionRoute(db, Number(userRow!.id));
+    const dynamicUpload = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dynamicPrefix: route.dynamicPrefix, token: route.routeKey, source: 'axr-dynamic-route', ips: ['203.0.113.101'] }),
+    });
+    expect(dynamicUpload.status).toBe(200);
+    expect(await dynamicUpload.json()).toMatchObject({ ok: true, accepted: 1, source: 'axr-dynamic-route' });
   });
 
   it('stores canary liveness reports via harvest kind=canary (2.17)', async () => {

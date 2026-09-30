@@ -1,8 +1,8 @@
 /**
  * Gozargah — per-user public status page (v1.2).
  *
- * Served at /{subPath}/{token} when the visitor is a browser (proxy
- * clients keep getting raw configs). Everything is server-rendered with
+ * Served at /{dynamicPrefix}/{routeKey} (or legacy /{subPath}/{token})
+ * when the visitor is a browser; proxy clients keep getting raw configs. It is server-rendered with
  * inline assets: Nexus glass design, RTL-first, dark/light, real byte
  * accounting, one-tap client imports (deep links), QR (embedded, no CDN),
  * per-operator tuning chips and alt TLS-port wheels.
@@ -157,6 +157,8 @@ export interface UserPageParams {
   user: GzUser;
   token: string;
   subPath: string;
+  dynamicPrefix?: string;
+  routeKey?: string;
   panelPath: string;
   lang: Lang;
   opts: SubOpts;
@@ -171,7 +173,9 @@ export async function userPageHtml(p: UserPageParams): Promise<string> {
   const S = STR[p.lang];
   const { host, user, token } = p;
   const opts = p.opts;
-  const base = 'https://' + host + '/' + p.subPath + '/' + token;
+  const base = p.dynamicPrefix && p.routeKey
+    ? 'https://' + host + '/' + p.dynamicPrefix + '/' + p.routeKey
+    : 'https://' + host + '/' + p.subPath + '/' + token;
   const dnsUrl = base + '/dns-query';
 
   const links = buildLinks(host, user, opts);
@@ -265,7 +269,9 @@ export async function userPageHtml(p: UserPageParams): Promise<string> {
       try {
         const bToken = await subTokenFor(bh, user.uuid);
         const bVless = buildLinks(bh, user, opts).vless;
-        const bSub = 'https://' + bh + '/' + p.subPath + '/' + bToken;
+        const bSub = p.dynamicPrefix && p.routeKey
+          ? 'https://' + bh + '/' + p.dynamicPrefix + '/' + p.routeKey
+          : 'https://' + bh + '/' + p.subPath + '/' + bToken;
         rows.push(
           '<div class="crow"><span class="clab mono" dir="ltr">' + esc(bh) + '</span>' +
           '<span class="cval mono">' + esc(bVless.slice(0, 58)) + '…</span>' +

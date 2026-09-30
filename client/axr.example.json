@@ -1,6 +1,7 @@
 {
   "uuid": "00000000-0000-0000-0000-000000000000",
-  "manifest_url": "https://entry.example.com/sub/TOKEN/axr-manifest",
+  "manifest_url": "https://entry.example.com/<dynamic-prefix>/<route-key>/axr-manifest",
+  "manifest_dial_ips": [],
   "entries": [
     { "host": "entry.example.com", "priority": 0 },
     { "host": "backup.example.com", "ips": ["104.16.0.1", "172.64.0.1"], "fp": "firefox", "priority": 1 }

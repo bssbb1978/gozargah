@@ -3,7 +3,7 @@
  */
 
 export const VERSION = '2.17.0';
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 /** D1 binding name (see wrangler.toml) */
 export const DB_BINDING = 'GZ_DB';

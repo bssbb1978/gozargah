@@ -9,6 +9,7 @@
 import { DEFAULTS, ResetCycle, resetCycleMs } from '../config';
 import { ensureSchema, invalidateCache } from './store';
 import { sha224Hex } from '../utils/sha224';
+import { randomHex } from '../utils/crypto';
 
 export interface GzUser {
   id: number;
@@ -78,6 +79,123 @@ export async function getUserByIdFresh(db: D1Database, id: number): Promise<GzUs
   await ensureSchema(db);
   const row = await db.prepare('SELECT * FROM users WHERE id = ?1').bind(id).first<UserRow>();
   return row ? toUser(row) : null;
+}
+
+export interface SubscriptionRouteKey {
+  userId: number;
+  dynamicPrefix: string;
+  routeKey: string;
+  createdAt: number;
+}
+
+const ROUTE_AUTH_TTL_MS = 30_000;
+const ROUTE_AUTH_CACHE_MAX = 2048;
+interface RouteAuthCacheEntry { user: GzUser; expiresAt: number; }
+const routeAuthCache = new Map<string, RouteAuthCacheEntry>();
+
+function routeAuthCacheRequest(key: string): Request {
+  return new Request('https://route-cache.gozargah.invalid/' + key, { method: 'GET' });
+}
+
+async function routeAuthCacheKey(dynamicPrefix: string, routeKey: string): Promise<string> {
+  const input = new TextEncoder().encode(dynamicPrefix + ':' + routeKey);
+  const digest = await crypto.subtle.digest('SHA-256', input);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Get or lazily provision a user's random opaque route. The D1 row is the
+ * source of truth; raw route keys are bearer credentials and are never logged.
+ */
+export async function getOrCreateSubscriptionRoute(db: D1Database, userId: number): Promise<SubscriptionRouteKey> {
+  await ensureSchema(db);
+  const existing = await db.prepare(
+    'SELECT user_id,dynamic_prefix,route_key,created_at FROM subscription_route_keys WHERE user_id=?1',
+  ).bind(userId).first<{ user_id: number; dynamic_prefix: string; route_key: string; created_at: number }>();
+  if (existing) return { userId: existing.user_id, dynamicPrefix: existing.dynamic_prefix, routeKey: existing.route_key, createdAt: existing.created_at };
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const candidate = { dynamicPrefix: 'p-' + randomHex(12), routeKey: randomHex(32), createdAt: Date.now() };
+    try {
+      await db.prepare(
+        'INSERT INTO subscription_route_keys(user_id,dynamic_prefix,route_key,created_at) VALUES(?1,?2,?3,?4)',
+      ).bind(userId, candidate.dynamicPrefix, candidate.routeKey, candidate.createdAt).run();
+    } catch {
+      // Concurrent first access or an extraordinarily unlikely collision; re-read below.
+    }
+    const row = await db.prepare(
+      'SELECT user_id,dynamic_prefix,route_key,created_at FROM subscription_route_keys WHERE user_id=?1',
+    ).bind(userId).first<{ user_id: number; dynamic_prefix: string; route_key: string; created_at: number }>();
+    if (row) return { userId: row.user_id, dynamicPrefix: row.dynamic_prefix, routeKey: row.route_key, createdAt: row.created_at };
+  }
+  throw new Error('unable to provision subscription route');
+}
+
+/**
+ * Resolve a per-user route using isolate RAM -> per-data-center Cache API -> D1.
+ * Positive auth results are cached for at most 30 seconds by explicit policy;
+ * a disable, expiry, quota change, or key revocation may take that long to
+ * reach a warm cache. Unknown routes are never cached.
+ */
+export async function findUserBySubscriptionRoute(db: D1Database, dynamicPrefix: string, routeKey: string): Promise<GzUser | null> {
+  if (!/^p-[0-9a-f]{24}$/.test(dynamicPrefix) || !/^[0-9a-f]{64}$/.test(routeKey)) return null;
+  const key = await routeAuthCacheKey(dynamicPrefix, routeKey);
+  const now = Date.now();
+  const local = routeAuthCache.get(key);
+  if (local && local.expiresAt > now) {
+    routeAuthCache.delete(key);
+    routeAuthCache.set(key, local);
+    return local.user;
+  }
+  if (local) routeAuthCache.delete(key);
+
+  const cacheRequest = routeAuthCacheRequest(key);
+  try {
+    if (typeof caches !== 'undefined' && caches.default) {
+      const cached = await caches.default.match(cacheRequest);
+      if (cached) {
+        const body = await cached.json() as { user?: GzUser; expiresAt?: number };
+        if (body.user && Number(body.expiresAt) > now) {
+          rememberRouteUser(key, body.user, Number(body.expiresAt));
+          return body.user;
+        }
+        await caches.default.delete(cacheRequest);
+      }
+    }
+  } catch { /* Cache API is an optimization; D1 remains authoritative on misses. */ }
+
+  await ensureSchema(db);
+  const row = await db.prepare(
+    'SELECT u.* FROM subscription_route_keys r JOIN users u ON u.id=r.user_id ' +
+    'WHERE r.dynamic_prefix=?1 AND r.route_key=?2 LIMIT 1',
+  ).bind(dynamicPrefix, routeKey).first<UserRow>();
+  if (!row) return null;
+  const user = toUser(row);
+  const expiresAt = now + ROUTE_AUTH_TTL_MS;
+  rememberRouteUser(key, user, expiresAt);
+  try {
+    if (typeof caches !== 'undefined' && caches.default) {
+      await caches.default.put(cacheRequest, new Response(JSON.stringify({ user, expiresAt }), {
+        headers: { 'content-type': 'application/json', 'cache-control': 'max-age=30' },
+      }));
+    }
+  } catch { /* Cache API limits/evictions must never break subscription delivery. */ }
+  return user;
+}
+
+function rememberRouteUser(key: string, user: GzUser, expiresAt: number): void {
+  routeAuthCache.delete(key);
+  routeAuthCache.set(key, { user, expiresAt });
+  while (routeAuthCache.size > ROUTE_AUTH_CACHE_MAX) {
+    const oldest = routeAuthCache.keys().next().value;
+    if (oldest === undefined) break;
+    routeAuthCache.delete(oldest);
+  }
+}
+
+/** Test helper: clear only this isolate's RAM cache. */
+export function clearSubscriptionRouteCacheForTests(): void {
+  routeAuthCache.clear();
 }
 
 /** Persist one session's usage delta atomically so live quota checks see it. */
@@ -226,6 +344,7 @@ export async function createUser(db: D1Database, data: NewUser, audit?: UserAudi
     : await insert.run();
   invalidateUsers();
   const id = res.meta.last_row_id as number;
+  await getOrCreateSubscriptionRoute(db, id);
   return {
     id, name: data.name, uuid, trojanPass,
     quotaBytes: data.quotaBytes, usedUp: 0, usedDown: 0, expiryAt: data.expiryAt,

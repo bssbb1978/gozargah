@@ -11,7 +11,7 @@ import {
   consumeAiDiagnosticQuota, consumeUserControlQuota, loadUserControlAudit, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState, saveHealthSample, loadLatestPathSamples, loadPredictiveStates, loadCleanIPHarvest, saveCleanIPHarvest, appendCanaryResult,
 } from '../db/store';
 import {
-  createUser, deleteUser, getAdminUser, getUserByIdFresh, GzUser, invalidateUsers, listUsersFresh, updateUser, flushUsage,
+  createUser, deleteUser, findUserBySubscriptionRoute, getAdminUser, getOrCreateSubscriptionRoute, getUserByIdFresh, GzUser, invalidateUsers, listUsersFresh, updateUser, flushUsage,
   type UserAuditMutation, type UserPatch,
 } from '../db/users';
 import {
@@ -21,6 +21,7 @@ import {
 import { buildLinks, subTokenFor, buildProtocolMatrix, findUserByToken } from '../subscription';
 import { qrSvg } from '../utils/qr';
 import { logRing } from '../utils/log';
+import { requestWorkerHostname } from '../utils/request-host';
 import { pbkdf2Hex, randomHex } from '../utils/crypto';
 import { createDiagnostics } from '../ai/diagnostics';
 import { decideResilience, updateObservation, localResilienceAdvice, PathObservation } from '../ai/resilience';
@@ -76,6 +77,8 @@ export async function handlePanelApi(
   action: string,
 ): Promise<Response> {
   const method = request.method;
+  const requestUrl = new URL(request.url);
+  const requestHost = requestWorkerHostname(request, requestUrl);
   const db = env.GZ_DB;
 
   try {
@@ -87,7 +90,7 @@ export async function handlePanelApi(
         dbOk: eff.dbOk,
         isDefaultPassword: eff.isDefaultPassword,
         passwordChangeRequired: shouldRequirePasswordChange(env, eff),
-        host: new URL(request.url).hostname,
+        host: requestHost,
         logs: logRing.slice(-12),
       });
     }
@@ -123,10 +126,10 @@ export async function handlePanelApi(
     if (action === 'network/harvest' && method === 'POST') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
       const body = (await request.json().catch(() => ({}))) as {
-        token?: unknown; ips?: unknown; source?: unknown;
+        token?: unknown; dynamicPrefix?: unknown; ips?: unknown; source?: unknown;
         kind?: unknown; canaryHost?: unknown; canaryOk?: unknown;
       };
-      const host = new URL(request.url).hostname;
+      const host = requestHost;
       const tokenIn = String(body.token ?? request.headers.get('x-harvest-token') ?? '');
       let authorized = false;
       if (tokenIn) {
@@ -134,6 +137,10 @@ export async function handlePanelApi(
           authorized = true;
         } else {
           authorized = (await findUserByToken(db, host, tokenIn)) !== null;
+          const dynamicPrefix = String(body.dynamicPrefix ?? '');
+          if (!authorized && /^p-[0-9a-f]{24}$/.test(dynamicPrefix) && /^[0-9a-f]{64}$/.test(tokenIn)) {
+            authorized = (await findUserBySubscriptionRoute(db, dynamicPrefix, tokenIn)) !== null;
+          }
         }
       }
       if (!authorized) {
@@ -313,12 +320,12 @@ export async function handlePanelApi(
     }
 
     if (action === 'network/capabilities' && method === 'GET') {
-      const matrix = buildProtocolMatrix(env, new URL(request.url).hostname);
+      const matrix = buildProtocolMatrix(env, requestHost);
       return json({ ok: true, matrix, generatedAt: Date.now() });
     }
 
     if (action === 'network/policy' && method === 'GET') {
-      const matrix = buildProtocolMatrix(env, new URL(request.url).hostname);
+      const matrix = buildProtocolMatrix(env, requestHost);
       return json({ ok: true, policy: matrix.adaptivePolicy, origin: matrix.origin, limitations: {
         worker_native_tcp_inbound: false,
         worker_native_udp_inbound: false,
@@ -330,7 +337,7 @@ export async function handlePanelApi(
 
     if (action === 'network/autoplan' && method === 'GET') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
-      const host = new URL(request.url).hostname;
+      const host = requestHost;
       const matrix = buildProtocolMatrix(env, host);
       const [pathRows, profileRows, state] = await Promise.all([loadPathHealth(db), loadProfileHealth(db), loadNetworkState(db)]);
       const currentState = normalizeStoredNetworkState(state);
@@ -557,9 +564,15 @@ export async function handlePanelApi(
       if (!db) throw new GzError('database_not_bound', 'no_db');
       const users = await listUsersFresh(db);
       const withTokens = [] as Array<Record<string, unknown>>;
-      const host = new URL(request.url).hostname;
+      const host = requestHost;
       for (const u of users) {
-        withTokens.push({ ...publicUser(u), subToken: await subTokenFor(host, u.uuid) });
+        const route = await getOrCreateSubscriptionRoute(db, u.id);
+        withTokens.push({
+          ...publicUser(u),
+          subToken: await subTokenFor(host, u.uuid), // legacy link compatibility
+          dynamicPrefix: route.dynamicPrefix,
+          routeKey: route.routeKey,
+        });
       }
       return json({ users: withTokens });
     }
@@ -674,18 +687,19 @@ export async function handlePanelApi(
       const id = Number(linksMatch[1]);
       const u = await getUserByIdFresh(db, id);
       if (!u) throw new GzError('user not found', 'not_found');
-      const host = new URL(request.url).hostname;
+      const host = requestHost;
       const links = buildLinks(host, u, null);
-      const tok = await subTokenFor(host, u.uuid);
+      const route = await getOrCreateSubscriptionRoute(db, u.id);
+      const base = 'https://' + host + '/' + route.dynamicPrefix + '/' + route.routeKey;
       return json({
         links,
-        subBase: 'https://' + host + '/' + eff.subPath + '/' + tok,
-        subClash: 'https://' + host + '/' + eff.subPath + '/' + tok + '/clash',
-        subSingbox: 'https://' + host + '/' + eff.subPath + '/' + tok + '/singbox',
-        subXray: 'https://' + host + '/' + eff.subPath + '/' + tok + '/xray',
-        subAdaptive: 'https://' + host + '/' + eff.subPath + '/' + tok + '/adaptive',
-        dnsDoh: 'https://' + host + '/' + eff.subPath + '/' + tok + '/dns-query',
-        statusPage: 'https://' + host + '/' + eff.subPath + '/' + tok,
+        subBase: base,
+        subClash: base + '/clash',
+        subSingbox: base + '/singbox',
+        subXray: base + '/xray',
+        subAdaptive: base + '/adaptive',
+        dnsDoh: base + '/dns-query',
+        statusPage: base,
       });
     }
 
@@ -735,7 +749,7 @@ export async function handlePanelApi(
       } catch { /* optional */ }
       let signalJson: Record<string, unknown> | null = null;
       try { signalJson = signal ? (JSON.parse(signal.stateJson) as Record<string, unknown>) : null; } catch { signalJson = null; }
-      const host = new URL(request.url).hostname;
+      const host = requestHost;
       const ladder: Array<{ host: string; role: string; status: string; latencyMs: number | null }> = [
         { host, role: 'primary', status: 'primary', latencyMs: null },
       ];

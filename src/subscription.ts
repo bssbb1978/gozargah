@@ -1054,6 +1054,7 @@ export function subHeaders(
   app: string,
   opts: SubOpts | null | undefined,
   token?: string,
+  routeBase?: string,
 ): Headers {
   const h = new Headers();
   if (app === 'clash') h.set('content-type', 'text/yaml; charset=utf-8');
@@ -1068,7 +1069,7 @@ export function subHeaders(
   h.set('profile-title', 'base64:' + toBase64(title));
   h.set('profile-update-interval', '6');
   // the user's own live status page (v1.2) — falls back to the panel for admins w/o page
-  if (token) h.set('profile-web-page-url', 'https://' + host + '/' + eff.subPath + '/' + token);
+  if (token) h.set('profile-web-page-url', routeBase || ('https://' + host + '/' + eff.subPath + '/' + token));
   else h.set('profile-web-page-url', 'https://' + host + '/' + eff.panelPath);
   if (user.quotaBytes || user.expiryAt) {
     // REAL numbers from byte accounting (0 upload tracked separately in v2)

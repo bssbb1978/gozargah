@@ -18,6 +18,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"net"
 	"net/url"
 	"sort"
 	"strconv"
@@ -128,6 +129,24 @@ func verifyManifestSig(m *manifestV3, token string) (valid, present bool) {
 // subTokenFromURL extracts the subscription token from a manifest URL of the
 // form https://host/{subpath}/{token}/axr-manifest (the path segment
 // directly before "axr-manifest"). Returns "" when it cannot.
+func subscriptionRoutePrefixFromURL(manifestURL string) string {
+	u, err := url.Parse(manifestURL)
+	if err != nil {
+		return ""
+	}
+	segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i := len(segs) - 1; i >= 2; i-- {
+		if segs[i] == "axr-manifest" {
+			prefix := segs[i-2]
+			if len(prefix) == 26 && strings.HasPrefix(prefix, "p-") && strings.Trim(prefix[2:], "0123456789abcdef") == "" {
+				return prefix
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
 func subTokenFromURL(manifestURL string) string {
 	u, err := url.Parse(manifestURL)
 	if err != nil {
@@ -146,10 +165,17 @@ func subTokenFromURL(manifestURL string) string {
 // manifest URL's host: https://<host>/<panelPath>/api/network/harvest with
 // the Worker's default panel path ("gozargah"). An explicit config value
 // always wins.
-func harvestURLFromManifest(manifestURL string) string {
+func harvestURLFromManifest(manifestURL string, hostOverride ...string) string {
 	u, err := url.Parse(manifestURL)
 	if err != nil || u.Hostname() == "" {
 		return ""
 	}
-	return "https://" + u.Hostname() + "/gozargah/api/network/harvest"
+	host := u.Hostname()
+	if net.ParseIP(host) != nil {
+		if len(hostOverride) == 0 || hostOverride[0] == "" || net.ParseIP(hostOverride[0]) != nil {
+			return ""
+		}
+		host = hostOverride[0]
+	}
+	return "https://" + host + "/gozargah/api/network/harvest"
 }
