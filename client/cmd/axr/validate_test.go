@@ -2,7 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"reflect"
+	"sort"
 	"testing"
+	"time"
 )
 
 func TestValidationLabelRequiresManualSafeInput(t *testing.T) {
@@ -60,15 +63,8 @@ func TestValidationFailurePhasesAreCoarseAndCredentialFree(t *testing.T) {
 }
 
 func TestValidationReportLabelsRealMeasurementSchema(t *testing.T) {
-	report := validationReport{
-		Schema: validationSchema, EvidenceClass: "live_socket_observation", Simulation: false,
-		NetworkLabel: "mobile", ISPLabel: "carrier",
-		TransportCoverage: validationTransportCoverage{
-			ClientTransportsProbed: []string{"ws", "ws-alt"},
-			NotImplementedByAXR:    []string{"grpc", "http2", "xhttp"},
-		},
-		Measurements: []validationMeasurement{{FallbackTier: 1, HandshakeOK: true}},
-	}
+	report := newValidationReport("golden-run", time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), "mobile", "carrier", "www.cloudflare.com:443", 2)
+	report.Measurements = []validationMeasurement{{FallbackTier: 1, HandshakeOK: true}}
 	encoded, err := json.Marshal(report)
 	if err != nil {
 		t.Fatal(err)
@@ -77,15 +73,39 @@ func TestValidationReportLabelsRealMeasurementSchema(t *testing.T) {
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded["simulation"] != false || decoded["evidence_class"] != "live_socket_observation" {
-		t.Fatalf("report does not distinguish real measurement from simulation: %s", encoded)
+	if decoded["schema"] != "axr-network-validation/v2" || decoded["simulation"] != false || decoded["evidence_class"] != "live_socket_observation" {
+		t.Fatalf("report schema/evidence does not distinguish real measurement from simulation: %s", encoded)
 	}
 	rows, ok := decoded["measurements"].([]any)
 	if !ok || len(rows) != 1 || rows[0].(map[string]any)["fallback_tier"] != float64(1) {
 		t.Fatalf("fallback tier missing from JSON report: %s", encoded)
 	}
+	keys := make([]string, 0, len(decoded))
+	for key := range decoded {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	wantKeys := []string{
+		"destination", "evidence_class", "failed_handshakes", "fallback_order", "fallback_tier_counts", "finished_at_utc",
+		"isp_label", "measurement_scope", "measurements", "network_label", "probe_definition", "protocol_coverage",
+		"requested_repeats", "run_id", "schema", "simulation", "started_at_utc", "successful_handshakes",
+		"successful_repeats", "total_handshakes", "transport_coverage",
+	}
+	if !reflect.DeepEqual(keys, wantKeys) {
+		t.Fatalf("validation report schema drift: keys=%v want=%v", keys, wantKeys)
+	}
+
+	protocols, ok := decoded["protocol_coverage"].(map[string]any)
+	if !ok || !reflect.DeepEqual(protocols["client_protocols_probed"], []any{"vless"}) ||
+		!reflect.DeepEqual(protocols["not_implemented_by_axr_client"], []any{"http", "hysteria2", "shadowsocks", "trojan", "vmess", "wireguard"}) {
+		t.Fatalf("report must name the exact native protocol boundary: %s", encoded)
+	}
 	coverage, ok := decoded["transport_coverage"].(map[string]any)
-	if !ok || len(coverage["client_transports_probed"].([]any)) != 2 || len(coverage["not_implemented_by_axr_client"].([]any)) != 3 {
+	if !ok || !reflect.DeepEqual(coverage["client_transport_shapes_available"], []any{"ws", "ws-alt"}) ||
+		!reflect.DeepEqual(coverage["not_implemented_by_axr_client"], []any{"grpc", "http2", "http3", "httpupgrade", "kcp", "udp", "xhttp"}) {
 		t.Fatalf("report must name supported and unimplemented native transports: %s", encoded)
+	}
+	if !reflect.DeepEqual(transportsPerEntry, []string{"ws", "ws-alt"}) {
+		t.Fatalf("probe coverage drifted from the live client transport registry: %v", transportsPerEntry)
 	}
 }

@@ -24,14 +24,20 @@ import (
 	"github.com/bssbb1978/gozargah/axr/internal/vlessws"
 )
 
-const validationSchema = "axr-network-validation/v1"
+const validationSchema = "axr-network-validation/v2"
 
 // validationReport is one locally measured run. `simulation` is always false
 // here; tests do not construct/export this report from simulated probe data.
+type validationProtocolCoverage struct {
+	ClientProtocolsProbed []string `json:"client_protocols_probed"`
+	NotImplementedByAXR   []string `json:"not_implemented_by_axr_client"`
+	Note                  string   `json:"note"`
+}
+
 type validationTransportCoverage struct {
-	ClientTransportsProbed []string `json:"client_transports_probed"`
-	NotImplementedByAXR    []string `json:"not_implemented_by_axr_client"`
-	Note                   string   `json:"note"`
+	ClientTransportShapes []string `json:"client_transport_shapes_available"`
+	NotImplementedByAXR   []string `json:"not_implemented_by_axr_client"`
+	Note                  string   `json:"note"`
 }
 
 type validationReport struct {
@@ -47,6 +53,7 @@ type validationReport struct {
 	Destination          string                      `json:"destination"`
 	ProbeDefinition      string                      `json:"probe_definition"`
 	FallbackOrder        string                      `json:"fallback_order"`
+	ProtocolCoverage     validationProtocolCoverage  `json:"protocol_coverage"`
 	TransportCoverage    validationTransportCoverage `json:"transport_coverage"`
 	RequestedRepeats     int                         `json:"requested_repeats"`
 	SuccessfulRepeats    int                         `json:"successful_repeats"`
@@ -118,27 +125,10 @@ func runValidate(args []string) {
 		fatalf("validate: create run id: %v", err)
 	}
 	started := time.Now().UTC()
-	report := validationReport{
-		Schema:           validationSchema,
-		EvidenceClass:    "live_socket_observation",
-		MeasurementScope: "current host route; network and ISP labels are operator supplied and not independently verified",
-		Simulation:       false,
-		RunID:            uid,
-		StartedAtUTC:     started.Format(time.RFC3339Nano),
-		NetworkLabel:     networkLabel,
-		ISPLabel:         ispLabel,
-		Destination:      net.JoinHostPort(destHost, strconv.Itoa(destPort)),
-		ProbeDefinition:  "TCP dial + TLS + WebSocket upgrade + VLESS OK + Worker-side TCP connect to destination; no application payload",
-		FallbackOrder:    "AXR failover health/priority candidate order; tier is the zero-based attempted candidate index",
-		TransportCoverage: validationTransportCoverage{
-			ClientTransportsProbed: []string{"ws", "ws-alt"},
-			NotImplementedByAXR:    []string{"grpc", "http2", "xhttp"},
-			Note:                   "gRPC, HTTP/2, and XHTTP may be emitted in external Xray origin-engine profiles, but the native Go AXR client does not implement them and this command does not probe them.",
-		},
-		RequestedRepeats:   *repeats,
-		FallbackTierCounts: map[string]int{},
-		Measurements:       make([]validationMeasurement, 0, *repeats),
-	}
+	report := newValidationReport(
+		uid, started, networkLabel, ispLabel,
+		net.JoinHostPort(destHost, strconv.Itoa(destPort)), *repeats,
+	)
 
 	uuid, _ := vlessws.UUIDFromString(cfg.UUID)
 	header, err := vlessws.BuildVLESSHeader(uuid, destHost, uint16(destPort), false)
@@ -216,6 +206,42 @@ func runValidate(args []string) {
 	}
 	if _, err := os.Stdout.Write(encoded); err != nil {
 		fatalf("validate: write report to stdout: %v", err)
+	}
+}
+
+var notImplementedAXRProtocols = []string{"http", "hysteria2", "shadowsocks", "trojan", "vmess", "wireguard"}
+var notImplementedAXRTransports = []string{"grpc", "http2", "http3", "httpupgrade", "kcp", "udp", "xhttp"}
+
+func cloneStrings(values []string) []string {
+	return append([]string(nil), values...)
+}
+
+func newValidationReport(runID string, started time.Time, network, isp, destination string, repeats int) validationReport {
+	return validationReport{
+		Schema:           validationSchema,
+		EvidenceClass:    "live_socket_observation",
+		MeasurementScope: "current host route; network and ISP labels are operator supplied and not independently verified",
+		Simulation:       false,
+		RunID:            runID,
+		StartedAtUTC:     started.UTC().Format(time.RFC3339Nano),
+		NetworkLabel:     network,
+		ISPLabel:         isp,
+		Destination:      destination,
+		ProbeDefinition:  "TCP dial + TLS + WebSocket upgrade + VLESS OK + Worker-side TCP connect to destination; no application payload",
+		FallbackOrder:    "AXR failover health/priority candidate order; tier is the zero-based attempted candidate index",
+		ProtocolCoverage: validationProtocolCoverage{
+			ClientProtocolsProbed: []string{"vless"},
+			NotImplementedByAXR:   cloneStrings(notImplementedAXRProtocols),
+			Note:                  "Only the native VLESS-over-WebSocket relay is probed. Other protocol profiles may be generated for an external engine but are not implemented by this Go client.",
+		},
+		TransportCoverage: validationTransportCoverage{
+			ClientTransportShapes: cloneStrings(transportsPerEntry),
+			NotImplementedByAXR:   cloneStrings(notImplementedAXRTransports),
+			Note:                  "ws-alt is the same WebSocket protocol over an alternate path/query shape. The listed transports are not implemented by the native Go client; TCP here is only the socket substrate.",
+		},
+		RequestedRepeats:   repeats,
+		FallbackTierCounts: map[string]int{},
+		Measurements:       make([]validationMeasurement, 0, repeats),
 	}
 }
 
