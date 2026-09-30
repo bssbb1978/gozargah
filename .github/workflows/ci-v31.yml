@@ -72,28 +72,59 @@ env:
   GOFLAGS: "-mod=readonly"
 
 jobs:
+  # The checked-in JSON is the single source of truth for the Go matrix and
+  # worker leg. Export both the matrix and expected IDs from the same parse so
+  # the coverage report cannot drift from the jobs that actually ran.
+  gate-plan:
+    name: Define CI matrix and expected legs
+    runs-on: ubuntu-24.04
+    outputs:
+      go_legs: ${{ steps.matrix.outputs.go_legs }}
+      expected_ids: ${{ steps.matrix.outputs.expected_ids }}
+      worker_id: ${{ steps.matrix.outputs.worker_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate and export the gate matrix
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE' >> "$GITHUB_OUTPUT"
+          const fs = require('node:fs');
+          const matrix = JSON.parse(fs.readFileSync('.github/ci/gate-matrix.json', 'utf8'));
+          const validId = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+          if (!Array.isArray(matrix.go_legs) || matrix.go_legs.length === 0 ||
+              !matrix.worker_id || !validId.test(matrix.worker_id)) {
+            throw new Error('gate-matrix.json must define Go legs and one sanitized worker_id');
+          }
+          const goIds = matrix.go_legs.map((leg) => leg.id);
+          if (goIds.some((id) => typeof id !== 'string' || !validId.test(id)) ||
+              new Set(goIds).size !== goIds.length || goIds.includes(matrix.worker_id)) {
+            throw new Error('Go leg IDs must be unique, sanitized, and distinct from worker_id');
+          }
+          for (const leg of matrix.go_legs) {
+            for (const key of ['os', 'targets', 'native', 'android_ndk']) {
+              if (typeof leg[key] !== 'string') throw new Error(`Go leg ${leg.id} lacks string field ${key}`);
+            }
+          }
+          console.log(`go_legs=${JSON.stringify(matrix.go_legs)}`);
+          console.log(`expected_ids=${JSON.stringify([...goIds, matrix.worker_id])}`);
+          console.log(`worker_id=${matrix.worker_id}`);
+          NODE
+
   # ---------------------------------------------------------------------------
   # JOB SUITE A — Go client core engine verification
   # ---------------------------------------------------------------------------
   go-client:
-    name: Go client — ${{ matrix.os }} → ${{ matrix.targets }}
+    needs: gate-plan
+    name: Go client — ${{ matrix.id }} (${{ matrix.os }} → ${{ matrix.targets }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            targets: "linux/amd64 linux/arm64 android/arm64"
-            native: "linux/amd64"
-            android_ndk: "r26b"
-          - os: macos-15-intel
-            targets: "darwin/amd64 darwin/arm64"
-            native: "darwin/amd64"
-            android_ndk: ""
-          - os: windows-latest
-            targets: "windows/amd64"
-            native: "windows/amd64"
-            android_ndk: ""
+        include: ${{ fromJSON(needs.gate-plan.outputs.go_legs) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -105,6 +136,7 @@ jobs:
           cache-dependency-path: client/go.sum
 
       - name: Verify go.sum integrity
+        shell: bash
         working-directory: client
         run: |
           go mod download
@@ -129,6 +161,7 @@ jobs:
           echo "### Gate 1 — gofmt: clean" >> "$GITHUB_STEP_SUMMARY"
 
       - name: "Gate 2 — go vet (zero warnings, both TLS identities)"
+        shell: bash
         working-directory: client
         # Default = stdlib TLS (tls_std.go); -tags axr_utls = the
         # production uTLS fingerprint identity (tls_utls.go). Both
@@ -138,6 +171,7 @@ jobs:
           go vet -tags axr_utls ./...
 
       - name: "Gate 3 — staticcheck (zero findings, both TLS identities)"
+        shell: bash
         working-directory: client
         run: |
           go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 ./...
@@ -259,6 +293,7 @@ jobs:
         working-directory: client
         shell: bash
         env:
+          LEG_ID: ${{ matrix.id }}
           LEG_OS: ${{ matrix.os }}
           LEG_TARGETS: ${{ matrix.targets }}
           LEG_NATIVE: ${{ matrix.native }}
@@ -281,8 +316,9 @@ jobs:
               *) coverage="$coverage $t[build-only]" ;;
             esac
           done
-          cat > "dist/gate-attest-${{ strategy.job-index }}.json" <<JSON
+          cat > "dist/gate-attestation-${LEG_ID}.json" <<JSON
           {
+            "leg_id": "$LEG_ID",
             "leg": "$LEG_OS",
             "declared_native": "$LEG_NATIVE",
             "runner_native": "$native",
@@ -314,7 +350,7 @@ jobs:
             echo ""
             echo "gofmt, go vet, staticcheck, go test -race and the cross-compile all ran unconditionally on this leg."
           } >> "$GITHUB_STEP_SUMMARY"
-          cat "dist/gate-attest-${{ strategy.job-index }}.json"
+          cat "dist/gate-attestation-${LEG_ID}.json"
 
       - name: Upload gate attestation
         # always(): a FAILING leg's coverage declaration is exactly as
@@ -322,9 +358,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: gate-attest-${{ strategy.job-index }}
-          path: client/dist/gate-attest-${{ strategy.job-index }}.json
+          name: gate-attestation-${{ matrix.id }}
+          path: client/dist/gate-attestation-${{ matrix.id }}.json
           if-no-files-found: error
+          include-hidden-files: false
           retention-days: 14
 
       - name: "Diagnostics — surface Go failure as annotation"
@@ -352,11 +389,13 @@ jobs:
   # ---------------------------------------------------------------------------
   worker:
     name: Worker — Cloudflare edge relay
+    needs: gate-plan
     runs-on: ubuntu-24.04
     env:
       # Keep the dry-run hermetic: no telemetry network side channel.
       WRANGLER_TELEMETRY_DISABLED: "1"
       CI: "1"
+      LEG_ID: ${{ needs.gate-plan.outputs.worker_id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -372,6 +411,12 @@ jobs:
 
       - name: Clean install (npm ci)
         run: npm ci
+
+      - name: Deploy safety guard tests
+        run: node scripts/test-deploy-guard.mjs
+
+      - name: Staging smoke-script tests (mock responses only)
+        run: node scripts/test-smoke-staging.mjs
 
       - name: "Gate 1 — TypeScript type check (npx tsc --noEmit)"
         run: npx tsc --noEmit
@@ -399,8 +444,9 @@ jobs:
           # invisible mismatch — the first run that reached the summary died
           # on exactly that, so the two are now written from one variable.
           runner_native="$(node -p 'process.platform + "-" + process.arch')"
-          cat > worker-attest.json <<JSON
+          cat > worker-attestation.json <<JSON
           {
+            "leg_id": "$LEG_ID",
             "leg": "worker (ubuntu-24.04, node 22)",
             "declared_native": "linux-x64",
             "runner_native": "$runner_native",
@@ -429,18 +475,20 @@ jobs:
             echo "| job status | $LEG_RESULT |"
             echo "| gates | tsc, engine, vitest, wrangler dry-run (all unconditional) |"
           } >> "$GITHUB_STEP_SUMMARY"
-          cat worker-attest.json
+          cat worker-attestation.json
 
       - name: Upload gate attestation
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: gate-attest-worker
-          path: worker-attest.json
+          name: gate-attestation-${{ needs.gate-plan.outputs.worker_id }}
+          path: worker-attestation.json
           if-no-files-found: error
+          include-hidden-files: false
           retention-days: 14
 
       - name: "Diagnostics — surface bundle failure as annotation"
+        shell: bash
         # Log-zip retrieval can be flaky; this re-runs the failing command and
         # publishes the tail as a check-run annotation (readable via
         # `gh api check-runs/<id>/annotations`) so the repair loop can
@@ -453,6 +501,7 @@ jobs:
 
       - name: Upload bundle report
         if: always()
+        shell: bash
         run: |
           echo "## Worker bundle" >> "$GITHUB_STEP_SUMMARY"
           npx wrangler deploy --dry-run 2>&1 | grep -iE "total size|gzip|success" \
@@ -463,7 +512,7 @@ jobs:
   # ---------------------------------------------------------------------------
   gate-summary:
     name: Gate coverage — consolidated matrix report
-    needs: [go-client, worker]
+    needs: [gate-plan, go-client, worker]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -474,59 +523,81 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
-          pattern: gate-attest-*
-          merge-multiple: true
+          pattern: gate-attestation-*
+          merge-multiple: false
           path: attest
 
       - name: Render the matrix coverage table
+        shell: bash
         env:
+          EXPECTED_IDS_JSON: ${{ needs.gate-plan.outputs.expected_ids }}
+          PLAN_RESULT: ${{ needs.gate-plan.result }}
           GO_CLIENT_RESULT: ${{ needs.go-client.result }}
           WORKER_RESULT: ${{ needs.worker.result }}
         run: |
-          set -uo pipefail
-          # A cancelled run (concurrency supersede) has no coverage to
-          # report: say so and exit green rather than reporting a gap that
-          # the cancellation itself created.
-          if [ "$GO_CLIENT_RESULT" = "cancelled" ] || [ "$WORKER_RESULT" = "cancelled" ]; then
-            echo "### Gate coverage" >> "$GITHUB_STEP_SUMMARY"
-            echo "run superseded by concurrency; coverage not enforced" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          set -euo pipefail
+          mkdir -p attest
+          if [ "$PLAN_RESULT" != "success" ] || ! jq -e 'type == "array" and length > 0' <<< "$EXPECTED_IDS_JSON" >/dev/null; then
+            echo "::error title=matrix-definition-unavailable::gate-plan did not provide the expected leg IDs"
+            exit 1
           fi
-          count=$(ls -1 attest/*.json 2>/dev/null | wc -l | tr -d ' ')
+
+          mapfile -t expected_ids < <(jq -r '.[]' <<< "$EXPECTED_IDS_JSON")
+          mapfile -d '' -t files < <(find attest -type f -name '*.json' -print0 | sort -z)
+          actual_ids=()
+          malformed=()
+          for f in "${files[@]}"; do
+            if ! jq -e 'type == "object" and (.leg_id | type == "string" and length > 0)' "$f" >/dev/null; then
+              malformed+=("$f")
+              continue
+            fi
+            actual_ids+=("$(jq -r '.leg_id' "$f")")
+          done
+
           {
             echo "## AXR v3.1 — matrix gate coverage"
             echo ""
-            echo "| leg | declared native | runner native | status | coverage |"
-            echo "|-----|-----------------|---------------|--------|----------|"
-            for f in attest/*.json; do
-              [ -e "$f" ] || continue
-              jq -r '[.leg, .declared_native, .runner_native, .job_status, .coverage] | "| " + join(" | ") + " |"' "$f"
+            echo "| leg ID | leg | declared native | runner native | status | coverage |"
+            echo "|--------|-----|-----------------|---------------|--------|----------|"
+            for f in "${files[@]}"; do
+              if jq -e 'type == "object" and (.leg_id | type == "string")' "$f" >/dev/null; then
+                jq -r '[.leg_id, .leg, .declared_native, .runner_native, .job_status, .coverage] | map(. // "") | "| " + join(" | ") + " |"' "$f"
+              fi
             done
             echo ""
-            echo "Android NDK: $(jq -r 'select(.android_ndk != null and .android_ndk != "") | .android_ndk' attest/*.json 2>/dev/null | head -1)"
+            echo "Android NDK: $(jq -r 'select(.android_ndk != null and (.android_ndk | startswith("built"))) | .android_ndk' "${files[@]}" 2>/dev/null | head -1 || true)"
             echo ""
-            echo "Gates that run unconditionally on every Go leg: gofmt, go vet (both TLS"
-            echo "identities), staticcheck (both identities), go test -race -count=1 (native"
-            echo "arch, asserted), cross-compile (all declared targets, stripped)."
-          } >> "$GITHUB_STEP_SUMMARY"
-          cat "$GITHUB_STEP_SUMMARY"
-          # 3 Go legs + 1 Worker leg. A green run must account for all of them:
-          # a missing attestation means a leg produced no coverage evidence.
-          #
-          # NOTE the attestation FILE names are unique per leg: upload/download
-          # artifacts merge into ONE directory, so three legs all shipping
-          # "gate-attest.json" collapse into a single file and this check can
-          # never be satisfied. That is exactly what happened on the first run
-          # (4 artifacts on the API, 2 files on disk).
-          if [ "$count" -lt 4 ]; then
-            echo "::error title=incomplete-matrix::expected 4 gate attestations (3 Go legs + worker), found $count"
-            echo "Legs seen: $(jq -r '.leg' attest/*.json 2>/dev/null | tr '\n' ' ')"
+            echo "Unconditional Go gates: gofmt, go vet (both TLS identities), staticcheck (both identities),"
+            echo "go test -race -count=1 (native arch asserted), and stripped cross-compiles."
+            echo "Job results: gate-plan=$PLAN_RESULT, go-client=$GO_CLIENT_RESULT, worker=$WORKER_RESULT"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          expected_sorted=$(printf '%s\n' "${expected_ids[@]}" | sort -u)
+          actual_sorted=$(printf '%s\n' "${actual_ids[@]}" | sed '/^$/d' | sort -u)
+          missing=$(comm -23 <(printf '%s\n' "$expected_sorted" | sed '/^$/d') <(printf '%s\n' "$actual_sorted" | sed '/^$/d'))
+          unexpected=$(comm -13 <(printf '%s\n' "$expected_sorted" | sed '/^$/d') <(printf '%s\n' "$actual_sorted" | sed '/^$/d'))
+          duplicates=$(printf '%s\n' "${actual_ids[@]}" | sed '/^$/d' | sort | uniq -d || true)
+
+          if [ -n "$missing" ] || [ -n "$unexpected" ] || [ -n "$duplicates" ] || [ "${#malformed[@]}" -gt 0 ]; then
+            echo "::error title=incomplete-matrix::gate attestation IDs do not match the matrix definition"
+            echo "Expected IDs: $(printf '%s' "$expected_sorted" | tr '\n' ' ')"
+            echo "Found IDs: $(printf '%s' "$actual_sorted" | tr '\n' ' ')"
+            echo "Missing IDs: ${missing:-none}"
+            echo "Unexpected IDs: ${unexpected:-none}"
+            echo "Duplicate IDs: ${duplicates:-none}"
+            if [ "${#malformed[@]}" -gt 0 ]; then printf 'Malformed attestations: %s\n' "${malformed[*]}"; fi
             exit 1
           fi
-          # Any failing or mismatched leg must be visible here too.
-          bad=$(jq -r 'select(.job_status != "success" or .declared_native != .runner_native) | .leg' attest/*.json 2>/dev/null || true)
-          if [ -n "$bad" ]; then
-            echo "::error title=leg-without-clean-coverage::$(echo "$bad" | tr '\n' ' ')"
+
+          bad=()
+          for f in "${files[@]}"; do
+            if ! jq -e '.job_status == "success" and .declared_native == .runner_native' "$f" >/dev/null; then
+              bad+=("$(jq -r '[.leg_id // "unknown", .job_status // "missing status", .declared_native // "missing declaration", .runner_native // "missing measurement"] | join(": ")' "$f")")
+            fi
+          done
+          if [ "${#bad[@]}" -gt 0 ] || [ "$GO_CLIENT_RESULT" != "success" ] || [ "$WORKER_RESULT" != "success" ]; then
+            echo "::error title=leg-without-clean-coverage::one or more upstream jobs or attestations failed"
+            printf 'Unclean attestations: %s\n' "${bad[*]:-none}"
             exit 1
           fi
-          echo "all $count legs attested with a matched native arch"
+          echo "all ${#expected_ids[@]} matrix-defined legs attested with clean job status and matching native architecture"

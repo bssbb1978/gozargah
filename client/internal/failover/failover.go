@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -52,15 +53,16 @@ func (e Endpoint) dialPort() int {
 	return 443
 }
 
-// IPHealth is the live health record for one (endpoint, dial-address).
+// IPHealth is the live health record for one (host, transport, dial-address).
 type IPHealth struct {
-	DialAddr   string  `json:"dial_addr"` // ip:port or host:port (port defaults to 443)
-	RTTMS      float64 `json:"rtt_ms"`
-	Score      float64 `json:"score"` // 0..1 composite health
-	ConsecFail int     `json:"consec_fail"`
-	ConsecOK   int     `json:"consec_ok"`
-	LastOKMS   int64   `json:"last_ok_ms"`
-	LastErr    string  `json:"last_err"`
+	DialAddr    string  `json:"dial_addr"` // ip:port or host:port (port defaults to 443)
+	RTTMS       float64 `json:"rtt_ms"`
+	Score       float64 `json:"score"` // 0..1 composite health
+	ConsecFail  int     `json:"consec_fail"`
+	ConsecOK    int     `json:"consec_ok"`
+	LastOKMS    int64   `json:"last_ok_ms"`
+	CheckedAtMS int64   `json:"checked_at_ms"`
+	LastErr     string  `json:"last_err"`
 	// QuietUntilMS is the blackout-quiet gate (2.21): the dial address is
 	// skipped by the ladder until this unix-ms instant. Cleared on the next
 	// success. 0 = not quiet.
@@ -115,7 +117,8 @@ type QuietState struct {
 // Cache is the persistable routing cache.
 type Cache struct {
 	UpdatedAtMS int64                `json:"updated_at_ms"`
-	Health      map[string]*IPHealth `json:"health"` // key: host|dialaddr
+	Health      map[string]*IPHealth `json:"health"`              // key: host|transport|dialaddr
+	IPCursor    map[string]uint64    `json:"ip_cursor,omitempty"` // key: host|transport; rotates equal-health clean IPs
 }
 
 // ProbeFunc performs one connectivity probe and reports latency.
@@ -131,6 +134,9 @@ type Engine struct {
 	state   string // "normal" | "aggressive"
 	// failure streak that triggers aggressive mode
 	streak int
+	// When every address is quiet, probe one rotating candidate per round.
+	// A fixed first-candidate retry could starve a recovered alternate route.
+	quietCursor int
 	// quiet is the blackout-quiet gate (disabled until SetQuietPolicy).
 	quiet QuietPolicy
 }
@@ -150,10 +156,11 @@ const (
 	aggressiveCandidateCap = 6
 
 	// health scoring
-	healthOKBase   = 1.0
-	healthDecay    = 0.6  // per consecutive failure
-	healthRTTFloor = 0.25 // 400ms+ RTT starts costing score
-	healthRTTMax   = 400.0
+	healthOKBase     = 1.0
+	healthDecay      = 0.6  // per consecutive failure
+	healthRTTFloor   = 0.25 // 400ms+ RTT starts costing score
+	healthRTTMax     = 400.0
+	healthHalfLifeMS = int64(6 * time.Hour / time.Millisecond)
 
 	// quietMinFails is the consecutive-failure count that arms the
 	// blackout-quiet gate. Below it, a single unlucky dial never silences a
@@ -177,7 +184,7 @@ func New(entries []Endpoint, probe ProbeFunc) *Engine {
 	}
 	e := &Engine{
 		entries: entries,
-		cache:   &Cache{Health: map[string]*IPHealth{}},
+		cache:   &Cache{Health: map[string]*IPHealth{}, IPCursor: map[string]uint64{}},
 		probe:   probe,
 		state:   StateNormal,
 	}
@@ -207,9 +214,51 @@ func (e *Engine) LoadCache(path string) error {
 	if c.Health == nil {
 		c.Health = map[string]*IPHealth{}
 	}
+	if c.IPCursor == nil {
+		c.IPCursor = map[string]uint64{}
+	}
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	// Upgrade the pre-transport cache shape (host|dialaddr) by seeding each
+	// matching transport row. It is only a reachability prior; new real
+	// tunnel outcomes immediately make the transport-specific rows diverge.
+	legacyKeys := make([]string, 0)
+	for key := range c.Health {
+		legacyKeys = append(legacyKeys, key)
+	}
+	migratedLegacy := make(map[string]bool)
+	for _, ep := range e.entries {
+		prefix := ep.Host + "|"
+		for _, key := range legacyKeys {
+			if !strings.HasPrefix(key, prefix) {
+				continue
+			}
+			addr := strings.TrimPrefix(key, prefix)
+			if strings.Contains(addr, "|") {
+				continue // already transport-scoped
+			}
+			if _, _, err := net.SplitHostPort(addr); err != nil {
+				continue
+			}
+			newKey := healthKey(ep, addr)
+			if _, exists := c.Health[newKey]; exists {
+				migratedLegacy[key] = true
+				continue
+			}
+			if old := c.Health[key]; old != nil {
+				seed := *old
+				if seed.CheckedAtMS == 0 {
+					seed.CheckedAtMS = c.UpdatedAtMS
+				}
+				c.Health[newKey] = &seed
+				migratedLegacy[key] = true
+			}
+		}
+	}
+	for key := range migratedLegacy {
+		delete(c.Health, key)
+	}
 	e.cache = &c
-	e.mu.Unlock()
 	return nil
 }
 
@@ -218,6 +267,10 @@ func (e *Engine) SaveCache(path string) error {
 	e.mu.Lock()
 	c := *e.cache
 	c.Health = make(map[string]*IPHealth, len(e.cache.Health))
+	c.IPCursor = make(map[string]uint64, len(e.cache.IPCursor))
+	for k, v := range e.cache.IPCursor {
+		c.IPCursor[k] = v
+	}
 	for k, v := range e.cache.Health {
 		cp := *v
 		c.Health[k] = &cp
@@ -284,14 +337,14 @@ func (e *Engine) State() string {
 	return e.state
 }
 
-// CandidatesFor returns the dial-address candidates for an endpoint, best
-// health first: explicit IPs first (health order), then the bare hostname.
-// Unknown health (fresh) scores 0.5, so it ranks below healthy but above
-// known-dead.
+// CandidatesFor returns an endpoint's dial-address candidates, best health
+// first. Equal-health explicit IPs rotate as a pool; the hostname remains a
+// final fallback at the same health rank. Unknown health scores 0.5, between
+// known-healthy and known-dead evidence.
 func (e *Engine) CandidatesFor(ep Endpoint) []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	cs := e.candidatesForLocked(ep)
+	cs := e.candidatesForLocked(ep, time.Now().UnixMilli(), true)
 	addrs := make([]string, len(cs))
 	for i, c := range cs {
 		addrs[i] = c.addr
@@ -313,6 +366,17 @@ func (e *Engine) SetQuietPolicy(p QuietPolicy) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.quiet = p
+}
+
+// ClearQuiet releases every dial address from its current quiet window. The
+// client calls this only after fresh independent liveness evidence ends a
+// domestic-only blackout, so primary routes can be checked immediately.
+func (e *Engine) ClearQuiet() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, h := range e.cache.Health {
+		h.QuietUntilMS = 0
+	}
 }
 
 // Quiet returns the audit view of the blackout-quiet gate.
@@ -353,17 +417,17 @@ func (e *Engine) FailoverOrder(orderFn func(Arm) float64) []Candidate {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := time.Now().UnixMilli()
-	out := e.failoverOrderLocked(orderFn, true, now)
+	out := e.failoverOrderLocked(orderFn, true, now, false)
 	if len(out) == 0 {
-		out = e.failoverOrderLocked(orderFn, false, now)
+		return e.failoverOrderLocked(orderFn, false, now, true)
 	}
-	return out
+	return e.failoverOrderLocked(orderFn, true, now, true)
 }
 
 // failoverOrderLocked builds the ordered candidate list. skipQuiet drops
 // addresses inside their quiet window; the caller decides what an empty
 // result means.
-func (e *Engine) failoverOrderLocked(orderFn func(Arm) float64, skipQuiet bool, nowMS int64) []Candidate {
+func (e *Engine) failoverOrderLocked(orderFn func(Arm) float64, skipQuiet bool, nowMS int64, rotateIPs bool) []Candidate {
 	cap := normalCandidateCap
 	if e.state == StateAggressive {
 		cap = aggressiveCandidateCap
@@ -390,9 +454,9 @@ func (e *Engine) failoverOrderLocked(orderFn func(Arm) float64, skipQuiet bool, 
 	})
 	var out []Candidate
 	for _, r := range ranks {
-		addrs := e.candidatesForLocked(r.ep)
+		addrs := e.candidatesForLocked(r.ep, nowMS, rotateIPs)
 		for _, a := range addrs {
-			if skipQuiet && e.quietNow(e.cache.Health[r.ep.Host+"|"+a.addr], nowMS) {
+			if skipQuiet && e.quietNow(e.cache.Health[healthKey(r.ep, a.addr)], nowMS) {
 				continue
 			}
 			if len(out) >= cap {
@@ -405,26 +469,73 @@ func (e *Engine) failoverOrderLocked(orderFn func(Arm) float64, skipQuiet bool, 
 }
 
 type cand struct {
-	addr  string
-	score float64
+	addr     string
+	score    float64
+	explicit bool
 }
 
-func (e *Engine) candidatesForLocked(ep Endpoint) []cand {
+func healthKey(ep Endpoint, dialAddr string) string {
+	transport := ep.Transport
+	if transport == "" {
+		transport = "ws"
+	}
+	return ep.Host + "|" + transport + "|" + dialAddr
+}
+
+// decayedHealthScore lets old evidence return toward an unknown prior rather
+// than making a once-good or once-bad clean IP permanently dominant.
+func decayedHealthScore(h *IPHealth, nowMS int64) float64 {
+	if h.CheckedAtMS <= 0 || nowMS <= h.CheckedAtMS {
+		return h.Score
+	}
+	age := float64(nowMS - h.CheckedAtMS)
+	factor := math.Exp2(-age / float64(healthHalfLifeMS))
+	return 0.5 + (h.Score-0.5)*factor
+}
+
+func (e *Engine) candidatesForLocked(ep Endpoint, nowMS int64, rotateIPs bool) []cand {
 	var out []cand
-	add := func(addr string) {
-		h, ok := e.cache.Health[ep.Host+"|"+addr]
+	add := func(addr string, explicit bool) {
+		h, ok := e.cache.Health[healthKey(ep, addr)]
 		if !ok {
-			out = append(out, cand{addr: addr, score: 0.5})
+			out = append(out, cand{addr: addr, score: 0.5, explicit: explicit})
 			return
 		}
-		out = append(out, cand{addr: addr, score: h.Score})
+		out = append(out, cand{addr: addr, score: decayedHealthScore(h, nowMS), explicit: explicit})
 	}
 	port := strconv.Itoa(ep.dialPort())
 	for _, ip := range ep.IPs {
-		add(net.JoinHostPort(ip, port))
+		add(net.JoinHostPort(ip, port), true)
 	}
-	add(net.JoinHostPort(ep.Host, port))
+	add(net.JoinHostPort(ep.Host, port), false)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].score > out[j].score })
+	if !rotateIPs {
+		return out
+	}
+
+	// Rotate only equal-health explicit IPs. A measured healthier address
+	// keeps its rank, while a pool of equally unknown/healthy hints does not
+	// stick to the first configured IP on every connection.
+	rotationKey := ep.Host + "|" + ep.Transport
+	for i := 0; i < len(out); {
+		if !out[i].explicit {
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(out) && out[j].explicit && math.Abs(out[j].score-out[i].score) < 1e-9 {
+			j++
+		}
+		if j-i > 1 {
+			offset := int(e.cache.IPCursor[rotationKey] % uint64(j-i))
+			if offset > 0 {
+				group := append([]cand(nil), out[i:j]...)
+				copy(out[i:j], append(group[offset:], group[:offset]...))
+			}
+			e.cache.IPCursor[rotationKey]++
+		}
+		i = j
+	}
 	return out
 }
 
@@ -444,11 +555,18 @@ func (e *Engine) ProbeRound(now time.Time) []Candidate {
 	// wire. If that leaves nothing, the whole ladder is quiet — the
 	// blackout case, where one candidate per round is probed (the minimum
 	// failed-attempt signature that still discovers a reopened route).
-	order := e.failoverOrderLocked(nil, true, now.UnixMilli())
+	order := e.failoverOrderLocked(nil, true, now.UnixMilli(), false)
 	if len(order) == 0 {
-		if full := e.failoverOrderLocked(nil, false, now.UnixMilli()); len(full) > 0 {
-			order = full[:1]
+		if full := e.failoverOrderLocked(nil, false, now.UnixMilli(), true); len(full) > 0 {
+			// Keep blackout probe volume to one attempt per round, but rotate
+			// across the bounded ladder so a recovered non-leading path is not
+			// starved forever by one still-dead first entry.
+			index := e.quietCursor % len(full)
+			order = []Candidate{full[index]}
+			e.quietCursor = (index + 1) % len(full)
 		}
+	} else {
+		order = e.failoverOrderLocked(nil, true, now.UnixMilli(), true)
 	}
 	timeout := normalProbeTimeout
 	if e.state == StateAggressive {
@@ -484,12 +602,13 @@ func (e *Engine) Observe(ep Endpoint, dialAddr string, ok bool, rttMS float64, e
 func (e *Engine) observe(ep Endpoint, dialAddr string, ok bool, rttMS float64, errClass string, now time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	key := ep.Host + "|" + dialAddr
+	key := healthKey(ep, dialAddr)
 	h, exists := e.cache.Health[key]
 	if !exists {
 		h = &IPHealth{DialAddr: dialAddr}
 		e.cache.Health[key] = h
 	}
+	h.CheckedAtMS = now.UnixMilli()
 	if ok {
 		h.ConsecOK++
 		h.ConsecFail = 0

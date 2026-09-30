@@ -179,6 +179,7 @@ export function adaptiveProtocolOrder(originEngineConfigured: boolean, enabledOr
       if (c.transport === 'ws') score += 12;
       if (c.transport === 'xhttp') score += 8;
       if (c.transport === 'grpc') score += 5;
+      if (c.transport === 'h2') score += 4;
       if (c.protocol === 'vless') score += 4;
       if (c.protocol === 'trojan') score += 3;
       return { protocol: c.protocol, transport: c.transport, score };

@@ -132,7 +132,10 @@ export const PANEL_JS = String.raw`
       setVersion(st.version || GZ.version || '');
       setDbChip(st.dbOk);
       if (!st.dbOk) { showView('setup'); return; }
-      api('/me').then(function () { showView('main'); loadAll(); }, function () { /* 401 -> view login set in api() */ });
+      api('/me').then(function () { showView('main'); loadAll(); }, function (e) {
+        if (e.message === 'password_change_required') showRequiredPasswordChange();
+        /* 401 -> view login set in api() */
+      });
     }).catch(function () { showView('login'); });
   }
 
@@ -193,7 +196,7 @@ export const PANEL_JS = String.raw`
     setVersion(st.version || GZ.version || '');
     $('#pw-warn').classList.toggle('hidden', !(st.isDefaultPassword || GZ.isDefaultPassword));
     if (admin) {
-      var sub = location.origin + '/' + (S.settings ? S.settings.subPath : 'sub') + '/' + (admin.subToken || '');
+      var sub = location.origin + '/' + (admin.dynamicPrefix || (S.settings ? S.settings.subPath : 'sub')) + '/' + (admin.routeKey || admin.subToken || '');
       $('#admin-sub').textContent = sub;
       $('#admin-sub').setAttribute('data-copy', sub);
     }
@@ -423,8 +426,39 @@ export const PANEL_JS = String.raw`
       $('#s-subpath').value = s.subPath || '';
       $('#s-panelpath').value = s.panelPath || '';
       $('#s-resetcycle').value = s.resetCycle || 'none';
+      var applyToggle = $('#ai-advisor-apply');
+      var killButton = $('#ai-advisor-kill');
+      var controlStatus = $('#ai-advisor-control-status');
+      if (applyToggle) {
+        applyToggle.checked = !!s.aiAdvisorEnabled;
+        applyToggle.disabled = !!s.aiAdvisorKillSwitch || !!s.aiAdvisorKilled;
+      }
+      if (killButton) {
+        killButton.textContent = s.aiAdvisorKillSwitch ? t('aiAdvisorKillEnv') : (s.aiAdvisorKilled ? t('aiAdvisorUnkill') : t('aiAdvisorKill'));
+        killButton.disabled = !!s.aiAdvisorKillSwitch;
+      }
+      if (controlStatus) controlStatus.textContent = t('aiAdvisorStatus') + ': ' + String(s.aiAdvisorStatus || 'advisory');
       renderDash();
     }).catch(function () {});
+  }
+
+  function saveAdvisorControl(body) {
+    api('/settings', { method: 'POST', body: JSON.stringify(body) })
+      .then(function () { return api('/settings'); })
+      .then(function (s) {
+        S.settings = s;
+        var toggle = $('#ai-advisor-apply');
+        if (toggle) { toggle.checked = !!s.aiAdvisorEnabled; toggle.disabled = !!s.aiAdvisorKillSwitch || !!s.aiAdvisorKilled; }
+        var killButton = $('#ai-advisor-kill');
+        if (killButton) {
+          killButton.textContent = s.aiAdvisorKillSwitch ? t('aiAdvisorKillEnv') : (s.aiAdvisorKilled ? t('aiAdvisorUnkill') : t('aiAdvisorKill'));
+          killButton.disabled = !!s.aiAdvisorKillSwitch;
+        }
+        var status = $('#ai-advisor-control-status');
+        if (status) status.textContent = t('aiAdvisorStatus') + ': ' + String(s.aiAdvisorStatus || 'advisory');
+        toast(t('saved'), 'ok');
+      })
+      .catch(function (e) { toast(e.message, 'err'); loadSettings(); });
   }
 
   function saveSettings() {
@@ -464,11 +498,11 @@ export const PANEL_JS = String.raw`
   }
 
   /* ---------------- modal ---------------- */
-  function openModal(inner) {
+  function openModal(inner, locked) {
     $('#modal-root').innerHTML = '<div class="modal-bg"><div class="modal glass">' + inner + '</div></div>';
     $all('#modal-root [data-close]').forEach(function (b) { b.addEventListener('click', closeModal); });
     $('#modal-root').querySelector('.modal-bg').addEventListener('click', function (e) {
-      if (e.target === e.currentTarget) closeModal();
+      if (!locked && e.target === e.currentTarget) closeModal();
     });
   }
   function closeModal() { $('#modal-root').innerHTML = ''; }
@@ -531,11 +565,50 @@ export const PANEL_JS = String.raw`
 
     $('#login-btn').addEventListener('click', doLogin);
     $('#login-pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+    function showRequiredPasswordChange() {
+      if ($('#required-password-form')) return;
+      openModal(
+        '<h3>' + esc(t('initialPasswordTitle')) + '</h3>' +
+        '<p>' + esc(t('initialPasswordBody')) + '</p>' +
+        '<div class="field"><label>' + esc(t('newPassword')) + '</label><input type="password" id="required-new-password" autocomplete="new-password"></div>' +
+        '<div class="field"><label>' + esc(t('confirmPassword')) + '</label><input type="password" id="required-confirm-password" autocomplete="new-password"></div>' +
+        '<div class="auth-err" id="required-password-error"></div>' +
+        '<button class="btn primary" id="required-password-submit" type="button" style="width:100%">' + esc(t('changePw')) + '</button>',
+        true
+      );
+      function submitRequiredPassword() {
+        var password = $('#required-new-password').value;
+        var confirmation = $('#required-confirm-password').value;
+        var error = $('#required-password-error');
+        var button = $('#required-password-submit');
+        error.textContent = '';
+        if (password.length < 8) { error.textContent = t('passwordTooShort'); return; }
+        if (password !== confirmation) { error.textContent = t('passwordMismatch'); return; }
+        button.disabled = true;
+        api('/password', { method: 'POST', body: JSON.stringify({ newPassword: password }) })
+          .then(function () {
+            closeModal();
+            showView('login');
+            $('#login-pw').value = '';
+            toast(t('passwordChangedSignin'), 'ok');
+          })
+          .catch(function (e) {
+            error.textContent = e.message;
+            button.disabled = false;
+          });
+      }
+      $('#required-password-submit').addEventListener('click', submitRequiredPassword);
+      $('#required-confirm-password').addEventListener('keydown', function (e) { if (e.key === 'Enter') submitRequiredPassword(); });
+    }
     function doLogin() {
       var err = $('#login-err'); err.textContent = '';
       var btn = $('#login-btn'); btn.disabled = true;
       api('/login', { method: 'POST', body: JSON.stringify({ password: $('#login-pw').value }) })
-        .then(function () { btn.disabled = false; showView('main'); loadAll(); toast(t('saved'), 'ok'); })
+        .then(function (result) {
+          btn.disabled = false;
+          if (result.passwordChangeRequired) { showRequiredPasswordChange(); return; }
+          showView('main'); loadAll(); toast(t('saved'), 'ok');
+        })
         .catch(function (e) {
           btn.disabled = false;
           err.textContent = e.message === 'too_many_attempts' ? t('tooManyAttempts') : (e.message === 'bad_password' ? t('wrongPassword') : e.message);
@@ -572,6 +645,13 @@ export const PANEL_JS = String.raw`
     $('#add-user-btn').addEventListener('click', openAddUser);
     $('#save-settings').addEventListener('click', saveSettings);
     $('#ai-advisor-btn').addEventListener('click', runAiAdvisor);
+    $('#ai-advisor-apply').addEventListener('change', function (event) {
+      saveAdvisorControl({ aiAdvisorEnabled: !!event.target.checked });
+    });
+    $('#ai-advisor-kill').addEventListener('click', function () {
+      if (!S.settings || S.settings.aiAdvisorKillSwitch) return;
+      saveAdvisorControl({ aiAdvisorKilled: !S.settings.aiAdvisorKilled });
+    });
   });
 })();
 `;

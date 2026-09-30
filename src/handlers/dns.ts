@@ -256,7 +256,7 @@ function jsonError(code: string, status: number): Response {
   return new Response(JSON.stringify({ error: code }), { status, headers });
 }
 
-/** Per-user /sub/{token}/dns-query RFC 8484 handler. */
+/** Per-user subscription route /dns-query RFC 8484 handler. */
 export async function handleUserDnsRequest(request: Request, env: Env, user: GzUser): Promise<Response> {
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: dnsHttpHeaders() });
   if (request.method !== 'GET' && request.method !== 'POST') return jsonError('method_not_allowed', 405);

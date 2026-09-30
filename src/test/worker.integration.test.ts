@@ -2,13 +2,16 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
 import type { D1Database } from '@cloudflare/workers-types';
-import { VERSION } from '../config';
-import { createUser, getUserByIdFresh, recordUsageDelta } from '../db/users';
-import { consumeAiDiagnosticQuota, consumeDnsQueryQuota, loadHealthSamples, loadLatestPathSamples, saveHealthSample } from '../db/store';
-import { subTokenFor } from '../subscription';
+import { DEFAULTS, SCHEMA_VERSION, VERSION } from '../config';
+import { clearSubscriptionRouteCacheForTests, createUser, findUserBySubscriptionRoute, getOrCreateSubscriptionRoute, getUserByIdFresh, isUserAllowed, recordUsageDelta, updateUser } from '../db/users';
+import { consumeAiDiagnosticQuota, consumeDnsQueryQuota, loadHealthSamples, loadLatestPathSamples, loadNetworkState, loadSettings, saveHealthSample, saveNetworkState, saveSettings } from '../db/store';
+import { buildLiveAdaptiveClientBundle, subTokenFor } from '../subscription';
+import { pbkdf2Hex } from '../utils/crypto';
+import { defaultAdvisorApplication, setAdvisorApplicationControls } from '../ai/advisor-application';
 import { createDiagnostics, getAiModelCandidates, rankCatalogModels } from '../ai/diagnostics';
 
 let mf: Miniflare;
+let workerScript = '';
 let db: D1Database;
 let axrV2User: { uuid: string } | null = null;
 const SECRET = 'test-webhook-secret-should-not-be-used-in-production';
@@ -26,15 +29,19 @@ beforeAll(async () => {
     entryPoints: ['src/index.ts'], bundle: true, format: 'esm', platform: 'browser',
     target: 'es2022', write: false, logLevel: 'silent', external: ['cloudflare:sockets'],
   });
+  workerScript = bundled.outputFiles[0].text;
   mf = new Miniflare({
     workers: [
       {
-        name: 'gozargah-test', script: bundled.outputFiles[0].text, modules: true,
+        name: 'gozargah-test', script: workerScript, modules: true,
         compatibilityDate: '2025-01-15', compatibilityFlags: ['nodejs_compat'],
         d1Databases: ['GZ_DB'],
         bindings: {
           TELEGRAM_BOT_TOKEN: '123456:test-token', TELEGRAM_WEBHOOK_SECRET: SECRET,
           TELEGRAM_ADMIN_IDS: '42',
+          // The shared suite uses the bootstrap password for unrelated panel tests.
+          // Production enforcement is exercised in isolated Workers below.
+          ALLOW_DEFAULT_PASSWORD: 'true',
           DNS_UPSTREAMS: 'https://doh.test/dns-query',
           DNS64_ENABLED: 'true',
           CLEAN_EDGE_IPS: '203.0.113.10, 203.0.113.11, 999.1.1.1',
@@ -81,6 +88,250 @@ describe('Cloudflare Worker + D1 integration', () => {
     expect(response.status).toBe(200);
     // Compare with the shared constant, not a literal, so version bumps can't leave this test stale.
     expect(await response.json()).toMatchObject({ ok: true, version: VERSION });
+  });
+
+  it('issues per-user opaque routes while preserving legacy subscription URLs', async () => {
+    expect(axrV2User).not.toBeNull();
+    const user = axrV2User!;
+    const userRow = await db.prepare('SELECT id FROM users WHERE uuid=?1').bind(user.uuid).first<{ id: number }>();
+    expect(userRow).not.toBeNull();
+    const route = await getOrCreateSubscriptionRoute(db, Number(userRow!.id));
+    expect(route.dynamicPrefix).toMatch(/^p-[0-9a-f]{24}$/);
+    expect(route.routeKey).toMatch(/^[0-9a-f]{64}$/);
+    expect(route.routeKey).not.toBe(user.uuid);
+
+    const modern = await mf.dispatchFetch(`https://gozargah.test/${route.dynamicPrefix}/${route.routeKey}`);
+    expect(modern.status).toBe(200);
+    expect(modern.headers.get('profile-title')).toMatch(/^base64:/);
+    expect(modern.headers.get('profile-web-page-url')).toBe(`https://gozargah.test/${route.dynamicPrefix}/${route.routeKey}`);
+    const manifest = await mf.dispatchFetch(`https://gozargah.test/${route.dynamicPrefix}/${route.routeKey}/axr-manifest`);
+    expect(manifest.status).toBe(200);
+    expect(await manifest.json()).toMatchObject({ schema: 'gozargah-axr-manifest/v3', host: 'gozargah.test' });
+
+    const legacyToken = await subTokenFor('gozargah.test', user.uuid);
+    const legacy = await mf.dispatchFetch(`https://gozargah.test/sub/${legacyToken}`);
+    expect(legacy.status).toBe(200);
+  });
+
+  it('bounds cached per-user route authorization to the approved 30-second window', async () => {
+    expect(axrV2User).not.toBeNull();
+    const row = await db.prepare('SELECT id FROM users WHERE uuid=?1').bind(axrV2User!.uuid).first<{ id: number }>();
+    const userId = Number(row?.id);
+    const route = await getOrCreateSubscriptionRoute(db, userId);
+    clearSubscriptionRouteCacheForTests();
+    const now = Date.now();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      expect((await findUserBySubscriptionRoute(db, route.dynamicPrefix, route.routeKey))?.enabled).toBe(true);
+      await updateUser(db, userId, { enabled: false });
+      // A positive cache may retain the prior state only within the explicitly
+      // approved 30-second revocation window.
+      expect((await findUserBySubscriptionRoute(db, route.dynamicPrefix, route.routeKey))?.enabled).toBe(true);
+      vi.setSystemTime(now + 30_001);
+      expect((await findUserBySubscriptionRoute(db, route.dynamicPrefix, route.routeKey))?.enabled).toBe(false);
+    } finally {
+      await updateUser(db, userId, { enabled: true });
+      clearSubscriptionRouteCacheForTests();
+      vi.useRealTimers();
+    }
+  });
+
+  it('disables the production gate only when the emergency rollback binding is explicit', async () => {
+    const response = await mf.dispatchFetch('https://gozargah.test/gozargah/api/status');
+    expect(await response.json()).toMatchObject({ dbOk: true, isDefaultPassword: true, passwordChangeRequired: false });
+  });
+
+  it('forces a staging first-login password change and blocks panel APIs until completion', async () => {
+    const forceWorker = new Miniflare({
+      workers: [{
+        name: 'gozargah-force-password-test',
+        script: workerScript,
+        modules: true,
+        compatibilityDate: '2025-01-15',
+        compatibilityFlags: ['nodejs_compat'],
+        d1Databases: ['GZ_DB'],
+        bindings: { FORCE_INITIAL_PASSWORD_CHANGE: 'true', ALLOW_DEFAULT_PASSWORD: 'true' },
+      }],
+    });
+    try {
+      const status = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/status');
+      expect(status.status).toBe(200);
+      expect(await status.json()).toMatchObject({ dbOk: true, isDefaultPassword: true, passwordChangeRequired: true });
+
+      const login = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin' }),
+      });
+      expect(login.status).toBe(200);
+      expect(await login.json()).toMatchObject({ ok: true, passwordChangeRequired: true });
+      const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
+      expect(cookie).toMatch(/^gz_session=/);
+
+      const blocked = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/users', {
+        headers: { cookie },
+      });
+      expect(blocked.status).toBe(428);
+      expect(await blocked.json()).toMatchObject({ error: 'password_change_required' });
+
+      const changed = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/password', {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({ newPassword: 'staging-only-new-password' }),
+      });
+      expect(changed.status).toBe(200);
+      expect(changed.headers.get('set-cookie')).toContain('Max-Age=0');
+      expect(await changed.json()).toMatchObject({ ok: true, passwordChanged: true });
+
+      const postChangeStatus = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/status');
+      expect(await postChangeStatus.json()).toMatchObject({ isDefaultPassword: false, passwordChangeRequired: false });
+      const oldPassword = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin' }),
+      });
+      expect(oldPassword.status).toBe(401);
+      const newPassword = await forceWorker.dispatchFetch('https://force-password.test/gozargah/api/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'staging-only-new-password' }),
+      });
+      expect(newPassword.status).toBe(200);
+      expect(await newPassword.json()).toMatchObject({ ok: true, passwordChangeRequired: false });
+    } finally {
+      await forceWorker.dispose();
+    }
+  });
+
+  it('enforces the production default-password change, invalidates sessions, and rate limits brute force', async () => {
+    const productionWorker = new Miniflare({
+      workers: [{
+        name: 'gozargah-production-password-test',
+        script: workerScript,
+        modules: true,
+        compatibilityDate: '2025-01-15',
+        compatibilityFlags: ['nodejs_compat'],
+        d1Databases: ['GZ_DB'],
+      }],
+    });
+    try {
+      const base = 'https://production-password.test/gozargah/api';
+      const productionDb = await productionWorker.getD1Database('GZ_DB', 'gozargah-production-password-test');
+      const status = await productionWorker.dispatchFetch(base + '/status');
+      expect(await status.json()).toMatchObject({ dbOk: true, isDefaultPassword: true, passwordChangeRequired: true });
+
+      const login = await productionWorker.dispatchFetch(base + '/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: DEFAULTS.defaultPassword }),
+      });
+      expect(login.status).toBe(200);
+      expect(await login.json()).toMatchObject({ ok: true, passwordChangeRequired: true });
+      const oldCookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
+
+      const blocked = await productionWorker.dispatchFetch(base + '/users', { headers: { cookie: oldCookie } });
+      expect(blocked.status).toBe(428);
+      expect(await blocked.json()).toMatchObject({ error: 'password_change_required' });
+
+      const tooShort = await productionWorker.dispatchFetch(base + '/password', {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie: oldCookie },
+        body: JSON.stringify({ newPassword: '1234567' }),
+      });
+      expect(tooShort.status).toBe(400);
+      expect(await tooShort.json()).toMatchObject({ error: 'password too short (min 8)' });
+
+      const bootstrapPassword = await productionWorker.dispatchFetch(base + '/password', {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie: oldCookie },
+        body: JSON.stringify({ newPassword: DEFAULTS.defaultPassword }),
+      });
+      expect(bootstrapPassword.status).toBe(400);
+      expect(await bootstrapPassword.json()).toMatchObject({ error: 'new password must differ from the bootstrap password' });
+
+      const changed = await productionWorker.dispatchFetch(base + '/password', {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie: oldCookie },
+        body: JSON.stringify({ newPassword: 'production-test-password' }),
+      });
+      expect(changed.status).toBe(200);
+      expect(changed.headers.get('set-cookie')).toContain('Max-Age=0');
+      expect(await changed.json()).toMatchObject({ ok: true, passwordChanged: true });
+
+      const oldSession = await productionWorker.dispatchFetch(base + '/me', { headers: { cookie: oldCookie } });
+      expect(oldSession.status).toBe(401);
+      expect(await (await productionWorker.dispatchFetch(base + '/status')).json()).toMatchObject({
+        isDefaultPassword: false, passwordChangeRequired: false,
+      });
+      const newLogin = await productionWorker.dispatchFetch(base + '/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'production-test-password' }),
+      });
+      expect(newLogin.status).toBe(200);
+      expect(await newLogin.json()).toMatchObject({ ok: true, passwordChangeRequired: false });
+      const newCookie = (newLogin.headers.get('set-cookie') ?? '').split(';')[0];
+      expect((await productionWorker.dispatchFetch(base + '/me', { headers: { cookie: newCookie } })).status).toBe(200);
+
+      const ip = '203.0.113.77';
+      for (let attempt = 0; attempt < DEFAULTS.loginMaxAttempts; attempt++) {
+        const failed = await productionWorker.dispatchFetch(base + '/login', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'cf-connecting-ip': ip },
+          body: JSON.stringify({ password: 'definitely-wrong' }),
+        });
+        expect(failed.status).toBe(401);
+      }
+      const limited = await productionWorker.dispatchFetch(base + '/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'cf-connecting-ip': ip },
+        body: JSON.stringify({ password: 'definitely-wrong' }),
+      });
+      expect(limited.status).toBe(429);
+      expect(await limited.json()).toMatchObject({ error: 'too_many_attempts' });
+
+      const eventRows = await productionDb.prepare('SELECT detail FROM events').all<{ detail: string }>();
+      expect(JSON.stringify(eventRows.results ?? [])).not.toContain(DEFAULTS.defaultPassword);
+    } finally {
+      await productionWorker.dispose();
+    }
+  });
+
+  it('uses the stored PBKDF2 hash, not a stale boolean, for existing changed-password installs', async () => {
+    const changedWorker = new Miniflare({
+      workers: [{
+        name: 'gozargah-existing-password-test',
+        script: workerScript,
+        modules: true,
+        compatibilityDate: '2025-01-15',
+        compatibilityFlags: ['nodejs_compat'],
+        d1Databases: ['GZ_DB'],
+      }],
+    });
+    try {
+      const changedDb = await changedWorker.getD1Database('GZ_DB', 'gozargah-existing-password-test');
+      const salt = '0123456789abcdef0123456789abcdef';
+      const password = 'already-changed-install-password';
+      const hash = await pbkdf2Hex(password, salt, DEFAULTS.pwIterations);
+      const legacySettings = {
+        schemaVersion: SCHEMA_VERSION,
+        panelPath: 'gozargah',
+        subPath: 'sub',
+        proxyIPs: [...DEFAULTS.proxyIPs],
+        resetCycle: 'none',
+        passwordSalt: salt,
+        passwordHash: hash,
+        pwIterations: DEFAULTS.pwIterations,
+        isDefaultPassword: true, // deliberately stale legacy marker
+        forcePasswordChange: false,
+        createdAt: Date.now(),
+      };
+      // Seed this isolated D1 before the Worker bundle initializes its schema;
+      // module-level schema memoization in the test process is per isolate.
+      await changedDb.prepare('CREATE TABLE kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL, rev INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)').run();
+      await changedDb.prepare('INSERT INTO kv_store (key, value, rev, updated_at) VALUES (?1, ?2, 1, ?3)')
+        .bind('settings', JSON.stringify(legacySettings), Date.now()).run();
+
+      const base = 'https://existing-password.test/gozargah/api';
+      const status = await changedWorker.dispatchFetch(base + '/status');
+      expect(await status.json()).toMatchObject({ dbOk: true, isDefaultPassword: false, passwordChangeRequired: false });
+      const login = await changedWorker.dispatchFetch(base + '/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password }),
+      });
+      expect(login.status).toBe(200);
+      expect(await login.json()).toMatchObject({ ok: true, passwordChangeRequired: false });
+      const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
+      expect((await changedWorker.dispatchFetch(base + '/me', { headers: { cookie } })).status).toBe(200);
+    } finally {
+      await changedWorker.dispose();
+    }
   });
 
   it('forwards authenticated DoH requests and synthesizes RFC 6052 DNS64 records', async () => {
@@ -187,6 +438,90 @@ describe('Cloudflare Worker + D1 integration', () => {
     expect(unchanged?.enabled).toBe(1);
   });
 
+  it('audits authenticated per-user controls, isolates accounts, and rate limits admin routes', async () => {
+    const base = 'https://gozargah.test/gozargah/api';
+    const userA = await createUser(db, { name: 'Control A', quotaBytes: 0, expiryAt: 0 });
+    const userB = await createUser(db, { name: 'Control B', quotaBytes: 0, expiryAt: 0 });
+    await expect(updateUser(db, userB.id, { enabled: false }, {
+      actorUserId: 0, action: 'user_disabled', details: { enabled: false },
+    })).rejects.toThrow();
+    expect((await getUserByIdFresh(db, userB.id))?.enabled).toBe(true);
+    const unauthenticated = await mf.dispatchFetch(base + '/users/' + userA.id, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: false }),
+    });
+    expect(unauthenticated.status).toBe(401);
+
+    const login = await mf.dispatchFetch(base + '/login', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin' }),
+    });
+    expect(login.status).toBe(200);
+    const cookie = login.headers.get('set-cookie')?.split(';', 1)[0];
+    expect(cookie).toMatch(/^gz_session=/);
+    const adminId = await db.prepare('SELECT id FROM users WHERE is_admin=1 ORDER BY id LIMIT 1').first<{ id: number }>();
+    expect(adminId).not.toBeNull();
+    const adminCall = (path: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) => {
+      const headers = {
+        ...(init.headers ?? {}),
+        cookie: cookie!,
+        'cf-connecting-ip': '198.51.100.77',
+      };
+      return mf.dispatchFetch(base + path, { ...init, headers });
+    };
+
+    const advisorEnabled = await adminCall('/settings', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ aiAdvisorEnabled: true }),
+    });
+    expect(advisorEnabled.status).toBe(200);
+    expect(await (await adminCall('/settings')).json()).toMatchObject({ aiAdvisorEnabled: true, aiAdvisorKilled: false });
+    const advisorKilled = await adminCall('/settings', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ aiAdvisorKilled: true }),
+    });
+    expect(advisorKilled.status).toBe(200);
+    expect(await (await adminCall('/settings')).json()).toMatchObject({ aiAdvisorEnabled: true, aiAdvisorKilled: true, aiAdvisorStatus: 'killed' });
+    await adminCall('/settings', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ aiAdvisorEnabled: false, aiAdvisorKilled: false }),
+    });
+    expect(await (await adminCall('/settings')).json()).toMatchObject({ aiAdvisorEnabled: false, aiAdvisorKilled: false, aiAdvisorStatus: 'disabled' });
+
+    const expires = Date.now() + 5 * 86_400_000;
+    const changed = await adminCall('/users/' + userA.id, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: false, quotaGB: 3, expiryAt: expires }),
+    });
+    expect(changed.status).toBe(200);
+    const freshA = await getUserByIdFresh(db, userA.id);
+    const freshB = await getUserByIdFresh(db, userB.id);
+    expect(freshA).toMatchObject({ enabled: false, quotaBytes: 3 * 1024 ** 3, expiryAt: expires });
+    expect(isUserAllowed(freshA!).reason).toBe('disabled');
+    expect(freshB?.enabled).toBe(true);
+    expect(isUserAllowed(freshB!).ok).toBe(true);
+    const disabledToken = await subTokenFor('gozargah.test', userA.uuid);
+    const disabledSubscription = await mf.dispatchFetch('https://gozargah.test/sub/' + disabledToken);
+    const disabledBody = await disabledSubscription.text();
+    expect(disabledBody).not.toContain(userA.uuid);
+    expect(disabledBody).not.toContain(userA.trojanPass);
+
+    const auditResponse = await adminCall('/user-audit?limit=20');
+    expect(auditResponse.status).toBe(200);
+    const auditBody = await auditResponse.json() as { events: Array<Record<string, unknown>> };
+    const entry = auditBody.events.find((event) => event.targetUserId === userA.id);
+    expect(entry).toMatchObject({
+      actorUserId: adminId!.id,
+      targetUserId: userA.id,
+      action: 'user_disabled',
+      details: { enabled: false, quotaBytes: 3 * 1024 ** 3, expiryAt: expires },
+    });
+    expect(JSON.stringify(entry)).not.toContain(userA.uuid);
+    expect(JSON.stringify(entry)).not.toContain(userA.trojanPass);
+
+    // The successful PATCH and audit read used two of the 30 requests/minute.
+    for (let i = 0; i < 28; i++) expect((await adminCall('/user-audit?limit=1')).status).toBe(200);
+    const limited = await adminCall('/user-audit?limit=1');
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get('retry-after')).toBe('60');
+  });
+
   it('keeps probe-source telemetry bounded and loads latest samples per source without schema migration', async () => {
     const subjectId = 'telemetry-test.example';
     await saveHealthSample(db, { kind: 'path_tcp', subjectId, ts: 1_800_000_000_001, ok: false, latencyMs: 900 });
@@ -233,10 +568,20 @@ describe('Cloudflare Worker + D1 integration', () => {
       AI: { run: async (model, input) => {
         captured.push(JSON.stringify(input));
         if (model.endsWith('unavailable')) throw new Error('model disabled');
-        return { response: 'پیشنهاد: وضعیت سهمیه‌ها را بازبینی کنید.' };
+        return { response: JSON.stringify({
+          schema: 'axr-strategy-advice/v1',
+          transport: 'ws', profile: 'fragmented', entry: 'primary', sniChoice: 'primary',
+          fragment: { enabled: true, minBytes: 256, maxBytes: 1200, gapMs: 15 },
+          retry: { maxAttempts: 4, baseDelayMs: 500, maxDelayMs: 8000 },
+        }) };
       } },
     }, 'fa');
-    expect(result).toMatchObject({ ai: true, model: '@cf/example/working' });
+    expect(result).toMatchObject({
+      ai: true,
+      model: '@cf/example/working',
+      strategyRecommendation: { transport: 'ws', profile: 'fragmented', entry: 'primary', sniChoice: 'primary' },
+    });
+    expect(result.text).toContain('پیشنهاد پارامتریِ اعتبارسنجی‌شده');
     expect(captured).toHaveLength(2);
     expect(captured.join('')).not.toContain('Test user');
     expect(captured.join('')).not.toContain('admin-uuid');
@@ -257,9 +602,15 @@ describe('Cloudflare Worker + D1 integration', () => {
         GZ_DB: db,
         AI_CATALOG_ACCOUNT_ID: '11111111111111111111111111111111',
         AI_CATALOG_API_TOKEN: 'test-catalog-token-value',
-        AI: { run: async (model) => ({ response: model }) },
+        AI: { run: async () => ({ response: JSON.stringify({
+          schema: 'axr-strategy-advice/v1',
+          transport: 'ws', profile: 'standard', entry: 'primary', sniChoice: 'primary',
+          fragment: { enabled: false, minBytes: 256, maxBytes: 1200, gapMs: 0 },
+          retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 5000 },
+        }) }) },
       }, 'en');
       expect(result.model).toBe('@cf/test/newest');
+      expect(result.strategyRecommendation?.schema).toBe('axr-strategy-advice/v1');
       expect(requests).toHaveLength(1);
       expect(requests[0].url).toContain('https://api.cloudflare.com/client/v4/accounts/');
       expect(requests[0].authorization).toBe('Bearer test-catalog-token-value');
@@ -267,6 +618,46 @@ describe('Cloudflare Worker + D1 integration', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('uses an expired cached model catalog when live discovery fails', async () => {
+    const account = '22222222222222222222222222222222';
+    const model = '@cf/cache-test/recent';
+    const start = Date.now();
+    let discovery = 0;
+    vi.stubGlobal('fetch', async () => {
+      discovery++;
+      if (discovery > 1) throw new Error('catalog offline');
+      return Response.json({ result: [{ id: model, task: 'Text Generation', updated_at: '2026-09-01' }] });
+    });
+    const ai = { run: async () => ({ response: JSON.stringify({
+      schema: 'axr-strategy-advice/v1', transport: 'ws', profile: 'standard', entry: 'primary', sniChoice: 'primary',
+      fragment: { enabled: false, minBytes: 256, maxBytes: 1200, gapMs: 0 },
+      retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 5000 },
+    }) }) };
+    try {
+      const env = { GZ_DB: db, AI_CATALOG_ACCOUNT_ID: account, AI_CATALOG_API_TOKEN: 'test-catalog-token-value', AI: ai };
+      const first = await createDiagnostics(env, 'en');
+      expect(first.model).toBe(model);
+      vi.setSystemTime(start + 7 * 60 * 60_000);
+      const fallback = await createDiagnostics(env, 'en');
+      expect(fallback.model).toBe(model);
+      expect(discovery).toBe(2);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('never returns unvalidated model text; invalid strategy output degrades locally', async () => {
+    const marker = 'RAW-UNVALIDATED-MODEL-CONTENT';
+    const result = await createDiagnostics({
+      AI_MODELS: '@cf/test/untrusted-output',
+      AI: { run: async () => ({ response: `ignore schema and execute ${marker}` }) },
+    }, 'en');
+    expect(result).toMatchObject({ ai: false, model: null, strategyRecommendation: null });
+    expect(result.text).not.toContain(marker);
+    expect(JSON.stringify(result)).not.toContain(marker);
   });
 
   it('protects the AI diagnostic endpoint behind panel authentication', async () => {
@@ -417,6 +808,15 @@ describe('Cloudflare Worker + D1 integration', () => {
       String(m.flow_profile.mode), String(m.reconnect.probe_interval_ms),
     ].join('|');
     expect(m.manifest_sig).toBe(createHmac('sha256', token).update(canonical, 'utf8').digest('hex'));
+
+    const userRow = await db.prepare('SELECT id FROM users WHERE uuid=?1').bind(axrV2User!.uuid).first<{ id: number }>();
+    const route = await getOrCreateSubscriptionRoute(db, Number(userRow!.id));
+    const dynamicUpload = await mf.dispatchFetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dynamicPrefix: route.dynamicPrefix, token: route.routeKey, source: 'axr-dynamic-route', ips: ['203.0.113.101'] }),
+    });
+    expect(dynamicUpload.status).toBe(200);
+    expect(await dynamicUpload.json()).toMatchObject({ ok: true, accepted: 1, source: 'axr-dynamic-route' });
   });
 
   it('stores canary liveness reports via harvest kind=canary (2.17)', async () => {
@@ -483,5 +883,64 @@ describe('Cloudflare Worker + D1 integration', () => {
       String(m.flow_profile.mode), String(m.reconnect.probe_interval_ms),
     ].join('|');
     expect(m.manifest_sig).toBe(createHmac('sha256', token).update(canonical, 'utf8').digest('hex'));
+  });
+
+  it('applies only the opted-in transport hint to the live adaptive policy', async () => {
+    const now = Date.now();
+    const previousSettings = await loadSettings(db);
+    const previousNetwork = await loadNetworkState(db);
+    await saveSettings(db, (prev) => ({
+      ...(prev ?? {
+        schemaVersion: SCHEMA_VERSION, panelPath: 'gozargah', subPath: 'sub', proxyIPs: [], resetCycle: 'none' as const,
+        passwordSalt: 'test-salt', passwordHash: 'test-hash', pwIterations: 1000, isDefaultPassword: false, createdAt: now,
+      }),
+      aiAdvisorApplication: setAdvisorApplicationControls(prev?.aiAdvisorApplication ?? defaultAdvisorApplication(), { enabled: true, killed: false }, now),
+    }));
+    await saveNetworkState(db, {
+      state: 'healthy', quorum: 1, failureRate: 0.05, selectedPath: 'test-path', reasonCodes: [],
+      confidence: 0.9, anomalyScore: 0.05, signalClass: 'normal', updatedAt: now,
+    });
+    try {
+      const result = await createDiagnostics({
+        GZ_DB: db,
+        AI_MODELS: '@cf/test/advisor-transport',
+        AI: { run: async () => ({ response: JSON.stringify({
+          schema: 'axr-strategy-advice/v1', transport: 'ws', profile: 'standard', entry: 'primary', sniChoice: 'primary',
+          fragment: { enabled: false, minBytes: 256, maxBytes: 1200, gapMs: 0 },
+          retry: { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 5000 },
+        }) }) },
+      }, 'en');
+      expect(result.advisorApplicationStatus).toBe('applied');
+      const settings = await loadSettings(db);
+      expect(settings?.aiAdvisorApplication).toMatchObject({ enabled: true, activeTransport: 'ws', status: 'applied' });
+      const bundle = JSON.parse(await buildLiveAdaptiveClientBundle(
+        'gozargah.test',
+        { uuid: '00000000-0000-4000-8000-000000000000', trojanPass: 'test-pass', name: 'advisor-test' },
+        null,
+        { GZ_DB: db },
+      )) as { live_policy: { advisor_application: Record<string, unknown> } };
+      expect(bundle.live_policy.advisor_application).toMatchObject({
+        status: 'applied', active_transport: 'ws', applied_scope: 'bounded_adaptive_transport_preference',
+        axr_native_transport_boundary: 'websocket_only',
+      });
+
+      vi.setSystemTime(now + 6 * 60_000);
+      await saveNetworkState(db, {
+        state: 'degraded', quorum: 0.5, failureRate: 0.3, selectedPath: 'test-path', reasonCodes: ['success_drop'],
+        confidence: 0.8, anomalyScore: 0.4, signalClass: 'selective_degradation', updatedAt: now + 6 * 60_000,
+      });
+      const rolledBundle = JSON.parse(await buildLiveAdaptiveClientBundle(
+        'gozargah.test',
+        { uuid: '00000000-0000-4000-8000-000000000000', trojanPass: 'test-pass', name: 'advisor-test' },
+        null,
+        { GZ_DB: db },
+      )) as { live_policy: { advisor_application: Record<string, unknown> } };
+      expect(rolledBundle.live_policy.advisor_application).toMatchObject({ status: 'rolled_back', active_transport: null });
+      expect((await loadSettings(db))?.aiAdvisorApplication).toMatchObject({ activeTransport: null, status: 'rolled_back' });
+    } finally {
+      vi.useRealTimers();
+      if (previousSettings) await saveSettings(db, () => previousSettings);
+      if (previousNetwork) await saveNetworkState(db, previousNetwork);
+    }
   });
 });

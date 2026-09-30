@@ -1,0 +1,47 @@
+# AXR multi-network validation protocol
+
+This is a manual, real-socket validation protocol. It does not create or contain measurements. `axr validate` makes actual TCP/TLS/WebSocket/VLESS handshake attempts from the machine where the command runs and exports one `axr-network-validation/v2` JSON document per run. Unit tests and the simulated DPI fixtures are **simulations** and must never be added to measurement results.
+
+## Probe definition and limits
+
+A successful attempt means: TCP dial to an AXR entry candidate, TLS handshake, WebSocket upgrade, VLESS `OK`, and a Worker-side TCP connect to the chosen destination. It sends no application payload. Latency is the client-observed elapsed time through the VLESS handshake. It measures this machine's current route only.
+
+The native Go AXR client probes VLESS over WebSocket only. Its `ws` and `ws-alt` entries are two path/query shapes of the same WebSocket transport, not independent protocol implementations. The strict report declares `vless` as its only probed proxy protocol and explicitly lists HTTP proxy, Trojan, VMess, Shadowsocks, WireGuard, and Hysteria2 as unsupported by this client. It lists `ws` and `ws-alt` as available candidate shapes (not a claim that each was attempted in every run); each actual attempt is recorded in `measurements[].transport`. It also lists gRPC, HTTP/2, HTTP/3, HTTPUpgrade, KCP, generic UDP, and XHTTP as unimplemented transports; an origin-engine profile generated for Xray does not imply AXR client support and is not measured here. `fallback_tier` is the zero-based candidate attempt index from the local failover health/priority ordering for that run; it is not a promise that every consumer uses the same order (the live tunnel also uses its learned bandit). Network and ISP labels are typed by the operator and are not independently verified or geolocated. A live socket observation from a VPN, test endpoint, proxy, local mock, or another ISP is not an inside-Iran carrier measurement.
+
+## Run one network sample
+
+1. Build the current AXR binary on the test device/host, using the repository's pinned Go toolchain. Keep `axr.json` private; it contains the subscription UUID/token and must not be shared.
+2. Run without a VPN, proxy, or another tunnel. Use one physical network at a time and manually label it; the program deliberately does not infer an ISP from IP/ASN.
+3. Example from `client/`:
+
+   ```sh
+   go run ./cmd/axr validate \
+     -config ./axr.json \
+     -network mobile-data \
+     -isp "operator label" \
+     -destination www.cloudflare.com:443 \
+     -repeats 10 \
+     -timeout 12s \
+     -out ./validation/mobile-operator-run1.json
+   ```
+
+   Use a separate, uniquely named output file for every run. The command also prints the same JSON to stdout. It records UTC timestamps, labels, destination, entry host, dial address, `ws`/`ws-alt`, success, latency, repeat/attempt number, and a coarse failure phase. It intentionally omits the UUID, subscription token, and raw error text.
+4. Review the JSON before sharing it. Entry hostnames and dial addresses may still be sensitive. Do not share `axr.json`, terminal environment variables, account tokens, or credentials.
+
+## Multi-ISP/mobile collection
+
+- Collect at least 10 repeats on each of: MCI/Hamrah-e Aval mobile data, Irancell mobile data, Rightel mobile data, a fixed-line ISP, and any available Wi-Fi network. Use the actual carrier/service name shown by the SIM or contract; do not guess from IP addresses.
+- Repeat each set in a second time window. Record separate JSON files rather than merging labels or overwriting earlier runs. Keep destination, binary version, config entry set, timeout, and repeat count constant where possible.
+- For each run, note (outside the JSON) city/region at coarse granularity, date/time window, access type (LTE/5G/fixed/Wi-Fi), device/OS, and whether the configured entry list changed. Do not include subscriber identity, phone number, exact home address, or user credentials.
+- Do not interpret a failed handshake as proof of DPI, censorship, or an international cut. Failures can result from local radio, DNS, routing, server configuration, or destination outages. A fully simulated scenario is not a real network sample.
+- Summarize success rate, latency distribution, and the fallback-tier distribution per manually supplied network/ISP label only after collecting the actual JSON exports. Retain raw files and report missing/failed runs; do not substitute CI fixtures or estimates.
+
+## Network-state and offline semantics
+
+The Worker-side adaptive classifier uses the configured primary and backup path set as its quorum denominator, accepts at most the newest observation per path, and counts configured paths without a fresh observation as unknown. An observation is fresh only when its timestamp is finite, no older than 10 minutes, and no more than 60 seconds in the future. Missing, stale, malformed, or under-sampled evidence is reported as `unknown`; persisted aggregate status also expires after that freshness window, so an old `healthy` or failure label is not presented as current. Unknown evidence is not treated as healthy or as proof that a route is offline. The decision view labels this `watch` and asks for a bounded fresh probe rather than calling the network stable.
+
+`no_healthy_path` is reserved for a fresh observed set in which no path is scored usable. It describes only the configured paths from the Worker vantage; it does not prove physical upstream disconnection, an international outage, or DPI. A selected path is exposed only when its fresh score is healthy or degraded, never merely because it is the highest-scoring quarantined or unknown candidate. Lack of measurements and measured failures therefore remain distinct states.
+
+## Evidence status for this repository run
+
+No probe was executed from inside Iran, and no real ISP/mobile-network result is reported here. The command's Go build/test coverage is hosted CI validation only; it is not a connectivity measurement. The tests for SNI-block, RST, throttling, partial cut, and full cut remain explicitly synthetic regression tests.

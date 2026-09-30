@@ -16,7 +16,8 @@
     "test": "npm run test:engine && npm run test:integration",
     "test:engine": "node scripts/test.mjs",
     "test:integration": "vitest run",
-    "build:pages": "node scripts/build-pages-worker.mjs"
+    "build:pages": "node scripts/build-pages-worker.mjs",
+    "smoke:staging": "bash scripts/smoke-staging.sh"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260928.1",

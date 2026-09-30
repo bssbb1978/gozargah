@@ -31,7 +31,7 @@ no deep inspection.
 
 | Path | What it is |
 | --- | --- |
-| `cmd/axr` | The binary: SOCKS5 → 16-dim LinUCB-selected VLESS-WS tunnel (ws + ws-alt arms), HMAC manifest verification, fronting merge, session reuse, decision.jsonl audit — **plus the `axr scan` subcommand** (clean-IP scanner, §Scan) |
+| `cmd/axr` | The binary: SOCKS5 → 16-dim LinUCB-selected VLESS-WS tunnel (ws + ws-alt arms), HMAC manifest verification, fronting merge, session reuse, decision.jsonl audit — plus `axr scan` (clean-IP scanner) and `axr validate` (live handshake JSON export) |
 | `internal/cfscan` | **2.16** — CFScanner core: CF API CIDRs (offline snapshot fallback), priority /24s, blocked ranges, deterministic sampling, SNI-anchored TLS×3 (real cert verify), median RTT/loss, `cdn-cgi/trace` colo, top-N, JSON+CSV reports; live probing behind an injectable `Prober` |
 | `internal/bandit` | **Ensemble** (2.17): **LinUCB** contextual bandit + per-arm **Beta-Bernoulli Thompson sampler** with meta-learned arbitration (realized-reward EMAs, tanh weight; seeded draws, deterministic; `model: lin|ts` stamped on the decision). LinUCB: **16-dim context** (2.16: +throughput, loss velocity, TLS error rate, entry churn, flow KL, time-of-day, session age, regime ordinal — 2.17: +netstate `degraded`/`cut` labels), 16×16 ridge A/b per arm, pure-Go Gauss-Jordan; quarantine, prune, JSON persistence (2.15's 7-dim and 2.16's ensemble-less snapshots restore with neutral priors) |
 | `internal/netstate` | **2.17** — route-regime hysteresis (net-e-melli reflex): 12-obs sliding window over (primary/fronting/canary) tunnel outcomes → stable/degraded/cut/recovering with a canary-freshness veto on cut; emits the fronting-first priority policy + aggressive cadence |
@@ -67,7 +67,8 @@ Without the `axr_utls` tag the handshake uses the OS-native Go TLS identity
 ```json
 {
   "uuid": "6b7c6e12-5038-4b4c-a11b-714c9e089d6e",
-  "manifest_url": "https://entry.example.com/sub/<token>/axr-manifest",
+  "manifest_url": "https://entry.example.com/<dynamic-prefix>/<route-key>/axr-manifest",
+  "manifest_dial_ips": [],
   "entries": [
     { "host": "entry.example.com", "priority": 0 },
     { "host": "backup.example.com", "ips": ["104.16.0.1"], "fp": "firefox", "priority": 1 }
@@ -92,7 +93,38 @@ neutral fingerprint, worker-measured backup entries, **clean-IP hints**
 entry). The manifest v3 **`manifest_sig` is verified** (HMAC-SHA256 keyed by
 the token): a tampered feed is rejected and the last-known-good state is
 kept (`~/.axr/manifest-lastgood.json` persists the last verified raw JSON).
-`ws_path` (`"/sub/<token>/<pathbase>?ed=2048"`) is the explicit alternative.
+
+For a hostname URL, `manifest_dial_ips` optionally supplies candidate TCP
+addresses. AXR dials each candidate, then falls back to DNS; TLS SNI,
+certificate verification, and HTTP `Host` remain the hostname in
+`manifest_url`. Existing entry IPs for the same hostname and the signed
+manifest's learned hints are also candidates. This is an AXR-specific dial
+override, not a browser or generic-app URL feature.
+
+A direct-IP manifest URL is also configurable for clients that need it, but
+requires `manifest_host`:
+
+```json
+{
+  "manifest_url": "https://<CLOUDFLARE-IP>/<dynamic-prefix>/<route-key>/axr-manifest",
+  "manifest_host": "<WORKER-HOSTNAME>",
+  "manifest_dial_ips": ["<CLIENT-MEASURED-CLOUDFLARE-IP>"]
+}
+```
+
+AXR sets both TLS SNI and HTTP `Host` to `manifest_host` and still verifies
+the certificate for that hostname. This remains a client-side custom request:
+it is not equivalent to opening the IP URL in an ordinary browser, and a
+Cloudflare edge may still reject or fail to route it. No live Worker hostname
+was available to verify this path in this change; try from the actual client
+network before treating it as usable. Do not put Google, Amazon, OVH, or
+Hetzner server IPs in a Cloudflare edge list: they do not become Worker
+endpoints without a separate proxy/server.
+
+Harvested addresses are best-effort client hints, not globally certified
+“clean” IPs. AXR validates each connection's TLS hostname/certificate; local
+reachability differs by network. `ws_path` (`"/sub/<token>/<pathbase>?ed=2048"`)
+is the explicit alternative.
 
 ```sh
 ./axr -config axr.json -socks 127.0.0.1:1080 -v
@@ -170,6 +202,29 @@ RTT → IP. `~/.axr/clean-ips.json` is always refreshed (merged into the
 ladder at the next `axr` startup; 30-day freshness guard). `-upload` POSTs
 the survivors to the Worker harvest endpoint (token: `harvest_token` →
 manifest URL token; URL: `harvest_url` → derived from the manifest host).
+
+## Network validation subcommand
+
+`axr validate` makes real TCP/TLS/WebSocket/VLESS handshake attempts from
+the host running the binary and writes a per-run JSON report. It requires
+manual `-network` and `-isp` labels; it does not infer carrier identity.
+Example and multi-network collection protocol:
+[`docs/network-validation.md`](../docs/network-validation.md).
+
+```sh
+axr validate -config axr.json -network mobile-data -isp "operator label" \
+  -destination www.cloudflare.com:443 -repeats 10 -out ./validation/run.json
+```
+
+The report's `simulation:false` means the command performed live socket
+operations, not that the network label or country was independently verified.
+The report contains entry hosts and dial addresses; review before sharing.
+The harness JSON declares VLESS over `ws`/`ws-alt` as its only native AXR
+scope (`ws-alt` is a second path/query shape, not a different transport).
+It separately lists unsupported proxy protocols and unimplemented transports;
+these are not probed. Some transport profiles may be emitted for external Xray
+origin engines, but that is separate from AXR client support and is not measured
+here. The report schema test pins these coverage lists and the exact JSON keys.
 
 ## Honest boundaries
 

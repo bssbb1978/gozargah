@@ -4,33 +4,37 @@
  * cookie except /login (throttled) and /status (used to detect auth state).
  */
 
-import { Env, GzError, VERSION } from '../config';
+import { DEFAULTS, Env, GzError, VERSION } from '../config';
 import { EffectiveSettings } from '../settings';
 import {
   addEvent, recentEvents, saveSettings, SettingsBlob, loadSettings, invalidateCache,
-  consumeAiDiagnosticQuota, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState, saveHealthSample, loadLatestPathSamples, loadPredictiveStates, loadCleanIPHarvest, saveCleanIPHarvest, appendCanaryResult,
+  consumeAiDiagnosticQuota, consumeUserControlQuota, loadUserControlAudit, loadPathHealth, savePathHealth, loadProfileHealth, loadAdaptiveModel, loadNetworkState, saveProtocolPolicyState, loadProtocolPolicyState, loadAdaptiveGuardState, loadPolicySignalState, saveHealthSample, loadLatestPathSamples, loadPredictiveStates, loadCleanIPHarvest, saveCleanIPHarvest, appendCanaryResult,
 } from '../db/store';
 import {
-  createUser, deleteUser, GzUser, invalidateUsers, listUsers, updateUser, flushUsage,
+  createUser, deleteUser, findUserBySubscriptionRoute, getAdminUser, getOrCreateSubscriptionRoute, getUserByIdFresh, GzUser, invalidateUsers, listUsersFresh, updateUser, flushUsage,
+  type UserAuditMutation, type UserPatch,
 } from '../db/users';
 import {
   checkLoginGate, clearedCookie, ipHash, isAuthed, makeSessionToken, onLoginResult,
-  requireAuth, sessionCookie, verifyPanelPassword,
+  requireAuth, sessionCookie, verifyPanelPassword, passwordChangeRequired as shouldRequirePasswordChange,
 } from '../auth';
 import { buildLinks, subTokenFor, buildProtocolMatrix, findUserByToken } from '../subscription';
 import { qrSvg } from '../utils/qr';
 import { logRing } from '../utils/log';
+import { requestWorkerHostname } from '../utils/request-host';
 import { pbkdf2Hex, randomHex } from '../utils/crypto';
 import { createDiagnostics } from '../ai/diagnostics';
 import { decideResilience, updateObservation, localResilienceAdvice, PathObservation } from '../ai/resilience';
 import { decideAdaptiveProfile } from '../ai/edge-brain';
 import { buildAdaptiveProtocolPlan } from '../ai/protocol-controller';
+import { normalizeStoredNetworkState } from '../ai/network-state';
 import { assessHealth } from '../ai/predictive-mesh';
 import { defaultEdgeLearner, learnerConfidence } from '../ai/edge-learner';
 import { classifyFailureDomain, classifyNetworkCondition, normalizeFetchFailure } from '../ai/network-intelligence';
 import { buildDecisionView } from '../ai/decision';
 import type { RegimeAssessment } from '../ai/regime';
 import { shapeModeFor } from '../utils/shape';
+import { advisorKillSwitchEnabled, normalizeAdvisorApplication, setAdvisorApplicationControls } from '../ai/advisor-application';
 
 const JSON_CT = 'application/json; charset=utf-8';
 
@@ -39,6 +43,13 @@ function json(data: unknown, status = 200, extraHeaders?: Headers): Response {
   h.set('content-type', JSON_CT);
   h.set('cache-control', 'no-store');
   return new Response(JSON.stringify(data), { status, headers: h });
+}
+
+function validateNewPanelPassword(password: string): void {
+  if (password === DEFAULTS.defaultPassword) {
+    throw new GzError('new password must differ from the bootstrap password', 'validation');
+  }
+  if (password.length < 8) throw new GzError('password too short (min 8)', 'validation');
 }
 
 function publicUser(u: GzUser): Record<string, unknown> {
@@ -51,6 +62,14 @@ function publicUser(u: GzUser): Record<string, unknown> {
   };
 }
 
+async function adminActorId(db: D1Database): Promise<number> {
+  // Panel sessions are signed from the single configured panel-admin password;
+  // resolve its stable D1 user id for an attributable audit entry.
+  const admin = await getAdminUser(db);
+  if (!admin?.isAdmin) throw new GzError('admin account unavailable', 'no_db');
+  return admin.id;
+}
+
 export async function handlePanelApi(
   request: Request,
   env: Env,
@@ -58,6 +77,8 @@ export async function handlePanelApi(
   action: string,
 ): Promise<Response> {
   const method = request.method;
+  const requestUrl = new URL(request.url);
+  const requestHost = requestWorkerHostname(request, requestUrl);
   const db = env.GZ_DB;
 
   try {
@@ -68,7 +89,8 @@ export async function handlePanelApi(
         version: VERSION,
         dbOk: eff.dbOk,
         isDefaultPassword: eff.isDefaultPassword,
-        host: new URL(request.url).hostname,
+        passwordChangeRequired: shouldRequirePasswordChange(env, eff),
+        host: requestHost,
         logs: logRing.slice(-12),
       });
     }
@@ -88,7 +110,10 @@ export async function handlePanelApi(
       }
       if (db) await addEvent(db, 'login_ok', 'panel login');
       const token = await makeSessionToken(eff);
-      return json({ ok: true }, 200, new Headers({ 'set-cookie': sessionCookie(token) }));
+      return json({
+        ok: true,
+        passwordChangeRequired: shouldRequirePasswordChange(env, eff),
+      }, 200, new Headers({ 'set-cookie': sessionCookie(token) }));
     }
 
     /* 2.16 — clean-IP harvest ingest. Public (no session cookie) but
@@ -101,10 +126,10 @@ export async function handlePanelApi(
     if (action === 'network/harvest' && method === 'POST') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
       const body = (await request.json().catch(() => ({}))) as {
-        token?: unknown; ips?: unknown; source?: unknown;
+        token?: unknown; dynamicPrefix?: unknown; ips?: unknown; source?: unknown;
         kind?: unknown; canaryHost?: unknown; canaryOk?: unknown;
       };
-      const host = new URL(request.url).hostname;
+      const host = requestHost;
       const tokenIn = String(body.token ?? request.headers.get('x-harvest-token') ?? '');
       let authorized = false;
       if (tokenIn) {
@@ -112,6 +137,10 @@ export async function handlePanelApi(
           authorized = true;
         } else {
           authorized = (await findUserByToken(db, host, tokenIn)) !== null;
+          const dynamicPrefix = String(body.dynamicPrefix ?? '');
+          if (!authorized && /^p-[0-9a-f]{24}$/.test(dynamicPrefix) && /^[0-9a-f]{64}$/.test(tokenIn)) {
+            authorized = (await findUserBySubscriptionRoute(db, dynamicPrefix, tokenIn)) !== null;
+          }
         }
       }
       if (!authorized) {
@@ -160,6 +189,45 @@ export async function handlePanelApi(
 
     await requireAuth(request, eff);
 
+    const mustChangePassword = shouldRequirePasswordChange(env, eff);
+    if (mustChangePassword && action === 'password' && method === 'POST') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+      if (Object.keys(body).length !== 1 || typeof body.newPassword !== 'string') {
+        throw new GzError('provide only newPassword', 'validation');
+      }
+      validateNewPanelPassword(body.newPassword);
+      const salt = randomHex(16);
+      const hash = await pbkdf2Hex(body.newPassword, salt, eff.pwIterations);
+      await saveSettings(db, (prev) => {
+        if (!prev || prev.passwordHash !== eff.passwordHash || !(prev.forcePasswordChange || eff.isDefaultPassword)) {
+          throw new GzError('initial password change is no longer required', 'conflict');
+        }
+        return {
+          ...prev,
+          passwordSalt: salt,
+          passwordHash: hash,
+          pwIterations: eff.pwIterations,
+          isDefaultPassword: false,
+          forcePasswordChange: false,
+        };
+      });
+      invalidateCache();
+      await addEvent(db, 'password_changed', 'initial panel password changed');
+      // The session signature is derived from the password hash; force a fresh
+      // login with the newly chosen password instead of retaining a stale cookie.
+      return json({ ok: true, passwordChanged: true }, 200, new Headers({ 'set-cookie': clearedCookie() }));
+    }
+    if (mustChangePassword) return json({ error: 'password_change_required' }, 428);
+
+    const userControlRoute = action === 'users' || action.startsWith('users/') || action === 'user-audit';
+    if (userControlRoute && ['GET', 'POST', 'PATCH', 'DELETE'].includes(method)) {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      if (!(await consumeUserControlQuota(db, await ipHash(request)))) {
+        return json({ error: 'admin_rate_limited' }, 429, new Headers({ 'retry-after': '60' }));
+      }
+    }
+
     if (action === 'me' && method === 'GET') {
       return json({ ok: true, version: VERSION, dbOk: eff.dbOk, isDefaultPassword: eff.isDefaultPassword });
     }
@@ -177,6 +245,7 @@ export async function handlePanelApi(
     if (action === 'network/state' && method === 'GET') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
       const [state, paths, settings] = await Promise.all([loadNetworkState(db), loadPathHealth(db), loadSettings(db)]);
+      const currentState = normalizeStoredNetworkState(state);
       const configuredPaths = settings?.proxyIPs ?? eff.proxyIPs;
       const samples = await loadLatestPathSamples(db, configuredPaths);
       const pathById = new Map(paths.map((row) => [row.pathId, row]));
@@ -226,7 +295,7 @@ export async function handlePanelApi(
       } catch { /* optional */ }
       return json({
         ok: true,
-        state,
+        state: currentState,
         condition,
         regime,
         backupEntryHosts: settings?.backupEntryHosts ?? [],
@@ -251,12 +320,12 @@ export async function handlePanelApi(
     }
 
     if (action === 'network/capabilities' && method === 'GET') {
-      const matrix = buildProtocolMatrix(env, new URL(request.url).hostname);
+      const matrix = buildProtocolMatrix(env, requestHost);
       return json({ ok: true, matrix, generatedAt: Date.now() });
     }
 
     if (action === 'network/policy' && method === 'GET') {
-      const matrix = buildProtocolMatrix(env, new URL(request.url).hostname);
+      const matrix = buildProtocolMatrix(env, requestHost);
       return json({ ok: true, policy: matrix.adaptivePolicy, origin: matrix.origin, limitations: {
         worker_native_tcp_inbound: false,
         worker_native_udp_inbound: false,
@@ -268,9 +337,10 @@ export async function handlePanelApi(
 
     if (action === 'network/autoplan' && method === 'GET') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
-      const host = new URL(request.url).hostname;
+      const host = requestHost;
       const matrix = buildProtocolMatrix(env, host);
       const [pathRows, profileRows, state] = await Promise.all([loadPathHealth(db), loadProfileHealth(db), loadNetworkState(db)]);
+      const currentState = normalizeStoredNetworkState(state);
       let learner = defaultEdgeLearner();
       const modelRow = await loadAdaptiveModel(db);
       if (modelRow) { try { learner = JSON.parse(modelRow.stateJson); } catch { /* safe default */ } }
@@ -280,7 +350,7 @@ export async function handlePanelApi(
         drift: (r.drift ?? 'stable') as 'improving'|'stable'|'degrading', forecastSuccess: r.forecastSuccess ?? 0.5,
         confidence: Math.min(1, (r.successes + r.failures) / 12),
       }]));
-      const plan = buildAdaptiveProtocolPlan({ profiles: matrix.adaptivePolicy.profiles, health: profileRows, predictive, networkState: state ? { state: state.state as 'healthy'|'degraded'|'recovery'|'no_healthy_path', quorum: state.quorum, healthy: 0, degraded: 0, quarantined: 0, unknown: 0, total: pathRows.length, failureRate: state.failureRate, confidence: state.confidence, anomalyScore: state.anomalyScore, signalClass: state.signalClass as import('../ai/network-state').NetworkSignalClass, selectedPath: state.selectedPath || null, reasonCodes: state.reasonCodes, generatedAt: state.updatedAt } : null, learner, limit: 10 });
+      const plan = buildAdaptiveProtocolPlan({ profiles: matrix.adaptivePolicy.profiles, health: profileRows, predictive, networkState: currentState ? { state: currentState.state as 'healthy'|'degraded'|'recovery'|'no_healthy_path'|'unknown', quorum: currentState.quorum, healthy: 0, degraded: 0, quarantined: 0, unknown: 0, total: currentState.state === 'unknown' ? 0 : pathRows.length, failureRate: currentState.failureRate, confidence: currentState.confidence, anomalyScore: currentState.anomalyScore, signalClass: currentState.signalClass as import('../ai/network-state').NetworkSignalClass, selectedPath: currentState.selectedPath || null, reasonCodes: currentState.reasonCodes, generatedAt: currentState.updatedAt } : null, learner, limit: 10 });
       await saveProtocolPolicyState(db, { selectedProfile: plan.selected || '', fallbackLadder: plan.fallbackLadder, reasonCodes: plan.reasonCodes, diversity: plan.diversity, confidence: plan.confidence, mode: plan.mode, consensus: plan.consensus, signalAgreement: plan.signalAgreement, switchRisk: plan.switchRisk, fusionMode: plan.fusionMode, policyFingerprint: plan.policyFingerprint, updatedAt: plan.generatedAt });
       return json({ ok: true, plan, persisted: true, origin: matrix.origin, generatedAt: Date.now() });
     }
@@ -387,13 +457,20 @@ export async function handlePanelApi(
 
     if (action === 'settings' && method === 'GET') {
       const s = db ? await loadSettings(db) : null;
+      const advisor = normalizeAdvisorApplication(s?.aiAdvisorApplication);
+      const workerKillSwitch = advisorKillSwitchEnabled(env.AI_ADVISOR_KILL_SWITCH);
       return json({
         panelPath: s?.panelPath ?? eff.panelPath,
         subPath: s?.subPath ?? eff.subPath,
         proxyIPs: s?.proxyIPs ?? eff.proxyIPs,
         backupEntryHosts: s?.backupEntryHosts ?? eff.backupEntryHosts ?? [],
         resetCycle: s?.resetCycle ?? eff.resetCycle ?? 'none',
-        isDefaultPassword: s?.isDefaultPassword ?? eff.isDefaultPassword,
+        isDefaultPassword: eff.isDefaultPassword,
+        aiAdvisorEnabled: advisor.enabled,
+        aiAdvisorKilled: advisor.killed,
+        aiAdvisorKillSwitch: workerKillSwitch,
+        aiAdvisorStatus: workerKillSwitch ? 'killed' : advisor.status,
+        aiAdvisorActiveTransport: workerKillSwitch ? null : advisor.activeTransport,
         dbOk: eff.dbOk,
       });
     }
@@ -406,9 +483,16 @@ export async function handlePanelApi(
         const cur: SettingsBlob = prev ?? {
           schemaVersion: 1, panelPath: eff.panelPath, subPath: eff.subPath,
           proxyIPs: eff.proxyIPs, resetCycle: 'none', passwordSalt: eff.passwordSalt, passwordHash: eff.passwordHash,
-          pwIterations: eff.pwIterations, isDefaultPassword: eff.isDefaultPassword, createdAt: Date.now(),
+          pwIterations: eff.pwIterations, isDefaultPassword: eff.isDefaultPassword, forcePasswordChange: false, createdAt: Date.now(),
         };
         const out: SettingsBlob = { ...cur };
+
+        if (typeof body.aiAdvisorEnabled === 'boolean' || typeof body.aiAdvisorKilled === 'boolean') {
+          out.aiAdvisorApplication = setAdvisorApplicationControls(out.aiAdvisorApplication, {
+            enabled: typeof body.aiAdvisorEnabled === 'boolean' ? body.aiAdvisorEnabled : undefined,
+            killed: typeof body.aiAdvisorKilled === 'boolean' ? body.aiAdvisorKilled : undefined,
+          });
+        }
 
         if (typeof body.panelPath === 'string') {
           const v = body.panelPath.trim().toLowerCase();
@@ -443,7 +527,7 @@ export async function handlePanelApi(
         }
         if (typeof body.newPassword === 'string' && body.newPassword.length > 0) {
           const pw = body.newPassword;
-          if (pw.length < 8) throw new GzError('password too short (min 8)', 'validation');
+          validateNewPanelPassword(pw);
           out.passwordSalt = randomHex(16);
           out.pwIterations = eff.pwIterations;
           // hash computed outside (async) — handled below
@@ -462,22 +546,33 @@ export async function handlePanelApi(
         marker.passwordSalt = salt;
         marker.passwordHash = hash;
         marker.isDefaultPassword = false;
+        marker.forcePasswordChange = false;
         await saveSettings(db, () => marker);
         invalidateUsers();
         invalidateCache();
         await addEvent(db, 'password_changed', 'panel password updated');
       }
       invalidateCache();
+      if (typeof body.aiAdvisorEnabled === 'boolean' || typeof body.aiAdvisorKilled === 'boolean') {
+        const state = normalizeAdvisorApplication(next.aiAdvisorApplication);
+        await addEvent(db, 'ai_advisor_control', JSON.stringify({ enabled: state.enabled, killed: state.killed, status: state.status }));
+      }
       return json({ ok: true });
     }
 
     if (action === 'users' && method === 'GET') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
-      const users = await listUsers(db);
+      const users = await listUsersFresh(db);
       const withTokens = [] as Array<Record<string, unknown>>;
-      const host = new URL(request.url).hostname;
+      const host = requestHost;
       for (const u of users) {
-        withTokens.push({ ...publicUser(u), subToken: await subTokenFor(host, u.uuid) });
+        const route = await getOrCreateSubscriptionRoute(db, u.id);
+        withTokens.push({
+          ...publicUser(u),
+          subToken: await subTokenFor(host, u.uuid), // legacy link compatibility
+          dynamicPrefix: route.dynamicPrefix,
+          routeKey: route.routeKey,
+        });
       }
       return json({ users: withTokens });
     }
@@ -490,11 +585,17 @@ export async function handlePanelApi(
       const quotaGB = Number(body.quotaGB ?? 0);
       if (!Number.isFinite(quotaGB) || quotaGB < 0 || quotaGB > 1024 * 100) throw new GzError('invalid quotaGB', 'validation');
       const expiryAt = Number(body.expiryAt ?? 0);
-      if (!Number.isFinite(expiryAt) || expiryAt < 0) throw new GzError('invalid expiryAt', 'validation');
+      if (!Number.isSafeInteger(expiryAt) || expiryAt < 0) throw new GzError('invalid expiryAt', 'validation');
       const expiryDays = Number(body.expiryDays ?? 0);
-      if (!Number.isFinite(expiryDays) || expiryDays < 0 || expiryDays > 3650) throw new GzError('invalid expiryDays', 'validation');
-      const u = await createUser(db, { name, quotaBytes: Math.round(quotaGB * 1024 ** 3), expiryAt, expiryDays });
-      await addEvent(db, 'user_created', name);
+      if (!Number.isSafeInteger(expiryDays) || expiryDays < 0 || expiryDays > 3650) throw new GzError('invalid expiryDays', 'validation');
+      const quotaBytes = Math.round(quotaGB * 1024 ** 3);
+      const actorUserId = await adminActorId(db);
+      const audit: UserAuditMutation = {
+        actorUserId,
+        action: 'user_created',
+        details: { name, quotaBytes, expiryAt, expiryDays },
+      };
+      const u = await createUser(db, { name, quotaBytes, expiryAt, expiryDays }, audit);
       return json({ user: publicUser(u) }, 201);
     }
 
@@ -503,45 +604,79 @@ export async function handlePanelApi(
       if (!db) throw new GzError('database_not_bound', 'no_db');
       const id = Number(userMatch[1]);
       if (method === 'PATCH') {
+        const before = await getUserByIdFresh(db, id);
+        if (!before || before.isAdmin) throw new GzError('user not found', 'not_found');
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-        const patch: Record<string, unknown> = {};
-        if (typeof body.name === 'string') {
+        const patch: UserPatch = {};
+        const details: Record<string, unknown> = {};
+        if (body.name !== undefined) {
+          if (typeof body.name !== 'string') throw new GzError('invalid name', 'validation');
           const n = body.name.trim().slice(0, 32);
           if (!/^[\w\u0600-\u06FF .-]{1,32}$/.test(n)) throw new GzError('invalid name', 'validation');
           patch.name = n;
+          details.name = n;
         }
         if (body.quotaGB !== undefined) {
           const q = Number(body.quotaGB);
-          if (!Number.isFinite(q) || q < 0) throw new GzError('invalid quotaGB', 'validation');
+          if (!Number.isFinite(q) || q < 0 || q > 1024 * 100) throw new GzError('invalid quotaGB', 'validation');
           patch.quotaBytes = Math.round(q * 1024 ** 3);
+          details.quotaBytes = patch.quotaBytes;
         }
         if (body.expiryAt !== undefined) {
           const x = Number(body.expiryAt);
-          if (!Number.isFinite(x) || x < 0) throw new GzError('invalid expiryAt', 'validation');
+          if (!Number.isSafeInteger(x) || x < 0) throw new GzError('invalid expiryAt', 'validation');
           patch.expiryAt = x;
+          details.expiryAt = x;
         }
         if (body.expiryDays !== undefined) {
           const d = Number(body.expiryDays);
-          if (!Number.isFinite(d) || d < 0 || d > 3650) throw new GzError('invalid expiryDays', 'validation');
+          if (!Number.isSafeInteger(d) || d < 0 || d > 3650) throw new GzError('invalid expiryDays', 'validation');
           patch.expiryDays = d;
-          if (d > 0) patch.expiryAt = 0; // modes are mutually exclusive
+          details.expiryDays = d;
+          if (d > 0) {
+            patch.expiryAt = 0; // first-use and absolute expiry modes are mutually exclusive
+            details.expiryAt = 0;
+          }
         }
-        if (body.enabled !== undefined) patch.enabled = !!body.enabled;
-        if (body.resetUsage === true) { patch.resetUsage = true; patch.usedUp = 0; patch.usedDown = 0; }
+        if (body.enabled !== undefined) {
+          if (typeof body.enabled !== 'boolean') throw new GzError('enabled must be boolean', 'validation');
+          patch.enabled = body.enabled;
+          details.enabled = body.enabled;
+        }
+        if (body.resetUsage === true) {
+          patch.resetUsage = true;
+          patch.usedUp = 0;
+          patch.usedDown = 0;
+          details.resetUsage = true;
+        }
         if (body.rotateCredentials === true) {
-          const u = (await listUsers(db)).find((x) => x.id === id);
-          if (u?.isAdmin) throw new GzError('cannot rotate admin credentials (reset D1 instead)', 'validation');
           patch.uuid = crypto.randomUUID();
           patch.trojanPass = randomHex(12);
+          // Never write credential values to the audit record.
+          details.credentialsRotated = true;
         }
-        await updateUser(db, id, patch);
+        if (Object.keys(patch).length === 0) return json({ ok: true, unchanged: true });
+        const actionName = patch.enabled === true
+          ? 'user_enabled'
+          : patch.enabled === false ? 'user_disabled' : 'user_updated';
+        const audit: UserAuditMutation = {
+          actorUserId: await adminActorId(db),
+          action: actionName,
+          details,
+        };
+        await updateUser(db, id, patch, audit);
         if (patch.usedUp !== undefined || patch.usedDown !== undefined) await flushUsage(db);
-        await addEvent(db, 'user_updated', 'id=' + id);
+        invalidateUsers();
         return json({ ok: true });
       }
       if (method === 'DELETE') {
-        await deleteUser(db, id); // admin rows protected in SQL
-        await addEvent(db, 'user_deleted', 'id=' + id);
+        const target = await getUserByIdFresh(db, id);
+        if (!target || target.isAdmin) throw new GzError('user not found', 'not_found');
+        await deleteUser(db, id, {
+          actorUserId: await adminActorId(db),
+          action: 'user_deleted',
+          details: { deleted: true },
+        });
         return json({ ok: true });
       }
     }
@@ -550,20 +685,21 @@ export async function handlePanelApi(
     if (linksMatch && method === 'GET') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
       const id = Number(linksMatch[1]);
-      const u = (await listUsers(db)).find((x) => x.id === id);
+      const u = await getUserByIdFresh(db, id);
       if (!u) throw new GzError('user not found', 'not_found');
-      const host = new URL(request.url).hostname;
+      const host = requestHost;
       const links = buildLinks(host, u, null);
-      const tok = await subTokenFor(host, u.uuid);
+      const route = await getOrCreateSubscriptionRoute(db, u.id);
+      const base = 'https://' + host + '/' + route.dynamicPrefix + '/' + route.routeKey;
       return json({
         links,
-        subBase: 'https://' + host + '/' + eff.subPath + '/' + tok,
-        subClash: 'https://' + host + '/' + eff.subPath + '/' + tok + '/clash',
-        subSingbox: 'https://' + host + '/' + eff.subPath + '/' + tok + '/singbox',
-        subXray: 'https://' + host + '/' + eff.subPath + '/' + tok + '/xray',
-        subAdaptive: 'https://' + host + '/' + eff.subPath + '/' + tok + '/adaptive',
-        dnsDoh: 'https://' + host + '/' + eff.subPath + '/' + tok + '/dns-query',
-        statusPage: 'https://' + host + '/' + eff.subPath + '/' + tok,
+        subBase: base,
+        subClash: base + '/clash',
+        subSingbox: base + '/singbox',
+        subXray: base + '/xray',
+        subAdaptive: base + '/adaptive',
+        dnsDoh: base + '/dns-query',
+        statusPage: base,
       });
     }
 
@@ -575,6 +711,20 @@ export async function handlePanelApi(
       catch { throw new GzError('invalid qr payload', 'validation'); }
       if (!text || text.length > 512) throw new GzError('invalid qr payload', 'validation');
       return json({ svg: await qrSvg(text, 230) });
+    }
+
+    if (action === 'user-audit' && method === 'GET') {
+      if (!db) throw new GzError('database_not_bound', 'no_db');
+      const query = new URL(request.url).searchParams;
+      const rawLimit = query.get('limit');
+      const rawBefore = query.get('before');
+      const limit = rawLimit === null ? 50 : Number(rawLimit);
+      const before = rawBefore === null ? 0 : Number(rawBefore);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
+          !Number.isSafeInteger(before) || before < 0) {
+        throw new GzError('invalid audit pagination', 'validation');
+      }
+      return json({ events: await loadUserControlAudit(db, limit, before) });
     }
 
     if (action === 'events' && method === 'GET') {
@@ -590,6 +740,7 @@ export async function handlePanelApi(
       const [state, signal, policy, settings, pathRows] = await Promise.all([
         loadNetworkState(db), loadPolicySignalState(db), loadProtocolPolicyState(db), loadSettings(db), loadPathHealth(db),
       ]);
+      const currentState = normalizeStoredNetworkState(state);
       let regime: RegimeAssessment | null = null;
       try {
         const rows = await loadPredictiveStates(db, 'regime');
@@ -598,7 +749,7 @@ export async function handlePanelApi(
       } catch { /* optional */ }
       let signalJson: Record<string, unknown> | null = null;
       try { signalJson = signal ? (JSON.parse(signal.stateJson) as Record<string, unknown>) : null; } catch { signalJson = null; }
-      const host = new URL(request.url).hostname;
+      const host = requestHost;
       const ladder: Array<{ host: string; role: string; status: string; latencyMs: number | null }> = [
         { host, role: 'primary', status: 'primary', latencyMs: null },
       ];
@@ -610,11 +761,11 @@ export async function handlePanelApi(
           latencyMs: row?.latencyMs ?? null,
         });
       }
-      const conditionCode = state?.reasonCodes.find((c) => c.startsWith('condition_'));
+      const conditionCode = currentState?.reasonCodes.find((c) => c.startsWith('condition_'));
       const view = buildDecisionView({
-        networkState: state ? {
-          state: state.state as 'healthy' | 'degraded' | 'recovery' | 'no_healthy_path',
-          confidence: state.confidence, updatedAt: state.updatedAt, reasonCodes: state.reasonCodes,
+        networkState: currentState ? {
+          state: currentState.state as 'healthy' | 'degraded' | 'recovery' | 'no_healthy_path' | 'unknown',
+          confidence: currentState.confidence, updatedAt: currentState.updatedAt, reasonCodes: currentState.reasonCodes,
         } : null,
         conditionState: conditionCode ? conditionCode.slice('condition_'.length).toUpperCase() : null,
         regime,
@@ -640,6 +791,12 @@ export async function handlePanelApi(
     }
     if (e instanceof GzError && e.code === 'validation') {
       return json({ error: e.message }, 400);
+    }
+    if (e instanceof GzError && e.code === 'not_found') {
+      return json({ error: e.message }, 404);
+    }
+    if (e instanceof GzError && e.code === 'conflict') {
+      return json({ error: e.message }, 409);
     }
     if (e instanceof GzError && e.code === 'no_db') {
       return json({ error: 'database_not_bound' }, 503);

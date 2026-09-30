@@ -130,6 +130,24 @@ func TestQuietGateClearsOnSuccess(t *testing.T) {
 	}
 }
 
+func TestClearQuietReleasesEveryAddress(t *testing.T) {
+	e := New(quietEntries(), nil)
+	e.SetQuietPolicy(DefaultQuietPolicy())
+	now := time.Now()
+	for _, ep := range e.Entries() {
+		for i := 0; i < quietMinFails; i++ {
+			e.Observe(ep, ep.Host+":443", false, 0, "timeout", now)
+		}
+	}
+	if q := e.Quiet(); q.Quiet != 2 {
+		t.Fatalf("setup: expected both addresses quiet, got %+v", q)
+	}
+	e.ClearQuiet()
+	if q := e.Quiet(); q.Quiet != 0 {
+		t.Fatalf("fresh external liveness must release all quiet gates, got %+v", q)
+	}
+}
+
 // TestQuietWindowBacksOffAndIsBounded: the window grows with the failure run
 // and is capped by MaxMS — the bound is what guarantees a recovered route is
 // always rediscovered.

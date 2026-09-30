@@ -8,7 +8,7 @@
 import { connect } from 'cloudflare:sockets';
 import { Env } from '../config';
 import { addEvent, loadAdaptiveGuardState, loadAdaptiveModel, loadNetworkState, loadPathHealth, loadProfileHealth, loadSettings, loadRecentHealthSamples, saveAdaptiveGuardState, saveNetworkState, savePathHealth, saveProtocolPolicyState, loadHealthSamples, loadPredictiveStates, saveHealthSample, savePredictiveState, savePolicySignalState } from '../db/store';
-import { classifyNetworkState } from './network-state';
+import { classifyNetworkState, normalizeStoredNetworkState } from './network-state';
 import { classifyNetworkCondition, normalizeSocketFailure, normalizeFetchFailure } from './network-intelligence';
 import { updateObservation } from './resilience';
 import { buildAdaptiveProtocolPlan } from './protocol-controller';
@@ -76,7 +76,7 @@ export async function runScheduledHealth(env: Env): Promise<void> {
   // this tick probes entries with full-path HTTPS (DNS+TCP+TLS+HTTP) so the
   // first route that reopens is detected and selected immediately. Bounded:
   // ≤ 4 entries × (1 TCP + 1 HTTPS) per tick.
-  const previousNetworkState = (await loadNetworkState(env.GZ_DB).catch(() => null));
+  const previousNetworkState = normalizeStoredNetworkState(await loadNetworkState(env.GZ_DB).catch(() => null));
   const previousConditionCode = previousNetworkState?.reasonCodes.find((code) => code.startsWith('condition_'));
   const prevProbeMode: 'normal' | 'aggressive' =
     previousNetworkState?.state === 'recovery' || previousNetworkState?.state === 'no_healthy_path' ||
@@ -173,12 +173,13 @@ export async function runScheduledHealth(env: Env): Promise<void> {
     });
   }
 
+  const configuredStatePaths = [...endpoints, ...backupHosts.map((host) => 'entry:' + host)];
   const state = classifyNetworkState([...byId.values()].map((r) => ({
     id: r.pathId, latencyMs: r.latencyMs, ok: r.ok, checkedAt: r.checkedAt,
     failures: r.failures, successes: r.successes, quarantineUntil: r.quarantineUntil,
     consecutiveFailures: r.consecutiveFailures, consecutiveSuccesses: r.consecutiveSuccesses,
     lastError: r.lastError,
-  })));
+  })), Date.now(), configuredStatePaths);
   const condition = classifyNetworkCondition(endpoints, [...byId.values()].map((row) => ({
     pathId: row.pathId,
     source: 'WORKER_TCP' as const,

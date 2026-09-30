@@ -3,7 +3,7 @@
  */
 
 export const VERSION = '2.17.0';
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 /** D1 binding name (see wrangler.toml) */
 export const DB_BINDING = 'GZ_DB';
@@ -20,6 +20,12 @@ export interface Env {
   AI?: { run: (model: string, input: unknown) => Promise<unknown> };
   /** Explicit prioritized model IDs; if absent, optional live model discovery is used. */
   AI_MODELS?: string;
+  /** Staging override that keeps the initial-password-change gate enabled. */
+  FORCE_INITIAL_PASSWORD_CHANGE?: string;
+  /** Emergency rollback only: allow the built-in initial password in production. */
+  ALLOW_DEFAULT_PASSWORD?: string;
+  /** Emergency Worker-level kill switch for all AI-advice application. */
+  AI_ADVISOR_KILL_SWITCH?: string;
   /** Optional Workers AI Read-scoped token for the fixed Cloudflare model-search API. */
   AI_CATALOG_API_TOKEN?: string;
   /** Cloudflare account ID for model discovery; not a secret. */

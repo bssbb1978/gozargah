@@ -1,0 +1,26 @@
+{
+  "go_legs": [
+    {
+      "id": "ubuntu-24-04",
+      "os": "ubuntu-24.04",
+      "targets": "linux/amd64 linux/arm64 android/arm64",
+      "native": "linux/amd64",
+      "android_ndk": "r26b"
+    },
+    {
+      "id": "macos-15-intel",
+      "os": "macos-15-intel",
+      "targets": "darwin/amd64 darwin/arm64",
+      "native": "darwin/amd64",
+      "android_ndk": ""
+    },
+    {
+      "id": "windows-latest",
+      "os": "windows-latest",
+      "targets": "windows/amd64",
+      "native": "windows/amd64",
+      "android_ndk": ""
+    }
+  ],
+  "worker_id": "worker"
+}

@@ -14,6 +14,7 @@ import { Env, GzError } from '../config';
 import { b64UrlDecode, concatBytes, utf8Decode } from '../utils/crypto';
 import { sha224Hex } from '../utils/sha224';
 import { glog } from '../utils/log';
+import { requestWorkerHostname } from '../utils/request-host';
 import { dialWithFallback } from './proxy';
 import { parseVless, vlessOkResponse } from '../protocols/vless';
 import { parseTrojan } from '../protocols/trojan';
@@ -70,7 +71,7 @@ export function acceptWebSocket(request: Request, env: Env, ctx: ExecutionContex
   }
 
   const requestUrl = new URL(request.url);
-  const host = requestUrl.host;
+  const host = requestWorkerHostname(request, requestUrl);
   const rawProfile = requestUrl.searchParams.get('gz_profile');
   const profileId = rawProfile === 'standard' || rawProfile === 'fragmented' || rawProfile === 'alt-port' || rawProfile === 'fragmented-alt'
     ? rawProfile : 'standard';

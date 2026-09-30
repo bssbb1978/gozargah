@@ -9,6 +9,7 @@
 import { DEFAULTS, ResetCycle, resetCycleMs } from '../config';
 import { ensureSchema, invalidateCache } from './store';
 import { sha224Hex } from '../utils/sha224';
+import { randomHex } from '../utils/crypto';
 
 export interface GzUser {
   id: number;
@@ -54,13 +55,15 @@ export function invalidateUsers(): void {
   listCache = null;
 }
 
+export async function listUsersFresh(db: D1Database): Promise<GzUser[]> {
+  await ensureSchema(db);
+  const res = await db.prepare('SELECT * FROM users ORDER BY is_admin DESC, id ASC').all<UserRow>();
+  return (res.results ?? []).map(toUser);
+}
+
 export function listUsers(db: D1Database): Promise<GzUser[]> {
   if (listCache && Date.now() - listCache.at < DEFAULTS.cacheTtlMs) return listCache.promise;
-  const p = (async () => {
-    await ensureSchema(db);
-    const res = await db.prepare('SELECT * FROM users ORDER BY is_admin DESC, id ASC').all<UserRow>();
-    return (res.results ?? []).map(toUser);
-  })();
+  const p = listUsersFresh(db);
   listCache = { at: Date.now(), promise: p };
   p.catch(() => { listCache = null; });
   return p;
@@ -76,6 +79,123 @@ export async function getUserByIdFresh(db: D1Database, id: number): Promise<GzUs
   await ensureSchema(db);
   const row = await db.prepare('SELECT * FROM users WHERE id = ?1').bind(id).first<UserRow>();
   return row ? toUser(row) : null;
+}
+
+export interface SubscriptionRouteKey {
+  userId: number;
+  dynamicPrefix: string;
+  routeKey: string;
+  createdAt: number;
+}
+
+const ROUTE_AUTH_TTL_MS = 30_000;
+const ROUTE_AUTH_CACHE_MAX = 2048;
+interface RouteAuthCacheEntry { user: GzUser; expiresAt: number; }
+const routeAuthCache = new Map<string, RouteAuthCacheEntry>();
+
+function routeAuthCacheRequest(key: string): Request {
+  return new Request('https://route-cache.gozargah.invalid/' + key, { method: 'GET' });
+}
+
+async function routeAuthCacheKey(dynamicPrefix: string, routeKey: string): Promise<string> {
+  const input = new TextEncoder().encode(dynamicPrefix + ':' + routeKey);
+  const digest = await crypto.subtle.digest('SHA-256', input);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Get or lazily provision a user's random opaque route. The D1 row is the
+ * source of truth; raw route keys are bearer credentials and are never logged.
+ */
+export async function getOrCreateSubscriptionRoute(db: D1Database, userId: number): Promise<SubscriptionRouteKey> {
+  await ensureSchema(db);
+  const existing = await db.prepare(
+    'SELECT user_id,dynamic_prefix,route_key,created_at FROM subscription_route_keys WHERE user_id=?1',
+  ).bind(userId).first<{ user_id: number; dynamic_prefix: string; route_key: string; created_at: number }>();
+  if (existing) return { userId: existing.user_id, dynamicPrefix: existing.dynamic_prefix, routeKey: existing.route_key, createdAt: existing.created_at };
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const candidate = { dynamicPrefix: 'p-' + randomHex(12), routeKey: randomHex(32), createdAt: Date.now() };
+    try {
+      await db.prepare(
+        'INSERT INTO subscription_route_keys(user_id,dynamic_prefix,route_key,created_at) VALUES(?1,?2,?3,?4)',
+      ).bind(userId, candidate.dynamicPrefix, candidate.routeKey, candidate.createdAt).run();
+    } catch {
+      // Concurrent first access or an extraordinarily unlikely collision; re-read below.
+    }
+    const row = await db.prepare(
+      'SELECT user_id,dynamic_prefix,route_key,created_at FROM subscription_route_keys WHERE user_id=?1',
+    ).bind(userId).first<{ user_id: number; dynamic_prefix: string; route_key: string; created_at: number }>();
+    if (row) return { userId: row.user_id, dynamicPrefix: row.dynamic_prefix, routeKey: row.route_key, createdAt: row.created_at };
+  }
+  throw new Error('unable to provision subscription route');
+}
+
+/**
+ * Resolve a per-user route using isolate RAM -> per-data-center Cache API -> D1.
+ * Positive auth results are cached for at most 30 seconds by explicit policy;
+ * a disable, expiry, quota change, or key revocation may take that long to
+ * reach a warm cache. Unknown routes are never cached.
+ */
+export async function findUserBySubscriptionRoute(db: D1Database, dynamicPrefix: string, routeKey: string): Promise<GzUser | null> {
+  if (!/^p-[0-9a-f]{24}$/.test(dynamicPrefix) || !/^[0-9a-f]{64}$/.test(routeKey)) return null;
+  const key = await routeAuthCacheKey(dynamicPrefix, routeKey);
+  const now = Date.now();
+  const local = routeAuthCache.get(key);
+  if (local && local.expiresAt > now) {
+    routeAuthCache.delete(key);
+    routeAuthCache.set(key, local);
+    return local.user;
+  }
+  if (local) routeAuthCache.delete(key);
+
+  const cacheRequest = routeAuthCacheRequest(key);
+  try {
+    if (typeof caches !== 'undefined' && caches.default) {
+      const cached = await caches.default.match(cacheRequest);
+      if (cached) {
+        const body = await cached.json() as { user?: GzUser; expiresAt?: number };
+        if (body.user && Number(body.expiresAt) > now) {
+          rememberRouteUser(key, body.user, Number(body.expiresAt));
+          return body.user;
+        }
+        await caches.default.delete(cacheRequest);
+      }
+    }
+  } catch { /* Cache API is an optimization; D1 remains authoritative on misses. */ }
+
+  await ensureSchema(db);
+  const row = await db.prepare(
+    'SELECT u.* FROM subscription_route_keys r JOIN users u ON u.id=r.user_id ' +
+    'WHERE r.dynamic_prefix=?1 AND r.route_key=?2 LIMIT 1',
+  ).bind(dynamicPrefix, routeKey).first<UserRow>();
+  if (!row) return null;
+  const user = toUser(row);
+  const expiresAt = now + ROUTE_AUTH_TTL_MS;
+  rememberRouteUser(key, user, expiresAt);
+  try {
+    if (typeof caches !== 'undefined' && caches.default) {
+      await caches.default.put(cacheRequest, new Response(JSON.stringify({ user, expiresAt }), {
+        headers: { 'content-type': 'application/json', 'cache-control': 'max-age=30' },
+      }));
+    }
+  } catch { /* Cache API limits/evictions must never break subscription delivery. */ }
+  return user;
+}
+
+function rememberRouteUser(key: string, user: GzUser, expiresAt: number): void {
+  routeAuthCache.delete(key);
+  routeAuthCache.set(key, { user, expiresAt });
+  while (routeAuthCache.size > ROUTE_AUTH_CACHE_MAX) {
+    const oldest = routeAuthCache.keys().next().value;
+    if (oldest === undefined) break;
+    routeAuthCache.delete(oldest);
+  }
+}
+
+/** Test helper: clear only this isolate's RAM cache. */
+export function clearSubscriptionRouteCacheForTests(): void {
+  routeAuthCache.clear();
 }
 
 /** Persist one session's usage delta atomically so live quota checks see it. */
@@ -171,14 +291,34 @@ export async function lazyMaintenance(db: D1Database, u: GzUser, cycle: ResetCyc
 
 /* ------------------------------ CRUD ------------------------------ */
 
+export interface UserAuditMutation {
+  actorUserId: number;
+  action: 'user_created' | 'user_updated' | 'user_enabled' | 'user_disabled' | 'user_deleted';
+  details: Record<string, unknown>;
+  at?: number;
+}
+
+function auditDetailsJson(audit: UserAuditMutation): string {
+  const encoded = JSON.stringify(audit.details);
+  if (encoded.length > 4096) throw new Error('user audit details exceed the size limit');
+  return encoded;
+}
+
+function auditForExistingUser(db: D1Database, id: number, audit: UserAuditMutation): D1PreparedStatement {
+  return db.prepare(
+    'INSERT INTO user_control_audit(actor_user_id,target_user_id,action,details_json,created_at) ' +
+    'SELECT ?1,id,?3,?4,?5 FROM users WHERE id=?2 AND is_admin=0',
+  ).bind(audit.actorUserId, id, audit.action, auditDetailsJson(audit), audit.at ?? Date.now());
+}
+
 export interface NewUser { name: string; quotaBytes: number; expiryAt: number; expiryDays?: number; isAdmin?: boolean; uuid?: string; trojanPass?: string; }
 
-export async function createUser(db: D1Database, data: NewUser): Promise<GzUser> {
+export async function createUser(db: D1Database, data: NewUser, audit?: UserAuditMutation): Promise<GzUser> {
   await ensureSchema(db);
   const now = Date.now();
   const uuid = data.uuid ?? crypto.randomUUID();
   const trojanPass = data.trojanPass ?? randomPass();
-  const res = await db
+  const insert = db
     .prepare(
       'INSERT INTO users (name, uuid, trojan_pass, quota_bytes, expiry_at, expiry_days, enabled, is_admin, created_at) ' +
       'VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)',
@@ -192,10 +332,19 @@ export async function createUser(db: D1Database, data: NewUser): Promise<GzUser>
       Math.max(0, Math.floor(data.expiryDays ?? 0)),
       data.isAdmin ? 1 : 0,
       now,
-    )
-    .run();
+    );
+  const res = audit
+    ? (await db.batch([
+        insert,
+        db.prepare(
+          'INSERT INTO user_control_audit(actor_user_id,target_user_id,action,details_json,created_at) ' +
+          'SELECT ?1,id,?3,?4,?5 FROM users WHERE uuid=?2 AND is_admin=0',
+        ).bind(audit.actorUserId, uuid, audit.action, auditDetailsJson(audit), audit.at ?? now),
+      ]))[0]
+    : await insert.run();
   invalidateUsers();
   const id = res.meta.last_row_id as number;
+  await getOrCreateSubscriptionRoute(db, id);
   return {
     id, name: data.name, uuid, trojanPass,
     quotaBytes: data.quotaBytes, usedUp: 0, usedDown: 0, expiryAt: data.expiryAt,
@@ -210,7 +359,7 @@ export interface UserPatch {
   usedUp?: number; usedDown?: number; uuid?: string; trojanPass?: string; resetUsage?: boolean;
 }
 
-export async function updateUser(db: D1Database, id: number, patch: UserPatch): Promise<void> {
+export async function updateUser(db: D1Database, id: number, patch: UserPatch, audit?: UserAuditMutation): Promise<void> {
   await ensureSchema(db);
   const sets: string[] = [];
   const vals: Array<string | number> = [];
@@ -231,13 +380,21 @@ export async function updateUser(db: D1Database, id: number, patch: UserPatch): 
   if (patch.trojanPass !== undefined) { sets.push('trojan_pass = ?' + (sets.length + 1)); vals.push(patch.trojanPass); }
   if (!sets.length) return;
   vals.push(id);
-  await db.prepare('UPDATE users SET ' + sets.join(', ') + ' WHERE id = ?' + (sets.length + 1)).bind(...vals).run();
+  const update = db.prepare('UPDATE users SET ' + sets.join(', ') + ' WHERE id = ?' + (sets.length + 1) + ' AND is_admin = 0').bind(...vals);
+  if (audit) {
+    const results = await db.batch([auditForExistingUser(db, id, audit), update]);
+    if (results[1].meta.changes === 0) return;
+  } else {
+    await update.run();
+  }
   invalidateUsers();
 }
 
-export async function deleteUser(db: D1Database, id: number): Promise<void> {
+export async function deleteUser(db: D1Database, id: number, audit?: UserAuditMutation): Promise<void> {
   await ensureSchema(db);
-  await db.prepare('DELETE FROM users WHERE id = ?1 AND is_admin = 0').bind(id).run();
+  const deletion = db.prepare('DELETE FROM users WHERE id = ?1 AND is_admin = 0').bind(id);
+  if (audit) await db.batch([auditForExistingUser(db, id, audit), deletion]);
+  else await deletion.run();
   invalidateUsers();
 }
 

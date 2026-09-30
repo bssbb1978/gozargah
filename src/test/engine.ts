@@ -17,7 +17,7 @@ import { qrSvg } from '../utils/qr';
 import type { GzUser } from '../db/users';
 import { decideAdaptiveProfile, nextProfileObservation } from '../ai/edge-brain';
 import { defaultEdgeLearner, observationFeatures, predictSuccess, updateEdgeLearner } from '../ai/edge-learner';
-import { classifyNetworkState } from '../ai/network-state';
+import { classifyNetworkState, normalizeStoredNetworkState } from '../ai/network-state';
 import { buildAdaptiveProtocolPlan } from '../ai/protocol-controller';
 import { defaultAdaptiveGuard, nextAdaptiveGuardState, reconcileAdaptivePlan } from '../ai/adaptive-guard';
 import { bayesianReliability, riskAdjustedReliability } from '../ai/ensemble';
@@ -219,6 +219,31 @@ async function main() {
     assert.ok(!JSON.stringify(templates).includes('shadowsocks'));
   });
 
+  await ok('origin diversity: supported WS, gRPC, HTTPUpgrade, and XHTTP are emitted and ranked', () => {
+    const origin = {
+      ORIGIN_ENGINE_HOST: 'origin.example',
+      // h2 is deliberately included to prove the strict allowlist drops it.
+      ORIGIN_ENGINE_TRANSPORTS: 'ws,grpc,httpupgrade,xhttp,h2',
+    };
+    const bundle = JSON.parse(buildAdaptiveClientBundle(HOST, USER, {}, origin));
+    const templates = bundle.origin.protocol_templates as Record<string, Record<string, unknown>>;
+    for (const key of ['vmess_ws', 'vless_grpc', 'vless_httpupgrade', 'vless_xhttp', 'trojan_xhttp']) {
+      assert.ok(templates[key], 'missing origin transport template ' + key);
+    }
+    assert.ok(!Object.keys(templates).some((key) => key.endsWith('_h2')), 'HTTP/2 must not be emitted');
+
+    const cfg = JSON.parse(buildXrayJson(HOST, USER, {}, origin));
+    const outbounds = cfg.outbounds as Array<Record<string, any>>;
+    const tags = outbounds.map((outbound) => outbound.tag as string);
+    for (const tag of ['origin-vmess-ws', 'origin-vless-grpc', 'origin-vless-httpupgrade', 'origin-vless-xhttp']) {
+      assert.ok(tags.includes(tag), 'missing Xray origin outbound ' + tag);
+    }
+    assert.ok(!outbounds.some((outbound) => outbound.streamSettings?.network === 'h2'), 'Xray h2 network must not be generated');
+    assert.deepEqual(cfg.observatory.subjectSelector, ['gz-', 'origin-']);
+    const selector: string[] = cfg.routing.balancers[0].selector;
+    assert.ok(['origin-vless-grpc', 'origin-vless-httpupgrade', 'origin-vless-xhttp'].every((tag) => selector.includes(tag)));
+  });
+
   /* ---------------- quota semantics ---------------- */
   await ok('first-use expiry: not started -> allowed & no expiry', () => {
     const u = { ...USER, expiryDays: 30, firstUsedAt: 0, expiryAt: 0 };
@@ -299,6 +324,79 @@ async function main() {
     assert.equal(d.state, 'recovery');
     assert.ok(d.reasonCodes.length >= 1);
     assert.equal((d as any).dpiProven, undefined);
+  });
+
+  await ok('network state: missing, stale, malformed, and under-sampled evidence stays unknown', () => {
+    const now = 100_000;
+    const empty = classifyNetworkState([], now);
+    assert.equal(empty.state, 'unknown');
+    assert.equal(empty.selectedPath, null);
+    assert.ok(empty.reasonCodes.includes('no_recent_probe_data'));
+
+    const staleStored = normalizeStoredNetworkState({
+      state: 'healthy', quorum: 1, failureRate: 0, selectedPath: 'old-path', reasonCodes: [],
+      confidence: 0.9, anomalyScore: 0, signalClass: 'normal', updatedAt: now - 600_001,
+    }, now);
+    assert.equal(staleStored?.state, 'unknown');
+    assert.equal(staleStored?.selectedPath, '');
+    assert.equal(staleStored?.confidence, 0);
+    assert.equal(staleStored?.signalClass, 'insufficient_evidence');
+
+    const underSampled = classifyNetworkState([{
+      id: 'single-sample', latencyMs: 80, ok: true, checkedAt: now,
+      failures: 0, successes: 1, quarantineUntil: 0,
+    }], now);
+    assert.equal(underSampled.state, 'unknown');
+    assert.equal(underSampled.selectedPath, null);
+    assert.ok(underSampled.reasonCodes.includes('insufficient_fresh_data'));
+
+    const partialCoverage = classifyNetworkState([
+      { id: 'a', latencyMs: 70, ok: true, checkedAt: now, failures: 0, successes: 2, quarantineUntil: 0 },
+      { id: 'b', latencyMs: 90, ok: true, checkedAt: now, failures: 0, successes: 2, quarantineUntil: 0 },
+    ], now, ['a', 'b', 'c', 'd']);
+    assert.equal(partialCoverage.state, 'unknown');
+    assert.equal(partialCoverage.total, 4);
+    assert.equal(partialCoverage.unknown, 2);
+    assert.ok(partialCoverage.reasonCodes.includes('some_path_evidence_unknown'));
+
+    const failureWithMissingPath = classifyNetworkState([{
+      id: 'a', latencyMs: null, ok: false, checkedAt: now,
+      failures: 5, successes: 0, quarantineUntil: now + 60_000,
+    }], now, ['a', 'b']);
+    assert.equal(failureWithMissingPath.state, 'unknown');
+
+    const staleOnly = classifyNetworkState([{
+      id: 'stale', latencyMs: 20, ok: true, checkedAt: now - 600_001,
+      failures: 0, successes: 10, quarantineUntil: 0,
+    }], now);
+    assert.equal(staleOnly.state, 'unknown');
+    assert.equal(staleOnly.total, 0);
+
+    const futureOnly = classifyNetworkState([{
+      id: 'future', latencyMs: 20, ok: true, checkedAt: now + 60_001,
+      failures: 0, successes: 10, quarantineUntil: 0,
+    }], now);
+    assert.equal(futureOnly.state, 'unknown');
+    assert.equal(futureOnly.total, 0);
+
+    const infiniteTimestamp = classifyNetworkState([{
+      id: 'infinite', latencyMs: 20, ok: true, checkedAt: Number.POSITIVE_INFINITY,
+      failures: 0, successes: 10, quarantineUntil: 0,
+    }], now);
+    assert.equal(infiniteTimestamp.state, 'unknown');
+    assert.equal(infiniteTimestamp.total, 0);
+  });
+
+  await ok('network state: only fresh failed evidence may report no healthy path', () => {
+    const now = 100_000;
+    const d = classifyNetworkState([
+      { id: 'failed', latencyMs: 20, ok: true, checkedAt: now - 1_000, failures: 0, successes: 10, quarantineUntil: 0 },
+      { id: 'failed', latencyMs: null, ok: false, checkedAt: now, failures: 5, successes: 0, quarantineUntil: now + 60_000 },
+    ], now);
+    assert.equal(d.total, 1);
+    assert.equal(d.state, 'no_healthy_path');
+    assert.equal(d.selectedPath, null);
+    assert.ok(d.reasonCodes.includes('no_healthy_configured_path'));
   });
 
   await ok('network signal fusion: reports an observational degradation class', () => {
@@ -423,6 +521,16 @@ async function main() {
     });
     assert.ok(html.includes('dir="ltr"'));
     assert.ok(html.includes('Ready — open your first connection'));
+  });
+
+  await ok('status page: unknown network evidence is not presented as online or offline', async () => {
+    const html = await userPageHtml({
+      host: HOST, user: USER, token: 'tok123', subPath: 'sub', panelPath: 'gozargah',
+      lang: 'en', opts: {}, echOn: false,
+      networkState: { state: 'unknown', updatedAt: Date.now() },
+    });
+    assert.ok(html.includes('There is no fresh path evidence'));
+    assert.ok(html.includes('not confirmed online or offline'));
   });
 
   /* ---------------- QR ---------------- */

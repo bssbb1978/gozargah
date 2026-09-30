@@ -10,7 +10,7 @@
 import { DEFAULTS, Env } from './config';
 import { loadSettings, SettingsBlob, ensureSchema } from './db/store';
 import { getAdminUser } from './db/users';
-import { pbkdf2Hex, sha256Hex, uuidFromSeed } from './utils/crypto';
+import { constTimeEqual, pbkdf2Hex, sha256Hex, uuidFromSeed } from './utils/crypto';
 
 export interface EffectiveSettings extends SettingsBlob {
   dbOk: boolean;
@@ -21,6 +21,29 @@ export interface EffectiveSettings extends SettingsBlob {
 
 /** Cache computed envless password hash per isolate (PBKDF2 is expensive). */
 let envlessPwCache: { salt: string; hash: string } | null = null;
+
+/**
+ * Hash-based legacy-safe detection. The persisted boolean is not authoritative:
+ * old installs may have changed their password before that marker was updated.
+ * Cache by the stored hash tuple so this PBKDF2 comparison is not repeated on
+ * every request; the cache contains hashes only and never logs a password.
+ */
+const defaultPasswordCache = new Map<string, { at: number; matches: boolean }>();
+export async function hashMatchesDefaultPassword(settings: Pick<SettingsBlob, 'passwordSalt' | 'passwordHash' | 'pwIterations'>): Promise<boolean> {
+  const key = settings.passwordSalt + ':' + settings.pwIterations + ':' + settings.passwordHash;
+  const cached = defaultPasswordCache.get(key);
+  if (cached && Date.now() - cached.at < DEFAULTS.cacheTtlMs) return cached.matches;
+  let matches = true; // malformed stored credentials fail closed for the gate
+  try {
+    const expected = await pbkdf2Hex(DEFAULTS.defaultPassword, settings.passwordSalt, settings.pwIterations);
+    matches = constTimeEqual(expected, settings.passwordHash);
+  } catch {
+    matches = true;
+  }
+  if (defaultPasswordCache.size >= 64) defaultPasswordCache.delete(defaultPasswordCache.keys().next().value as string);
+  defaultPasswordCache.set(key, { at: Date.now(), matches });
+  return matches;
+}
 
 export async function getEffectiveSettings(env: Env, host: string): Promise<EffectiveSettings> {
   if (env.GZ_DB) {
@@ -36,7 +59,16 @@ export async function getEffectiveSettings(env: Env, host: string): Promise<Effe
         const admin = await getAdminUser(db);
         const uuid = admin ? admin.uuid : await uuidFromSeed(host + ':admin');
         const trojanPass = admin ? admin.trojanPass : (await sha256Hex(host + ':trojan')).slice(0, 16);
-        return { ...s, dbOk: true, uuid, trojanPass };
+        return {
+          ...s,
+          // Derive from the PBKDF2 hash so legacy installs whose marker is stale
+          // are not locked out after they have already changed the password.
+          isDefaultPassword: await hashMatchesDefaultPassword(s),
+          forcePasswordChange: s.forcePasswordChange === true,
+          dbOk: true,
+          uuid,
+          trojanPass,
+        };
       }
     } catch {
       /* fall through to envless mode */
@@ -67,6 +99,7 @@ export async function envlessSettings(host: string): Promise<EffectiveSettings> 
     passwordHash: hash,
     pwIterations: 2048,
     isDefaultPassword: true,
+    forcePasswordChange: false,
     createdAt: 0,
     dbOk: false,
     uuid,
@@ -98,6 +131,7 @@ export async function bootstrapSettings(env: Env, host: string): Promise<void> {
     passwordHash: hash,
     pwIterations: DEFAULTS.pwIterations,
     isDefaultPassword: true,
+    forcePasswordChange: false,
     createdAt: Date.now(),
   };
   await db

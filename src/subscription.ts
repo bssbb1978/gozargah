@@ -10,12 +10,14 @@
  */
 
 import { toBase64 } from './utils/crypto';
-import { GzUser, listUsers } from './db/users';
-import { loadAdaptiveGuardState, loadAdaptiveModel, loadCanaryState, loadCleanIPHarvest, loadNetworkState, loadPathHealth, loadPolicySignalState, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState } from './db/store';
+import { GzUser, listUsersFresh } from './db/users';
+import { loadAdaptiveGuardState, loadAdaptiveModel, loadCanaryState, loadCleanIPHarvest, loadNetworkState, loadPathHealth, loadPolicySignalState, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState, saveSettings } from './db/store';
 import { decideResilience, type PathObservation } from './ai/resilience';
+import { normalizeStoredNetworkState } from './ai/network-state';
 import { assessPressure, canaryEvidence } from './ai/pressure';
 import { buildAdaptiveProtocolPlan } from './ai/protocol-controller';
 import { nextAdaptiveGuardState, reconcileAdaptivePlan } from './ai/adaptive-guard';
+import { advisorKillSwitchEnabled, defaultAdvisorApplication, normalizeAdvisorApplication, observeAdvisorSuccessRate, setAdvisorApplicationControls } from './ai/advisor-application';
 import { EffectiveSettings } from './settings';
 import { DEFAULT_FP, FragPreset, adaptiveProfiles, fpFor, opBranding, resolveOp, SubOpts, AdaptiveProfile } from './sub/operators';
 import { PATH_ROTATION_WINDOW_MS, rotatedPathBase } from './sub/path-rotation';
@@ -171,6 +173,7 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
         loadCleanIPHarvest(db),
         loadCanaryState(db),
       ]);
+      const currentNetworkState = normalizeStoredNetworkState(ns, now);
       const regimeRow = regimeRows.find((r) => r.subjectId === 'global');
       let regimeState: string | undefined;
       if (regimeRow) {
@@ -178,8 +181,8 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
         out.regime = { state: parsed.state, confidence: parsed.confidence, recent_success: parsed.recentSuccess, baseline_success: parsed.baselineSuccess };
         regimeState = parsed.state;
       }
-      if (ns) {
-        out.network_state = { state: ns.state, updated_at: ns.updatedAt };
+      if (currentNetworkState) {
+        out.network_state = { state: currentNetworkState.state, updated_at: currentNetworkState.updatedAt };
       }
       // 2.17 — pressure engine: fleet canary evidence + harvest freshness +
       // regime label -> 0-3 level -> the dynamic manifest levers (probe
@@ -198,7 +201,7 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
       out.pressure = { level: pressure.level, reasons: pressure.reasons };
       // The network-state machine still overrides the cadence when it has
       // DIRECTLY measured a dead/recovering route (stronger than inference).
-      if (ns?.state === 'recovery' || ns?.state === 'no_healthy_path') {
+      if (currentNetworkState?.state === 'recovery' || currentNetworkState?.state === 'no_healthy_path') {
         (out.reconnect as Record<string, unknown>).probe_interval_ms = Math.min(pressure.probeIntervalMs, 30_000);
         (out.flow_profile as Record<string, unknown>).mode = 'video';
       }
@@ -393,13 +396,16 @@ export async function buildLiveAdaptiveClientBundle(
   let pathRows: Awaited<ReturnType<typeof loadPathHealth>> = [];
   let regime: RegimeAssessment | null = null;
   let backupHosts: string[] = [];
+  let settingsSnapshot: Awaited<ReturnType<typeof loadSettings>> = null;
+  let advisorApplication = defaultAdvisorApplication();
   if (db) {
     try { networkState = await loadNetworkState(db); } catch { /* optional */ }
     try { profileHealth = await loadProfileHealth(db); } catch { /* optional */ }
     try { pathRows = await loadPathHealth(db); } catch { /* optional */ }
     try {
-      const s = await loadSettings(db);
-      backupHosts = (s?.backupEntryHosts ?? []).slice(0, 4);
+      settingsSnapshot = await loadSettings(db);
+      backupHosts = (settingsSnapshot?.backupEntryHosts ?? []).slice(0, 4);
+      advisorApplication = normalizeAdvisorApplication(settingsSnapshot?.aiAdvisorApplication);
     } catch { /* optional */ }
     if (user.id && user.id > 0) {
       try { userState = await loadUserAdaptiveState(db, user.id); } catch { /* optional */ }
@@ -417,6 +423,7 @@ export async function buildLiveAdaptiveClientBundle(
       }
     } catch { /* optional */ }
   }
+  const currentNetworkState = normalizeStoredNetworkState(networkState, now);
   const observations: PathObservation[] = pathRows.map(r => ({
     id: r.pathId, latencyMs: r.latencyMs, ok: r.ok, checkedAt: r.checkedAt,
     failures: r.failures, successes: r.successes, quarantineUntil: r.quarantineUntil,
@@ -424,12 +431,37 @@ export async function buildLiveAdaptiveClientBundle(
     lastError: r.lastError,
   }));
   const resilience = observations.length ? decideResilience(observations, now, learner, userState?.preferredPathId ?? '') : null;
-  const networkDecision = networkState ? {
-    state: networkState.state as 'healthy'|'degraded'|'recovery'|'no_healthy_path',
-    quorum: networkState.quorum, healthy: 0, degraded: 0, quarantined: 0, unknown: 0,
-    total: observations.length, failureRate: networkState.failureRate, confidence: networkState.confidence, anomalyScore: networkState.anomalyScore, signalClass: networkState.signalClass as import('./ai/network-state').NetworkSignalClass,
-    selectedPath: networkState.selectedPath || null, reasonCodes: networkState.reasonCodes, generatedAt: networkState.updatedAt,
+  const networkDecision = currentNetworkState ? {
+    state: currentNetworkState.state as 'healthy'|'degraded'|'recovery'|'no_healthy_path'|'unknown',
+    quorum: currentNetworkState.quorum, healthy: 0, degraded: 0, quarantined: 0, unknown: 0,
+    total: currentNetworkState.state === 'unknown' ? 0 : observations.length,
+    failureRate: currentNetworkState.failureRate, confidence: currentNetworkState.confidence, anomalyScore: currentNetworkState.anomalyScore, signalClass: currentNetworkState.signalClass as import('./ai/network-state').NetworkSignalClass,
+    selectedPath: currentNetworkState.selectedPath || null, reasonCodes: currentNetworkState.reasonCodes, generatedAt: currentNetworkState.updatedAt,
   } : null;
+  const workerAdvisorKill = advisorKillSwitchEnabled(env?.AI_ADVISOR_KILL_SWITCH);
+  if (workerAdvisorKill) {
+    advisorApplication = setAdvisorApplicationControls(advisorApplication, { killed: true }, now);
+    advisorApplication = { ...advisorApplication, reason: 'worker_kill_switch' };
+    if (db && settingsSnapshot && !settingsSnapshot.aiAdvisorApplication?.killed) {
+      try { await saveSettings(db, (prev) => ({ ...(prev ?? settingsSnapshot!), aiAdvisorApplication: advisorApplication })); }
+      catch { /* the Worker-level kill still applies to this response */ }
+    }
+  } else if (db && settingsSnapshot && currentNetworkState && currentNetworkState.state !== 'unknown' && advisorApplication.activeTransport) {
+    const observed = observeAdvisorSuccessRate(advisorApplication, {
+      successRate: Math.max(0, Math.min(1, 1 - currentNetworkState.failureRate)),
+      updatedAt: currentNetworkState.updatedAt,
+    }, now);
+    if (JSON.stringify(observed) !== JSON.stringify(advisorApplication)) {
+      advisorApplication = observed;
+      try {
+        await saveSettings(db, (prev) => ({ ...(prev ?? settingsSnapshot!), aiAdvisorApplication: observed }));
+      } catch { /* rollback state persistence is best-effort; the current response still uses the rolled-back state */ }
+    }
+  }
+  const advisorTransport = !workerAdvisorKill && advisorApplication.enabled && !advisorApplication.killed &&
+    (advisorApplication.status === 'applied' || advisorApplication.status === 'rolled_back')
+    ? advisorApplication.activeTransport
+    : null;
   const predictive = Object.fromEntries(profileHealth.map((row) => [row.profileId, {
     sampleCount: row.successes + row.failures,
     reliability: (row.successes + row.failures) ? row.successes / (row.successes + row.failures) : 0.5,
@@ -437,6 +469,9 @@ export async function buildLiveAdaptiveClientBundle(
     successSlope: 0, latencySlope: 0, drift: (row.drift ?? 'stable') as 'improving'|'stable'|'degrading',
     forecastSuccess: row.forecastSuccess ?? 0.5, confidence: Math.min(1, (row.successes + row.failures) / 12),
   }]));
+  const effectiveAdvisorTransport = advisorTransport && matrix.adaptivePolicy.profiles.some((profile) => profile.ready && profile.transport === advisorTransport)
+    ? advisorTransport
+    : null;
   const controllerPlan = buildAdaptiveProtocolPlan({
     profiles: matrix.adaptivePolicy.profiles,
     health: profileHealth,
@@ -445,6 +480,7 @@ export async function buildLiveAdaptiveClientBundle(
     learner,
     regime: regime ?? undefined,
     preferredProfileId: userState?.preferredProfileId ?? '',
+    preferredTransport: effectiveAdvisorTransport ?? undefined,
     limit: 10,
     now,
   });
@@ -490,7 +526,7 @@ export async function buildLiveAdaptiveClientBundle(
   }
   base.emergency_ladder = {
     schema: 'gozargah-emergency-ladder/v1',
-    network_state: networkDecision?.state ?? (networkState ? networkState.state : 'unknown'),
+    network_state: networkDecision?.state ?? (currentNetworkState ? currentNetworkState.state : 'unknown'),
     entries,
     honest_limit: {
       fa: 'اگر از شبکهٔ شما هیچ مسیری تا این Worker/کلادفلر باقی نمانده باشد، هیچ نرم‌افزاری نمی‌تواند از راه دور مسیر تازه‌ای بسازد؛ این پله فقط وقتی کمک می‌کند که دست‌کم یکی از نقاط ورود هنوز قابل‌رسو باشد.',
@@ -502,13 +538,20 @@ export async function buildLiveAdaptiveClientBundle(
   base.live_policy = {
     ...activePlan,
     guard: guardMeta,
+    advisor_application: {
+      status: advisorApplication.status,
+      active_transport: effectiveAdvisorTransport,
+      applied_scope: 'bounded_adaptive_transport_preference',
+      rollback_source: 'aggregate_worker_egress_success_rate',
+      axr_native_transport_boundary: 'websocket_only',
+    },
     path_selection: resilience ? {
       selected: resilience.selectedPath,
       mode: resilience.mode,
       confidence: resilience.confidence,
       candidates: resilience.candidates.slice(0, 12).map(x => ({ id: x.id, score: x.score, state: x.state, failureRate: x.failureRate, latencyMs: x.latencyMs })),
     } : null,
-    network_state: networkState,
+    network_state: currentNetworkState,
     client_behavior: {
       sticky_preference: userState?.preferredProfileId || null,
       switch_only_on_degrade_or_failure: true,
@@ -580,7 +623,7 @@ export async function subTokenFor(host: string, uuid: string): Promise<string> {
 
 /** Resolve a subscription token to its user (admin included). */
 export async function findUserByToken(db: D1Database, host: string, token: string): Promise<GzUser | null> {
-  const users = await listUsers(db);
+  const users = await listUsersFresh(db);
   for (const u of users) {
     if ((await subTokenFor(host, u.uuid)) === token) return u;
   }
@@ -810,6 +853,7 @@ export function buildXrayJson(
   const suffix = brand ? '-' + brand.key : '';
   const outbounds: Array<Record<string, unknown>> = [];
   const appTags: string[] = [];
+  const originTags: string[] = [];
 
   const addProfileOutbounds = (profile: AdaptiveProfile): void => {
     const stream = {
@@ -879,7 +923,6 @@ export function buildXrayJson(
     const canGenerateOrigin = (protocol: string, transport: ReturnType<typeof parseOriginTransports>[number]): boolean =>
       allowed.has(transport) &&
       originCapabilities.some((capability) => capability.protocol === protocol && capability.transport === transport && capability.generatorAvailable && capability.ready);
-    const originTags: string[] = [];
     const addOrigin = (tag: string, protocol: string, transport: string, streamSettings: Record<string, unknown>, settings: Record<string, unknown>): void => {
       outbounds.push({ tag, protocol, settings, streamSettings });
       originTags.push(tag);
@@ -895,7 +938,7 @@ export function buildXrayJson(
       addOrigin('origin-trojan-xhttp', 'trojan', 'xhttp', stream, { servers: [{ address: originHost, port: originPort, password: user.trojanPass, level: 0 }] });
     }
     if (canGenerateOrigin('vless', 'grpc')) {
-      const stream = { network: 'grpc', security: 'tls', tlsSettings, grpcSettings: { serviceName: grpcService, multiMode: true } };
+      const stream = { network: 'grpc', security: 'tls', tlsSettings: { ...tlsSettings, alpn: ['h2'] }, grpcSettings: { serviceName: grpcService, multiMode: true } };
       addOrigin('origin-vless-grpc', 'vless', 'grpc', stream, { vnext: [{ address: originHost, port: originPort, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] });
     }
     if (canGenerateOrigin('vless', 'httpupgrade')) {
@@ -940,7 +983,9 @@ export function buildXrayJson(
     // 2.13 — smart reconnection: the observatory probes harder (30s) while
     // the engine is in recovery/no_healthy_path, 90s otherwise.
     observatory: {
-      subjectSelector: ['gz-'],
+      // Origin transports join the same measured least-ping fallback, but are
+      // selected only when those explicitly configured outbounds exist.
+      subjectSelector: originTags.length ? ['gz-', 'origin-'] : ['gz-'],
       probeUrl: 'https://connectivitycheck.gstatic.com/generate_204',
       probeInterval: observatoryIntervalSec + 's',
       enableConcurrency: true,
@@ -1009,6 +1054,7 @@ export function subHeaders(
   app: string,
   opts: SubOpts | null | undefined,
   token?: string,
+  routeBase?: string,
 ): Headers {
   const h = new Headers();
   if (app === 'clash') h.set('content-type', 'text/yaml; charset=utf-8');
@@ -1023,7 +1069,7 @@ export function subHeaders(
   h.set('profile-title', 'base64:' + toBase64(title));
   h.set('profile-update-interval', '6');
   // the user's own live status page (v1.2) — falls back to the panel for admins w/o page
-  if (token) h.set('profile-web-page-url', 'https://' + host + '/' + eff.subPath + '/' + token);
+  if (token) h.set('profile-web-page-url', routeBase || ('https://' + host + '/' + eff.subPath + '/' + token));
   else h.set('profile-web-page-url', 'https://' + host + '/' + eff.panelPath);
   if (user.quotaBytes || user.expiryAt) {
     // REAL numbers from byte accounting (0 upload tracked separately in v2)
@@ -1052,7 +1098,7 @@ export async function renderSub(app: string, host: string, user: GzUser, opts: S
         .slice(0, 4);
     } catch { /* best-effort; ladder simply stays primary-only */ }
     try {
-      const ns = await loadNetworkState(env.GZ_DB);
+      const ns = normalizeStoredNetworkState(await loadNetworkState(env.GZ_DB));
       if (ns && (ns.state === 'recovery' || ns.state === 'no_healthy_path')) observatoryIntervalSec = 30;
     } catch { /* best-effort; keep the calm 90s cadence */ }
   }
