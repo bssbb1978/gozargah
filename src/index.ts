@@ -21,6 +21,7 @@ import { buildAxrManifest, buildLiveAdaptiveClientBundle, findUserByToken, rende
 import { resolveOpts } from './sub/operators';
 import { isUserAllowed, lazyMaintenance } from './db/users';
 import { loadNetworkState } from './db/store';
+import { normalizeStoredNetworkState } from './ai/network-state';
 import { handlePanelApi } from './panel/api';
 import { panelHtml } from './panel/ui';
 import { decoyResponse } from './panel/decoy';
@@ -124,10 +125,11 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
       if (app === 'page') {
         // 2.12 — best-effort network state for the honest emergency alert.
-        let netState: { state: string; updatedAt: number } | null = null;
+        // Missing or stale measurements are UNKNOWN, never an implied healthy state.
+        let netState: { state: string; updatedAt: number } = { state: 'unknown', updatedAt: 0 };
         if (env.GZ_DB) {
           try {
-            const ns = await loadNetworkState(env.GZ_DB);
+            const ns = normalizeStoredNetworkState(await loadNetworkState(env.GZ_DB));
             if (ns) netState = { state: ns.state, updatedAt: ns.updatedAt };
           } catch { /* optional */ }
         }

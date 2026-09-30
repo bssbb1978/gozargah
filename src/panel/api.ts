@@ -26,6 +26,7 @@ import { createDiagnostics } from '../ai/diagnostics';
 import { decideResilience, updateObservation, localResilienceAdvice, PathObservation } from '../ai/resilience';
 import { decideAdaptiveProfile } from '../ai/edge-brain';
 import { buildAdaptiveProtocolPlan } from '../ai/protocol-controller';
+import { normalizeStoredNetworkState } from '../ai/network-state';
 import { assessHealth } from '../ai/predictive-mesh';
 import { defaultEdgeLearner, learnerConfidence } from '../ai/edge-learner';
 import { classifyFailureDomain, classifyNetworkCondition, normalizeFetchFailure } from '../ai/network-intelligence';
@@ -237,6 +238,7 @@ export async function handlePanelApi(
     if (action === 'network/state' && method === 'GET') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
       const [state, paths, settings] = await Promise.all([loadNetworkState(db), loadPathHealth(db), loadSettings(db)]);
+      const currentState = normalizeStoredNetworkState(state);
       const configuredPaths = settings?.proxyIPs ?? eff.proxyIPs;
       const samples = await loadLatestPathSamples(db, configuredPaths);
       const pathById = new Map(paths.map((row) => [row.pathId, row]));
@@ -286,7 +288,7 @@ export async function handlePanelApi(
       } catch { /* optional */ }
       return json({
         ok: true,
-        state,
+        state: currentState,
         condition,
         regime,
         backupEntryHosts: settings?.backupEntryHosts ?? [],
@@ -331,6 +333,7 @@ export async function handlePanelApi(
       const host = new URL(request.url).hostname;
       const matrix = buildProtocolMatrix(env, host);
       const [pathRows, profileRows, state] = await Promise.all([loadPathHealth(db), loadProfileHealth(db), loadNetworkState(db)]);
+      const currentState = normalizeStoredNetworkState(state);
       let learner = defaultEdgeLearner();
       const modelRow = await loadAdaptiveModel(db);
       if (modelRow) { try { learner = JSON.parse(modelRow.stateJson); } catch { /* safe default */ } }
@@ -340,7 +343,7 @@ export async function handlePanelApi(
         drift: (r.drift ?? 'stable') as 'improving'|'stable'|'degrading', forecastSuccess: r.forecastSuccess ?? 0.5,
         confidence: Math.min(1, (r.successes + r.failures) / 12),
       }]));
-      const plan = buildAdaptiveProtocolPlan({ profiles: matrix.adaptivePolicy.profiles, health: profileRows, predictive, networkState: state ? { state: state.state as 'healthy'|'degraded'|'recovery'|'no_healthy_path', quorum: state.quorum, healthy: 0, degraded: 0, quarantined: 0, unknown: 0, total: pathRows.length, failureRate: state.failureRate, confidence: state.confidence, anomalyScore: state.anomalyScore, signalClass: state.signalClass as import('../ai/network-state').NetworkSignalClass, selectedPath: state.selectedPath || null, reasonCodes: state.reasonCodes, generatedAt: state.updatedAt } : null, learner, limit: 10 });
+      const plan = buildAdaptiveProtocolPlan({ profiles: matrix.adaptivePolicy.profiles, health: profileRows, predictive, networkState: currentState ? { state: currentState.state as 'healthy'|'degraded'|'recovery'|'no_healthy_path'|'unknown', quorum: currentState.quorum, healthy: 0, degraded: 0, quarantined: 0, unknown: 0, total: currentState.state === 'unknown' ? 0 : pathRows.length, failureRate: currentState.failureRate, confidence: currentState.confidence, anomalyScore: currentState.anomalyScore, signalClass: currentState.signalClass as import('../ai/network-state').NetworkSignalClass, selectedPath: currentState.selectedPath || null, reasonCodes: currentState.reasonCodes, generatedAt: currentState.updatedAt } : null, learner, limit: 10 });
       await saveProtocolPolicyState(db, { selectedProfile: plan.selected || '', fallbackLadder: plan.fallbackLadder, reasonCodes: plan.reasonCodes, diversity: plan.diversity, confidence: plan.confidence, mode: plan.mode, consensus: plan.consensus, signalAgreement: plan.signalAgreement, switchRisk: plan.switchRisk, fusionMode: plan.fusionMode, policyFingerprint: plan.policyFingerprint, updatedAt: plan.generatedAt });
       return json({ ok: true, plan, persisted: true, origin: matrix.origin, generatedAt: Date.now() });
     }
@@ -723,6 +726,7 @@ export async function handlePanelApi(
       const [state, signal, policy, settings, pathRows] = await Promise.all([
         loadNetworkState(db), loadPolicySignalState(db), loadProtocolPolicyState(db), loadSettings(db), loadPathHealth(db),
       ]);
+      const currentState = normalizeStoredNetworkState(state);
       let regime: RegimeAssessment | null = null;
       try {
         const rows = await loadPredictiveStates(db, 'regime');
@@ -743,11 +747,11 @@ export async function handlePanelApi(
           latencyMs: row?.latencyMs ?? null,
         });
       }
-      const conditionCode = state?.reasonCodes.find((c) => c.startsWith('condition_'));
+      const conditionCode = currentState?.reasonCodes.find((c) => c.startsWith('condition_'));
       const view = buildDecisionView({
-        networkState: state ? {
-          state: state.state as 'healthy' | 'degraded' | 'recovery' | 'no_healthy_path',
-          confidence: state.confidence, updatedAt: state.updatedAt, reasonCodes: state.reasonCodes,
+        networkState: currentState ? {
+          state: currentState.state as 'healthy' | 'degraded' | 'recovery' | 'no_healthy_path' | 'unknown',
+          confidence: currentState.confidence, updatedAt: currentState.updatedAt, reasonCodes: currentState.reasonCodes,
         } : null,
         conditionState: conditionCode ? conditionCode.slice('condition_'.length).toUpperCase() : null,
         regime,

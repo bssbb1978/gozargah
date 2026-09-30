@@ -41,6 +41,16 @@ const calmPlan = buildAdaptiveProtocolPlan({ profiles, networkState: calmNet, li
 if (calmPlan.strategy !== 'stable') throw new Error('calm network should be stable, got ' + calmPlan.strategy);
 if (calmPlan.regimeState !== 'stable') throw new Error('default regime label should be stable');
 
+const unknownPlan = buildAdaptiveProtocolPlan({
+  profiles,
+  networkState: { state: 'unknown', quorum: 0, healthy: 0, degraded: 0, quarantined: 0, unknown: 0, total: 0, failureRate: 0.5, confidence: 0, anomalyScore: 0, signalClass: 'insufficient_evidence', selectedPath: null, reasonCodes: ['no_recent_probe_data'], generatedAt: 2_000 },
+  limit: 8,
+  now: 2_000,
+});
+if (unknownPlan.strategy !== 'stable') throw new Error('unknown network evidence must not trigger a safe/degraded profile strategy');
+if (unknownPlan.reasonCodes.includes('network_recovery_bias')) throw new Error('unknown evidence must not be labeled as observed recovery');
+if (!unknownPlan.reasonCodes.includes('network_evidence_unknown')) throw new Error('unknown-evidence reason missing');
+
 const T0 = 1_700_000_000_000;
 const MIN = 60_000;
 const regimeSamples = [

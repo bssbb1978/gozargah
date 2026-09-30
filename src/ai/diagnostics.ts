@@ -7,6 +7,7 @@ import { Env, VERSION } from '../config';
 import { listUsers } from '../db/users';
 import { loadSettings, saveSettings, loadPathHealth, loadProfileHealth, loadAiModelHealth, saveAiModelHealth, loadNetworkState, loadPredictiveStates } from '../db/store';
 import { decideResilience, localResilienceAdvice, PathObservation } from './resilience';
+import { normalizeStoredNetworkState } from './network-state';
 import { parseOriginTransports, protocolCatalog } from '../protocols/catalog';
 import { applyAdvisorTransport, advisorKillSwitchEnabled, defaultAdvisorApplication, normalizeAdvisorApplication, type AdvisorApplicationStatus } from './advisor-application';
 import { parseStrategyRecommendation, StrategyConstraints, StrategyRecommendation } from './strategy-recommendation';
@@ -268,7 +269,7 @@ export async function createDiagnostics(env: Env, language: 'fa' | 'en'): Promis
       if (row) regime = JSON.parse(row.stateJson) as RegimeAssessment;
     } catch { /* optional */ }
   }
-  const networkSnapshot = env.GZ_DB ? await loadNetworkState(env.GZ_DB) : null;
+  const networkSnapshot = normalizeStoredNetworkState(env.GZ_DB ? await loadNetworkState(env.GZ_DB) : null);
   const networkState = networkSnapshot?.state ?? 'unknown';
   const killSwitch = advisorKillSwitchEnabled(env.AI_ADVISOR_KILL_SWITCH);
   let advisorApplication = normalizeAdvisorApplication(settingsSnapshot?.aiAdvisorApplication ?? defaultAdvisorApplication());

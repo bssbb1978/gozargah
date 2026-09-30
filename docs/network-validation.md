@@ -36,6 +36,12 @@ The native Go AXR client probes VLESS over WebSocket only. Its `ws` and `ws-alt`
 - Do not interpret a failed handshake as proof of DPI, censorship, or an international cut. Failures can result from local radio, DNS, routing, server configuration, or destination outages. A fully simulated scenario is not a real network sample.
 - Summarize success rate, latency distribution, and the fallback-tier distribution per manually supplied network/ISP label only after collecting the actual JSON exports. Retain raw files and report missing/failed runs; do not substitute CI fixtures or estimates.
 
+## Network-state and offline semantics
+
+The Worker-side adaptive classifier uses the configured primary and backup path set as its quorum denominator, accepts at most the newest observation per path, and counts configured paths without a fresh observation as unknown. An observation is fresh only when its timestamp is finite, no older than 10 minutes, and no more than 60 seconds in the future. Missing, stale, malformed, or under-sampled evidence is reported as `unknown`; persisted aggregate status also expires after that freshness window, so an old `healthy` or failure label is not presented as current. Unknown evidence is not treated as healthy or as proof that a route is offline. The decision view labels this `watch` and asks for a bounded fresh probe rather than calling the network stable.
+
+`no_healthy_path` is reserved for a fresh observed set in which no path is scored usable. It describes only the configured paths from the Worker vantage; it does not prove physical upstream disconnection, an international outage, or DPI. A selected path is exposed only when its fresh score is healthy or degraded, never merely because it is the highest-scoring quarantined or unknown candidate. Lack of measurements and measured failures therefore remain distinct states.
+
 ## Evidence status for this repository run
 
 No probe was executed from inside Iran, and no real ISP/mobile-network result is reported here. The command's Go build/test coverage is hosted CI validation only; it is not a connectivity measurement. The tests for SNI-block, RST, throttling, partial cut, and full cut remain explicitly synthetic regression tests.

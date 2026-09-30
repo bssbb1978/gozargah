@@ -17,11 +17,12 @@ import { regimeAdvice } from './regime';
 import { localResilienceAdvice } from './resilience';
 import type { ResilienceDecision } from './resilience';
 import type { ShapeMode } from '../utils/shape';
+import { isNetworkStateFresh } from './network-state';
 
 export type DecisionVerdict = 'stable' | 'watch' | 'degraded' | 'critical';
 
 export interface DecisionInput {
-  networkState?: { state: 'healthy' | 'degraded' | 'recovery' | 'no_healthy_path'; confidence: number; updatedAt: number; reasonCodes?: string[] } | null;
+  networkState?: { state: 'healthy' | 'degraded' | 'recovery' | 'no_healthy_path' | 'unknown'; confidence: number; updatedAt: number; reasonCodes?: string[] } | null;
   conditionState?: string | null;
   regime?: RegimeAssessment | null;
   probeMode?: 'normal' | 'aggressive';
@@ -61,7 +62,10 @@ function clamp01(n: number): number {
 }
 
 export function buildDecisionView(input: DecisionInput, now = Date.now()): DecisionView {
-  const net = input.networkState;
+  const suppliedNet = input.networkState ?? null;
+  const networkSnapshotFresh = !suppliedNet || isNetworkStateFresh(suppliedNet.updatedAt, now);
+  const net = suppliedNet && networkSnapshotFresh ? suppliedNet : null;
+  const conditionState = networkSnapshotFresh ? input.conditionState : null;
   const regime = input.regime ?? null;
   const plan = input.plan ?? null;
   const probeMode: 'normal' | 'aggressive' = input.probeMode ?? 'normal';
@@ -71,27 +75,32 @@ export function buildDecisionView(input: DecisionInput, now = Date.now()): Decis
 
   // --- verdict (bounded, evidence-ordered) ---
   let verdict: DecisionVerdict = 'stable';
-  if (net?.state === 'no_healthy_path' || input.conditionState === 'UPSTREAM_UNAVAILABLE') {
+  if (net?.state === 'no_healthy_path' || conditionState === 'UPSTREAM_UNAVAILABLE') {
     verdict = 'critical';
     reasons.push('no_healthy_path_from_worker_vantage');
   } else if (
     net?.state === 'recovery' ||
-    input.conditionState === 'SEVERELY_DEGRADED' ||
+    conditionState === 'SEVERELY_DEGRADED' ||
     regime?.state === 'suspected_change'
   ) {
     verdict = 'degraded';
     if (net?.state === 'recovery') reasons.push('network_recovery_mode');
-    if (input.conditionState === 'SEVERELY_DEGRADED') reasons.push('severely_degraded_condition');
+    if (conditionState === 'SEVERELY_DEGRADED') reasons.push('severely_degraded_condition');
     if (regime?.state === 'suspected_change') reasons.push('suspected_regime_change');
-  } else if (net?.state === 'degraded' || regime?.state === 'watch') {
+  } else if (!net || net.state === 'unknown') {
     verdict = 'watch';
-    if (net?.state === 'degraded') reasons.push('network_degraded');
+    reasons.push('network_evidence_unknown');
+  } else if (net.state === 'degraded' || regime?.state === 'watch') {
+    verdict = 'watch';
+    if (net.state === 'degraded') reasons.push('network_degraded');
     if (regime?.state === 'watch') reasons.push('regime_watch');
   }
   if (!reasons.length) reasons.push('all_signals_stable');
 
   // --- score: 0..100 composite of the bounded signals ---
-  const netScore = net ? (net.state === 'healthy' ? 0.95 : net.state === 'degraded' ? 0.6 : net.state === 'recovery' ? 0.4 : 0.15) : 0.5;
+  const netScore = !net || net.state === 'unknown'
+    ? 0.5
+    : net.state === 'healthy' ? 0.95 : net.state === 'degraded' ? 0.6 : net.state === 'recovery' ? 0.4 : 0.15;
   const regimeScore = regime
     ? (regime.state === 'stable' ? 0.9 : regime.state === 'recovering' ? 0.75 : regime.state === 'watch' ? 0.5 : 0.3)
     : 0.5;
@@ -110,6 +119,10 @@ export function buildDecisionView(input: DecisionInput, now = Date.now()): Decis
   }
   partsFa.push(regimeAdvice(regime, 'fa'));
   partsEn.push(regimeAdvice(regime, 'en'));
+  if (!net || net.state === 'unknown') {
+    partsFa.push('دادهٔ تازه‌ای برای ارزیابی مسیر در دسترس نیست؛ وضعیت اتصال نامشخص است، نه تأییدشده به‌عنوان آنلاین و نه آفلاین. پیش از تغییر سیاست، پروب محدود و تازه اجرا کنید.');
+    partsEn.push('Fresh path evidence is unavailable; connectivity is unknown, not confirmed online or offline. Run a bounded fresh probe before changing policy.');
+  }
   if (probeMode === 'aggressive') {
     partsFa.push('ماشین حالت پروب در حالت تهاجمی است: نقاط ورود جایگزین با پروب HTTPS+TCP فراگیرتر زیر نظرند تا اولین مسیر سالم بلافاصله انتخاب شود.');
     partsEn.push('The probe state machine is in aggressive mode: backup entries are under denser HTTPS+TCP probing so the first healthy route is selected as soon as it appears.');

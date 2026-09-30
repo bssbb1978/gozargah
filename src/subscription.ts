@@ -13,6 +13,7 @@ import { toBase64 } from './utils/crypto';
 import { GzUser, listUsersFresh } from './db/users';
 import { loadAdaptiveGuardState, loadAdaptiveModel, loadCanaryState, loadCleanIPHarvest, loadNetworkState, loadPathHealth, loadPolicySignalState, loadPredictiveStates, loadProfileHealth, loadSettings, loadUserAdaptiveState, saveAdaptiveGuardState, saveProtocolPolicyState, saveSettings } from './db/store';
 import { decideResilience, type PathObservation } from './ai/resilience';
+import { normalizeStoredNetworkState } from './ai/network-state';
 import { assessPressure, canaryEvidence } from './ai/pressure';
 import { buildAdaptiveProtocolPlan } from './ai/protocol-controller';
 import { nextAdaptiveGuardState, reconcileAdaptivePlan } from './ai/adaptive-guard';
@@ -172,6 +173,7 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
         loadCleanIPHarvest(db),
         loadCanaryState(db),
       ]);
+      const currentNetworkState = normalizeStoredNetworkState(ns, now);
       const regimeRow = regimeRows.find((r) => r.subjectId === 'global');
       let regimeState: string | undefined;
       if (regimeRow) {
@@ -179,8 +181,8 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
         out.regime = { state: parsed.state, confidence: parsed.confidence, recent_success: parsed.recentSuccess, baseline_success: parsed.baselineSuccess };
         regimeState = parsed.state;
       }
-      if (ns) {
-        out.network_state = { state: ns.state, updated_at: ns.updatedAt };
+      if (currentNetworkState) {
+        out.network_state = { state: currentNetworkState.state, updated_at: currentNetworkState.updatedAt };
       }
       // 2.17 — pressure engine: fleet canary evidence + harvest freshness +
       // regime label -> 0-3 level -> the dynamic manifest levers (probe
@@ -199,7 +201,7 @@ export async function buildAxrManifest(host: string, user: { uuid: string }, env
       out.pressure = { level: pressure.level, reasons: pressure.reasons };
       // The network-state machine still overrides the cadence when it has
       // DIRECTLY measured a dead/recovering route (stronger than inference).
-      if (ns?.state === 'recovery' || ns?.state === 'no_healthy_path') {
+      if (currentNetworkState?.state === 'recovery' || currentNetworkState?.state === 'no_healthy_path') {
         (out.reconnect as Record<string, unknown>).probe_interval_ms = Math.min(pressure.probeIntervalMs, 30_000);
         (out.flow_profile as Record<string, unknown>).mode = 'video';
       }
@@ -421,6 +423,7 @@ export async function buildLiveAdaptiveClientBundle(
       }
     } catch { /* optional */ }
   }
+  const currentNetworkState = normalizeStoredNetworkState(networkState, now);
   const observations: PathObservation[] = pathRows.map(r => ({
     id: r.pathId, latencyMs: r.latencyMs, ok: r.ok, checkedAt: r.checkedAt,
     failures: r.failures, successes: r.successes, quarantineUntil: r.quarantineUntil,
@@ -428,11 +431,12 @@ export async function buildLiveAdaptiveClientBundle(
     lastError: r.lastError,
   }));
   const resilience = observations.length ? decideResilience(observations, now, learner, userState?.preferredPathId ?? '') : null;
-  const networkDecision = networkState ? {
-    state: networkState.state as 'healthy'|'degraded'|'recovery'|'no_healthy_path',
-    quorum: networkState.quorum, healthy: 0, degraded: 0, quarantined: 0, unknown: 0,
-    total: observations.length, failureRate: networkState.failureRate, confidence: networkState.confidence, anomalyScore: networkState.anomalyScore, signalClass: networkState.signalClass as import('./ai/network-state').NetworkSignalClass,
-    selectedPath: networkState.selectedPath || null, reasonCodes: networkState.reasonCodes, generatedAt: networkState.updatedAt,
+  const networkDecision = currentNetworkState ? {
+    state: currentNetworkState.state as 'healthy'|'degraded'|'recovery'|'no_healthy_path'|'unknown',
+    quorum: currentNetworkState.quorum, healthy: 0, degraded: 0, quarantined: 0, unknown: 0,
+    total: currentNetworkState.state === 'unknown' ? 0 : observations.length,
+    failureRate: currentNetworkState.failureRate, confidence: currentNetworkState.confidence, anomalyScore: currentNetworkState.anomalyScore, signalClass: currentNetworkState.signalClass as import('./ai/network-state').NetworkSignalClass,
+    selectedPath: currentNetworkState.selectedPath || null, reasonCodes: currentNetworkState.reasonCodes, generatedAt: currentNetworkState.updatedAt,
   } : null;
   const workerAdvisorKill = advisorKillSwitchEnabled(env?.AI_ADVISOR_KILL_SWITCH);
   if (workerAdvisorKill) {
@@ -442,10 +446,10 @@ export async function buildLiveAdaptiveClientBundle(
       try { await saveSettings(db, (prev) => ({ ...(prev ?? settingsSnapshot!), aiAdvisorApplication: advisorApplication })); }
       catch { /* the Worker-level kill still applies to this response */ }
     }
-  } else if (db && settingsSnapshot && networkState && advisorApplication.activeTransport) {
+  } else if (db && settingsSnapshot && currentNetworkState && currentNetworkState.state !== 'unknown' && advisorApplication.activeTransport) {
     const observed = observeAdvisorSuccessRate(advisorApplication, {
-      successRate: Math.max(0, Math.min(1, 1 - networkState.failureRate)),
-      updatedAt: networkState.updatedAt,
+      successRate: Math.max(0, Math.min(1, 1 - currentNetworkState.failureRate)),
+      updatedAt: currentNetworkState.updatedAt,
     }, now);
     if (JSON.stringify(observed) !== JSON.stringify(advisorApplication)) {
       advisorApplication = observed;
@@ -522,7 +526,7 @@ export async function buildLiveAdaptiveClientBundle(
   }
   base.emergency_ladder = {
     schema: 'gozargah-emergency-ladder/v1',
-    network_state: networkDecision?.state ?? (networkState ? networkState.state : 'unknown'),
+    network_state: networkDecision?.state ?? (currentNetworkState ? currentNetworkState.state : 'unknown'),
     entries,
     honest_limit: {
       fa: 'اگر از شبکهٔ شما هیچ مسیری تا این Worker/کلادفلر باقی نمانده باشد، هیچ نرم‌افزاری نمی‌تواند از راه دور مسیر تازه‌ای بسازد؛ این پله فقط وقتی کمک می‌کند که دست‌کم یکی از نقاط ورود هنوز قابل‌رسو باشد.',
@@ -547,7 +551,7 @@ export async function buildLiveAdaptiveClientBundle(
       confidence: resilience.confidence,
       candidates: resilience.candidates.slice(0, 12).map(x => ({ id: x.id, score: x.score, state: x.state, failureRate: x.failureRate, latencyMs: x.latencyMs })),
     } : null,
-    network_state: networkState,
+    network_state: currentNetworkState,
     client_behavior: {
       sticky_preference: userState?.preferredProfileId || null,
       switch_only_on_degrade_or_failure: true,
@@ -1093,7 +1097,7 @@ export async function renderSub(app: string, host: string, user: GzUser, opts: S
         .slice(0, 4);
     } catch { /* best-effort; ladder simply stays primary-only */ }
     try {
-      const ns = await loadNetworkState(env.GZ_DB);
+      const ns = normalizeStoredNetworkState(await loadNetworkState(env.GZ_DB));
       if (ns && (ns.state === 'recovery' || ns.state === 'no_healthy_path')) observatoryIntervalSec = 30;
     } catch { /* best-effort; keep the calm 90s cadence */ }
   }

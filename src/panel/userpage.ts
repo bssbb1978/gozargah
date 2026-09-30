@@ -72,6 +72,7 @@ const STR = {
     netAlertTitle: 'وضعیت شبکه از دید Worker',
     netAlertRecovery: 'موتور در حالت بازیابی است؛ بخشی از مسیرهای پیکربندی‌شده ناسالم به نظر می‌رسند. مسیرهای جایگزین را امتحان کنید و اشتراک خود را تازه کنید.',
     netAlertNone: 'هیچ مسیر پیکربندی‌شده سالمی از دید Worker در دسترس نیست؛ این به‌تنهایی ثابت نمی‌کند که اینترنت بین‌الملل قطع است. مسیرهای جایگزین را امتحان کنید و اشتراک را تازه کنید.',
+    netAlertUnknown: 'دادهٔ تازه‌ای برای ارزیابی مسیرها وجود ندارد؛ وضعیت شبکه نامشخص است، نه آنلاین یا آفلاینِ تأییدشده. پس از اجرای پروب بعدی دوباره بررسی کنید.',
     themeDark: 'تم تاریک',
     themeLight: 'تم روشن',
   },
@@ -127,6 +128,7 @@ const STR = {
     netAlertTitle: 'Network state from the Worker vantage',
     netAlertRecovery: 'The engine is in recovery mode; some configured paths look unhealthy. Try the backup entries below and refresh your subscription.',
     netAlertNone: 'No configured path is healthy from the Worker vantage. This alone does not prove an international outage. Try the backup entries and refresh your subscription.',
+    netAlertUnknown: 'There is no fresh path evidence; network status is unknown, not confirmed online or offline. Check again after the next probe.',
     themeDark: 'Dark',
     themeLight: 'Light',
   },
@@ -283,8 +285,8 @@ export async function userPageHtml(p: UserPageParams): Promise<string> {
 
   let netAlertHtml = '';
   const netState = p.networkState?.state;
-  if (netState === 'recovery' || netState === 'no_healthy_path') {
-    const msg = netState === 'no_healthy_path' ? S.netAlertNone : S.netAlertRecovery;
+  if (netState === 'recovery' || netState === 'no_healthy_path' || netState === 'unknown') {
+    const msg = netState === 'unknown' ? S.netAlertUnknown : netState === 'no_healthy_path' ? S.netAlertNone : S.netAlertRecovery;
     netAlertHtml =
       '<div class="card" style="border-color:rgba(245,158,11,.45)">' +
       '<h3>⚠ ' + esc(S.netAlertTitle) + '</h3>' +

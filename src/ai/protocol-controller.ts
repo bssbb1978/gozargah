@@ -228,6 +228,7 @@ export function buildAdaptiveProtocolPlan(args: {
   if (args.preferredProfileId && selectedId === args.preferredProfileId) reasonCodes.push('per_user_preference');
   if (args.preferredTransport && selected?.p.transport === args.preferredTransport) reasonCodes.push('ai_advisor_transport_preference');
   if (ladder.length > 1) reasonCodes.push('diverse_fallback_ladder');
+  if (net?.state === 'unknown' || net?.signalClass === 'insufficient_evidence') reasonCodes.push('network_evidence_unknown');
   if (net?.state === 'recovery' || net?.state === 'no_healthy_path') reasonCodes.push('network_recovery_bias');
   if (ladder.some(x => x.p.mode === 'origin-engine')) reasonCodes.push('origin_engine_available');
   if (ladder.some(x => x.p.udp)) reasonCodes.push('udp_capability_available');
