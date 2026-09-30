@@ -14,4 +14,4 @@ Equal-health clean-IP candidates rotate using a cursor persisted in `routing.jso
 
 ## Validation boundary
 
-The SNI-block, RST, throttling, and partial/full-cut scenarios in `client/cmd/axr/simulated_dpi_test.go` inject synthetic probe outcomes. They are regression simulations only, not measurements from an Iranian ISP or any real filtered network. Actual per-ISP handshake rates and latency still require the separate multi-network validation harness/task.
+The SNI-block, RST, throttling, and partial/full-cut scenarios in `client/cmd/axr/simulated_dpi_test.go` inject synthetic probe outcomes. They are regression simulations only, not measurements from an Iranian ISP or any real filtered network. The `axr validate` live-socket harness and manual multi-ISP protocol are documented in [network-validation.md](network-validation.md); this repository run collected no inside-Iran or ISP measurements.

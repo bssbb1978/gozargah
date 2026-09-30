@@ -148,9 +148,15 @@ type options struct {
 
 func main() {
 	// 2.16 — subcommands (parsed before the default server flagset).
-	if len(os.Args) > 1 && os.Args[1] == "scan" {
-		runScan(os.Args[2:])
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "scan":
+			runScan(os.Args[2:])
+			return
+		case "validate":
+			runValidate(os.Args[2:])
+			return
+		}
 	}
 
 	var opt options
