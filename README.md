@@ -343,6 +343,10 @@ npm run deploy
 
 > 🔄 **به‌روزرسانی خودکار:** در فورک خودتان دو Secret تعریف کنید — `CLOUDFLARE_API_TOKEN` و `CLOUDFLARE_ACCOUNT_ID` — از این به بعد هر push به `main` خودکار دیپلوی می‌شود.
 
+> 📘 **راهنمای دسترسی‌ها:** کدام نقش/مجوز لازم است، کدام نوع توکن، و مسیر گام‌به‌گام staging → [`docs/DEPLOY-RUNBOOK-FA.md`](docs/DEPLOY-RUNBOOK-FA.md) · بررسی ذره‌بینی با شواهد → [`docs/CLOUDFLARE-DEPLOY-ACCESS-FA.md`](docs/CLOUDFLARE-DEPLOY-ACCESS-FA.md)
+>
+> 🔎 **قبل از Deploy:** `npm run preflight:cf` توکن، Workerها، D1ها و تطبیق UUIDهای `wrangler.toml` را فقط‌خواندنی چک می‌کند (مقدار توکن را چاپ نمی‌کند).
+
 ## 🔑 ورود اولیه
 
 | مورد | مقدار پیش‌فرض |

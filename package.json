@@ -17,7 +17,8 @@
     "test:engine": "node scripts/test.mjs",
     "test:integration": "vitest run",
     "build:pages": "node scripts/build-pages-worker.mjs",
-    "smoke:staging": "bash scripts/smoke-staging.sh"
+    "smoke:staging": "bash scripts/smoke-staging.sh",
+    "preflight:cf": "node scripts/cf-preflight.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260928.1",

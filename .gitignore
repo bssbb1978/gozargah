@@ -2,6 +2,10 @@ node_modules/
 .wrangler/
 dist/
 .dev.vars
+# Never commit credentials: local .env files are not part of the repo.
+.env
+.env.*
+!.env.example
 *.log
 .DS_Store
 

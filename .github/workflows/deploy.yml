@@ -1,7 +1,31 @@
 name: Deploy to Cloudflare Workers
 
+# Targets:
+#  - push to main        -> root environment (production Worker `gozargah`)
+#  - manual dispatch     -> choose `staging` (Worker `gozargah-staging`, its own D1)
+#                           or `production` explicitly.
+#
+# Repository secrets (Settings -> Secrets and variables -> Actions):
+#  - CLOUDFLARE_API_TOKEN   Workers Editor for the target Worker; D1:Edit is only
+#                           needed when `apply_migrations` is enabled. Creating a
+#                           Worker that does not exist yet needs product-level
+#                           Workers Admin once.
+#  - CLOUDFLARE_ACCOUNT_ID  Account ID (not a Zone ID and not a D1 database ID).
+# Never commit tokens or put them in wrangler.toml.
+
 on:
   workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment target. staging uses its own isolated D1 database."
+        type: choice
+        options: [staging, production]
+        default: staging
+        required: true
+      apply_migrations:
+        description: "Apply D1 migrations before deploying (needs D1:Edit on the token)."
+        type: boolean
+        default: false
   push:
     branches: [main]
 
@@ -24,6 +48,39 @@ jobs:
             echo "deploy=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # A push to main always keeps targeting the root environment, so the
+      # staging environment can only be selected through an explicit manual
+      # dispatch — a wrong flag can never silently redeploy production D1.
+      # `--env=` (empty) selects the top-level environment explicitly and also
+      # silences wrangler's "no target environment was specified" warning.
+      - name: Resolve target environment
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            environment="${INPUT_ENVIRONMENT:-production}"
+          else
+            environment="production"
+          fi
+          case "$environment" in
+            production)
+              echo "env_flag=--env=" >> "$GITHUB_OUTPUT"
+              echo "database=gozargah" >> "$GITHUB_OUTPUT"
+              ;;
+            staging)
+              echo "env_flag=--env=staging" >> "$GITHUB_OUTPUT"
+              echo "database=gozargah-staging" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error title=Unknown environment::Unsupported deploy environment '$environment' (expected staging or production)."
+              exit 1
+              ;;
+          esac
+          echo "environment=$environment" >> "$GITHUB_OUTPUT"
+          echo "Deploy target resolved to: $environment"
+
       - name: Setup Node 22 for deploy safety checks
         if: steps.check.outputs.deploy == 'true'
         uses: actions/setup-node@v7
@@ -32,7 +89,15 @@ jobs:
 
       - name: Guard target D1 ID before live deploy
         if: steps.check.outputs.deploy == 'true'
-        run: node scripts/guard-deploy-config.mjs
+        run: node scripts/guard-deploy-config.mjs ${{ steps.target.outputs.env_flag }}
+
+      - name: Apply D1 migrations
+        if: steps.check.outputs.deploy == 'true' && inputs.apply_migrations == true
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 migrations apply ${{ steps.target.outputs.database }} ${{ steps.target.outputs.env_flag }} --remote
 
       - name: Deploy
         if: steps.check.outputs.deploy == 'true'
@@ -40,4 +105,4 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
+          command: deploy ${{ steps.target.outputs.env_flag }}
