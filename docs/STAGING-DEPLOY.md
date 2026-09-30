@@ -30,6 +30,15 @@ A staging environment is declared in `wrangler.toml` as `env.staging`, with its 
 
    The script reads the expected version from `package.json`, checks `/healthz` for `ok: true` and that version, then checks `/gozargah/api/status` for `dbOk: true` and the same version. Set `STAGING_PANEL_PATH` if the panel path differs. Both endpoints are public read-only status endpoints; the script does not submit credentials.
 
+## Deploying staging from GitHub Actions
+
+`.github/workflows/deploy.yml` resolves its target explicitly instead of relying on wrangler's default:
+
+- a push to `main` targets the root environment (production Worker `gozargah`) with `wrangler deploy --env=`;
+- a manual `workflow_dispatch` selects `staging` (Worker `gozargah-staging`) or `production`; the guard runs with the same flag (`node scripts/guard-deploy-config.mjs --env=staging`, or `--env=` for the root environment), so each environment can only deploy after its own D1 ID is configured;
+- the optional `apply_migrations` input (default `false`) runs `wrangler d1 migrations apply <database> --env=<env> --remote` before the deploy and therefore needs `D1:Edit` on the CI token — leave it off while the token is Editor-only;
+- the first staging deploy still needs a credential that may create the `gozargah-staging` Worker (product-level Workers `Admin`), unless that Worker already exists.
+
 ## Current execution status
 
 No staging deployment or live smoke test has been executed in this workspace. Cloudflare credentials were unavailable, and the staging D1 ID remains a placeholder. CI's mock-response smoke-script tests are simulations of response validation, not a deployment or network measurement.
