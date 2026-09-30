@@ -23,7 +23,7 @@ compatibility_date = "2025-01-15"
 [[d1_databases]]
 binding = "GZ_DB"
 database_name = "gozargah"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "e30094a9-9fac-4335-bc3b-4a146a94ba5a"
 
 
 [observability]
