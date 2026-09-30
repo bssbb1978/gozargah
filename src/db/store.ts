@@ -28,6 +28,8 @@ export interface SettingsBlob {
   passwordHash: string;
   pwIterations: number;
   isDefaultPassword: boolean;
+  /** Emergency/operator recovery marker; cleared after a successful password update. */
+  forcePasswordChange?: boolean;
   createdAt: number;
 }
 
@@ -281,6 +283,7 @@ export async function loadSettings(db: D1Database): Promise<SettingsBlob | null>
   // forward-fill fields introduced after v1.1 (schema v2)
   if (!value.resetCycle) value.resetCycle = 'none';
   if (!Array.isArray(value.backupEntryHosts)) value.backupEntryHosts = [];
+  if (typeof value.forcePasswordChange !== 'boolean') value.forcePasswordChange = false;
   putCache(SETTINGS_KEY + '#rev', row.rev);
   putCache(SETTINGS_KEY, value);
   return value;

@@ -76,6 +76,20 @@ export async function ipHash(request: Request): Promise<string> {
   return sha256Hex('gzip:' + ip);
 }
 
+/**
+ * Production defaults to requiring a change when the stored PBKDF2 hash still
+ * matches the bootstrap password. Staging retains its explicit force flag.
+ * ALLOW_DEFAULT_PASSWORD is an emergency rollback only and never overrides an
+ * explicit recovery marker or the staging force flag.
+ */
+export function passwordChangeRequired(env: Env, eff: EffectiveSettings): boolean {
+  if (eff.forcePasswordChange) return true;
+  if (!eff.isDefaultPassword) return false;
+  if (env.FORCE_INITIAL_PASSWORD_CHANGE === 'true') return true;
+  if (!eff.dbOk) return false;
+  return env.ALLOW_DEFAULT_PASSWORD !== 'true';
+}
+
 export interface LoginGateResult { allowed: boolean; attemptsLeft: number; }
 
 export async function checkLoginGate(env: Env, request: Request): Promise<LoginGateResult> {

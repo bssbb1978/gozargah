@@ -20,7 +20,7 @@ A staging environment is declared in `wrangler.toml` as `env.staging`, with its 
    npx wrangler deploy --env staging
    ```
 
-   The first-login flow enforces a password change while the initial default password remains active: after login, the server blocks all other authenticated panel APIs until a new password of at least eight characters is set. The update endpoint clears the initial session, requiring a fresh login. This is a staging-only Worker variable; production behavior is unchanged.
+   The first-login flow enforces a password change while the initial default password remains active: after login, the server blocks all other authenticated panel APIs until a new password of at least eight characters is set. The update endpoint clears the initial session, requiring a fresh login. Production now enforces this automatically when D1's stored PBKDF2 hash matches the bootstrap password; the staging variable remains an explicit force-on override.
 4. Change the initial panel password immediately. The bootstrap default is currently `admin`; use the staging panel at `/gozargah`, sign in once, and complete the mandatory change prompt. Do not reuse a production password.
 5. Run the health and database smoke checks against the deployed staging URL (not a local preview):
 

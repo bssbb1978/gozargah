@@ -2,10 +2,11 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
 import type { D1Database } from '@cloudflare/workers-types';
-import { SCHEMA_VERSION, VERSION } from '../config';
+import { DEFAULTS, SCHEMA_VERSION, VERSION } from '../config';
 import { createUser, getUserByIdFresh, isUserAllowed, recordUsageDelta, updateUser } from '../db/users';
 import { consumeAiDiagnosticQuota, consumeDnsQueryQuota, loadHealthSamples, loadLatestPathSamples, loadNetworkState, loadSettings, saveHealthSample, saveNetworkState, saveSettings } from '../db/store';
 import { buildLiveAdaptiveClientBundle, subTokenFor } from '../subscription';
+import { pbkdf2Hex } from '../utils/crypto';
 import { defaultAdvisorApplication, setAdvisorApplicationControls } from '../ai/advisor-application';
 import { createDiagnostics, getAiModelCandidates, rankCatalogModels } from '../ai/diagnostics';
 
@@ -38,6 +39,9 @@ beforeAll(async () => {
         bindings: {
           TELEGRAM_BOT_TOKEN: '123456:test-token', TELEGRAM_WEBHOOK_SECRET: SECRET,
           TELEGRAM_ADMIN_IDS: '42',
+          // The shared suite uses the bootstrap password for unrelated panel tests.
+          // Production enforcement is exercised in isolated Workers below.
+          ALLOW_DEFAULT_PASSWORD: 'true',
           DNS_UPSTREAMS: 'https://doh.test/dns-query',
           DNS64_ENABLED: 'true',
           CLEAN_EDGE_IPS: '203.0.113.10, 203.0.113.11, 999.1.1.1',
@@ -86,6 +90,11 @@ describe('Cloudflare Worker + D1 integration', () => {
     expect(await response.json()).toMatchObject({ ok: true, version: VERSION });
   });
 
+  it('disables the production gate only when the emergency rollback binding is explicit', async () => {
+    const response = await mf.dispatchFetch('https://gozargah.test/gozargah/api/status');
+    expect(await response.json()).toMatchObject({ dbOk: true, isDefaultPassword: true, passwordChangeRequired: false });
+  });
+
   it('forces a staging first-login password change and blocks panel APIs until completion', async () => {
     const forceWorker = new Miniflare({
       workers: [{
@@ -95,7 +104,7 @@ describe('Cloudflare Worker + D1 integration', () => {
         compatibilityDate: '2025-01-15',
         compatibilityFlags: ['nodejs_compat'],
         d1Databases: ['GZ_DB'],
-        bindings: { FORCE_INITIAL_PASSWORD_CHANGE: 'true' },
+        bindings: { FORCE_INITIAL_PASSWORD_CHANGE: 'true', ALLOW_DEFAULT_PASSWORD: 'true' },
       }],
     });
     try {
@@ -138,6 +147,129 @@ describe('Cloudflare Worker + D1 integration', () => {
       expect(await newPassword.json()).toMatchObject({ ok: true, passwordChangeRequired: false });
     } finally {
       await forceWorker.dispose();
+    }
+  });
+
+  it('enforces the production default-password change, invalidates sessions, and rate limits brute force', async () => {
+    const productionWorker = new Miniflare({
+      workers: [{
+        name: 'gozargah-production-password-test',
+        script: workerScript,
+        modules: true,
+        compatibilityDate: '2025-01-15',
+        compatibilityFlags: ['nodejs_compat'],
+        d1Databases: ['GZ_DB'],
+      }],
+    });
+    try {
+      const base = 'https://production-password.test/gozargah/api';
+      const productionDb = await productionWorker.getD1Database('GZ_DB', 'gozargah-production-password-test');
+      const status = await productionWorker.dispatchFetch(base + '/status');
+      expect(await status.json()).toMatchObject({ dbOk: true, isDefaultPassword: true, passwordChangeRequired: true });
+
+      const login = await productionWorker.dispatchFetch(base + '/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: DEFAULTS.defaultPassword }),
+      });
+      expect(login.status).toBe(200);
+      expect(await login.json()).toMatchObject({ ok: true, passwordChangeRequired: true });
+      const oldCookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
+
+      const blocked = await productionWorker.dispatchFetch(base + '/users', { headers: { cookie: oldCookie } });
+      expect(blocked.status).toBe(428);
+      expect(await blocked.json()).toMatchObject({ error: 'password_change_required' });
+
+      const changed = await productionWorker.dispatchFetch(base + '/password', {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie: oldCookie },
+        body: JSON.stringify({ newPassword: 'production-test-password' }),
+      });
+      expect(changed.status).toBe(200);
+      expect(changed.headers.get('set-cookie')).toContain('Max-Age=0');
+      expect(await changed.json()).toMatchObject({ ok: true, passwordChanged: true });
+
+      const oldSession = await productionWorker.dispatchFetch(base + '/me', { headers: { cookie: oldCookie } });
+      expect(oldSession.status).toBe(401);
+      expect(await (await productionWorker.dispatchFetch(base + '/status')).json()).toMatchObject({
+        isDefaultPassword: false, passwordChangeRequired: false,
+      });
+      const newLogin = await productionWorker.dispatchFetch(base + '/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'production-test-password' }),
+      });
+      expect(newLogin.status).toBe(200);
+      expect(await newLogin.json()).toMatchObject({ ok: true, passwordChangeRequired: false });
+      const newCookie = (newLogin.headers.get('set-cookie') ?? '').split(';')[0];
+      expect((await productionWorker.dispatchFetch(base + '/me', { headers: { cookie: newCookie } })).status).toBe(200);
+
+      const ip = '203.0.113.77';
+      for (let attempt = 0; attempt < DEFAULTS.loginMaxAttempts; attempt++) {
+        const failed = await productionWorker.dispatchFetch(base + '/login', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'cf-connecting-ip': ip },
+          body: JSON.stringify({ password: 'definitely-wrong' }),
+        });
+        expect(failed.status).toBe(401);
+      }
+      const limited = await productionWorker.dispatchFetch(base + '/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'cf-connecting-ip': ip },
+        body: JSON.stringify({ password: 'definitely-wrong' }),
+      });
+      expect(limited.status).toBe(429);
+      expect(await limited.json()).toMatchObject({ error: 'too_many_attempts' });
+
+      const eventRows = await productionDb.prepare('SELECT detail FROM events').all<{ detail: string }>();
+      expect(JSON.stringify(eventRows.results ?? [])).not.toContain(DEFAULTS.defaultPassword);
+    } finally {
+      await productionWorker.dispose();
+    }
+  });
+
+  it('uses the stored PBKDF2 hash, not a stale boolean, for existing changed-password installs', async () => {
+    const changedWorker = new Miniflare({
+      workers: [{
+        name: 'gozargah-existing-password-test',
+        script: workerScript,
+        modules: true,
+        compatibilityDate: '2025-01-15',
+        compatibilityFlags: ['nodejs_compat'],
+        d1Databases: ['GZ_DB'],
+      }],
+    });
+    try {
+      const changedDb = await changedWorker.getD1Database('GZ_DB', 'gozargah-existing-password-test');
+      const salt = '0123456789abcdef0123456789abcdef';
+      const password = 'already-changed-install-password';
+      const hash = await pbkdf2Hex(password, salt, DEFAULTS.pwIterations);
+      const legacySettings = {
+        schemaVersion: SCHEMA_VERSION,
+        panelPath: 'gozargah',
+        subPath: 'sub',
+        proxyIPs: [...DEFAULTS.proxyIPs],
+        resetCycle: 'none',
+        passwordSalt: salt,
+        passwordHash: hash,
+        pwIterations: DEFAULTS.pwIterations,
+        isDefaultPassword: true, // deliberately stale legacy marker
+        forcePasswordChange: false,
+        createdAt: Date.now(),
+      };
+      // Seed this isolated D1 before the Worker bundle initializes its schema;
+      // module-level schema memoization in the test process is per isolate.
+      await changedDb.prepare('CREATE TABLE kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL, rev INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)').run();
+      await changedDb.prepare('INSERT INTO kv_store (key, value, rev, updated_at) VALUES (?1, ?2, 1, ?3)')
+        .bind('settings', JSON.stringify(legacySettings), Date.now()).run();
+
+      const base = 'https://existing-password.test/gozargah/api';
+      const status = await changedWorker.dispatchFetch(base + '/status');
+      expect(await status.json()).toMatchObject({ dbOk: true, isDefaultPassword: false, passwordChangeRequired: false });
+      const login = await changedWorker.dispatchFetch(base + '/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password }),
+      });
+      expect(login.status).toBe(200);
+      expect(await login.json()).toMatchObject({ ok: true, passwordChangeRequired: false });
+      const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
+      expect((await changedWorker.dispatchFetch(base + '/me', { headers: { cookie } })).status).toBe(200);
+    } finally {
+      await changedWorker.dispose();
     }
   });
 

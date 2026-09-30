@@ -16,7 +16,7 @@ import {
 } from '../db/users';
 import {
   checkLoginGate, clearedCookie, ipHash, isAuthed, makeSessionToken, onLoginResult,
-  requireAuth, sessionCookie, verifyPanelPassword,
+  requireAuth, sessionCookie, verifyPanelPassword, passwordChangeRequired as shouldRequirePasswordChange,
 } from '../auth';
 import { buildLinks, subTokenFor, buildProtocolMatrix, findUserByToken } from '../subscription';
 import { qrSvg } from '../utils/qr';
@@ -78,7 +78,7 @@ export async function handlePanelApi(
         version: VERSION,
         dbOk: eff.dbOk,
         isDefaultPassword: eff.isDefaultPassword,
-        passwordChangeRequired: env.FORCE_INITIAL_PASSWORD_CHANGE === 'true' && eff.isDefaultPassword,
+        passwordChangeRequired: shouldRequirePasswordChange(env, eff),
         host: new URL(request.url).hostname,
         logs: logRing.slice(-12),
       });
@@ -101,7 +101,7 @@ export async function handlePanelApi(
       const token = await makeSessionToken(eff);
       return json({
         ok: true,
-        passwordChangeRequired: env.FORCE_INITIAL_PASSWORD_CHANGE === 'true' && eff.isDefaultPassword,
+        passwordChangeRequired: shouldRequirePasswordChange(env, eff),
       }, 200, new Headers({ 'set-cookie': sessionCookie(token) }));
     }
 
@@ -174,8 +174,8 @@ export async function handlePanelApi(
 
     await requireAuth(request, eff);
 
-    const passwordChangeRequired = env.FORCE_INITIAL_PASSWORD_CHANGE === 'true' && eff.isDefaultPassword;
-    if (passwordChangeRequired && action === 'password' && method === 'POST') {
+    const mustChangePassword = shouldRequirePasswordChange(env, eff);
+    if (mustChangePassword && action === 'password' && method === 'POST') {
       if (!db) throw new GzError('database_not_bound', 'no_db');
       const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
       if (Object.keys(body).length !== 1 || typeof body.newPassword !== 'string') {
@@ -185,7 +185,7 @@ export async function handlePanelApi(
       const salt = randomHex(16);
       const hash = await pbkdf2Hex(body.newPassword, salt, eff.pwIterations);
       await saveSettings(db, (prev) => {
-        if (!prev || !prev.isDefaultPassword) {
+        if (!prev || prev.passwordHash !== eff.passwordHash || !(prev.forcePasswordChange || eff.isDefaultPassword)) {
           throw new GzError('initial password change is no longer required', 'conflict');
         }
         return {
@@ -194,15 +194,16 @@ export async function handlePanelApi(
           passwordHash: hash,
           pwIterations: eff.pwIterations,
           isDefaultPassword: false,
+          forcePasswordChange: false,
         };
       });
       invalidateCache();
-      await addEvent(db, 'password_changed', 'staging initial panel password changed');
+      await addEvent(db, 'password_changed', 'initial panel password changed');
       // The session signature is derived from the password hash; force a fresh
       // login with the newly chosen password instead of retaining a stale cookie.
       return json({ ok: true, passwordChanged: true }, 200, new Headers({ 'set-cookie': clearedCookie() }));
     }
-    if (passwordChangeRequired) return json({ error: 'password_change_required' }, 428);
+    if (mustChangePassword) return json({ error: 'password_change_required' }, 428);
 
     const userControlRoute = action === 'users' || action.startsWith('users/') || action === 'user-audit';
     if (userControlRoute && ['GET', 'POST', 'PATCH', 'DELETE'].includes(method)) {
@@ -447,7 +448,7 @@ export async function handlePanelApi(
         proxyIPs: s?.proxyIPs ?? eff.proxyIPs,
         backupEntryHosts: s?.backupEntryHosts ?? eff.backupEntryHosts ?? [],
         resetCycle: s?.resetCycle ?? eff.resetCycle ?? 'none',
-        isDefaultPassword: s?.isDefaultPassword ?? eff.isDefaultPassword,
+        isDefaultPassword: eff.isDefaultPassword,
         aiAdvisorEnabled: advisor.enabled,
         aiAdvisorKilled: advisor.killed,
         aiAdvisorKillSwitch: workerKillSwitch,
@@ -465,7 +466,7 @@ export async function handlePanelApi(
         const cur: SettingsBlob = prev ?? {
           schemaVersion: 1, panelPath: eff.panelPath, subPath: eff.subPath,
           proxyIPs: eff.proxyIPs, resetCycle: 'none', passwordSalt: eff.passwordSalt, passwordHash: eff.passwordHash,
-          pwIterations: eff.pwIterations, isDefaultPassword: eff.isDefaultPassword, createdAt: Date.now(),
+          pwIterations: eff.pwIterations, isDefaultPassword: eff.isDefaultPassword, forcePasswordChange: false, createdAt: Date.now(),
         };
         const out: SettingsBlob = { ...cur };
 
@@ -528,6 +529,7 @@ export async function handlePanelApi(
         marker.passwordSalt = salt;
         marker.passwordHash = hash;
         marker.isDefaultPassword = false;
+        marker.forcePasswordChange = false;
         await saveSettings(db, () => marker);
         invalidateUsers();
         invalidateCache();
