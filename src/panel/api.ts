@@ -4,7 +4,7 @@
  * cookie except /login (throttled) and /status (used to detect auth state).
  */
 
-import { Env, GzError, VERSION } from '../config';
+import { DEFAULTS, Env, GzError, VERSION } from '../config';
 import { EffectiveSettings } from '../settings';
 import {
   addEvent, recentEvents, saveSettings, SettingsBlob, loadSettings, invalidateCache,
@@ -41,6 +41,13 @@ function json(data: unknown, status = 200, extraHeaders?: Headers): Response {
   h.set('content-type', JSON_CT);
   h.set('cache-control', 'no-store');
   return new Response(JSON.stringify(data), { status, headers: h });
+}
+
+function validateNewPanelPassword(password: string): void {
+  if (password === DEFAULTS.defaultPassword) {
+    throw new GzError('new password must differ from the bootstrap password', 'validation');
+  }
+  if (password.length < 8) throw new GzError('password too short (min 8)', 'validation');
 }
 
 function publicUser(u: GzUser): Record<string, unknown> {
@@ -181,7 +188,7 @@ export async function handlePanelApi(
       if (Object.keys(body).length !== 1 || typeof body.newPassword !== 'string') {
         throw new GzError('provide only newPassword', 'validation');
       }
-      if (body.newPassword.length < 8) throw new GzError('password too short (min 8)', 'validation');
+      validateNewPanelPassword(body.newPassword);
       const salt = randomHex(16);
       const hash = await pbkdf2Hex(body.newPassword, salt, eff.pwIterations);
       await saveSettings(db, (prev) => {
@@ -510,7 +517,7 @@ export async function handlePanelApi(
         }
         if (typeof body.newPassword === 'string' && body.newPassword.length > 0) {
           const pw = body.newPassword;
-          if (pw.length < 8) throw new GzError('password too short (min 8)', 'validation');
+          validateNewPanelPassword(pw);
           out.passwordSalt = randomHex(16);
           out.pwIterations = eff.pwIterations;
           // hash computed outside (async) — handled below

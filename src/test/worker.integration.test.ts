@@ -178,6 +178,20 @@ describe('Cloudflare Worker + D1 integration', () => {
       expect(blocked.status).toBe(428);
       expect(await blocked.json()).toMatchObject({ error: 'password_change_required' });
 
+      const tooShort = await productionWorker.dispatchFetch(base + '/password', {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie: oldCookie },
+        body: JSON.stringify({ newPassword: '1234567' }),
+      });
+      expect(tooShort.status).toBe(400);
+      expect(await tooShort.json()).toMatchObject({ error: 'password too short (min 8)' });
+
+      const bootstrapPassword = await productionWorker.dispatchFetch(base + '/password', {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie: oldCookie },
+        body: JSON.stringify({ newPassword: DEFAULTS.defaultPassword }),
+      });
+      expect(bootstrapPassword.status).toBe(400);
+      expect(await bootstrapPassword.json()).toMatchObject({ error: 'new password must differ from the bootstrap password' });
+
       const changed = await productionWorker.dispatchFetch(base + '/password', {
         method: 'POST', headers: { 'content-type': 'application/json', cookie: oldCookie },
         body: JSON.stringify({ newPassword: 'production-test-password' }),

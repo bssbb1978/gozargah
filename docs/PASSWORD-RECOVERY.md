@@ -4,6 +4,8 @@
 
 Production requires a password change when the PBKDF2 hash in D1 still matches the bootstrap password. The decision is made server-side; the persisted `isDefaultPassword` boolean is not trusted for that decision. This avoids blocking an older installation whose password was changed but whose marker was stale. Staging retains `FORCE_INITIAL_PASSWORD_CHANGE = "true"` as a force-on override.
 
+**Security warning:** the bootstrap password is the fixed, public repository constant `DEFAULTS.defaultPassword = "admin"` in `src/config.ts`; it is not generated per installation or supplied by an environment variable. An unchanged installation is therefore guessable by anyone who knows the public default until its first forced password change. The production gate prompts for a new password immediately after successful login, but does not make the known bootstrap credential secret before that change. Complete the change promptly and do not expose an unchanged installation.
+
 After a successful login with the initial password, only the password-change endpoint and logout remain available to that session. A successful change invalidates the old HMAC session and clears its cookie; sign in again using the new password. Login failures continue to use the D1-backed rate limit.
 
 Passwords are never included in events or logs. The emergency rollback variable `ALLOW_DEFAULT_PASSWORD = "true"` disables only automatic enforcement for the built-in password. It is a temporary break-glass setting: remove it as soon as access is restored. It does not override the staging force-on setting or an explicit recovery marker.
