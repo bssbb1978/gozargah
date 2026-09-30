@@ -219,31 +219,29 @@ async function main() {
     assert.ok(!JSON.stringify(templates).includes('shadowsocks'));
   });
 
-  await ok('origin diversity: WS, gRPC, HTTP/2, and XHTTP are emitted and observatory-ranked', () => {
+  await ok('origin diversity: supported WS, gRPC, HTTPUpgrade, and XHTTP are emitted and ranked', () => {
     const origin = {
       ORIGIN_ENGINE_HOST: 'origin.example',
-      ORIGIN_ENGINE_TRANSPORTS: 'ws,grpc,h2,xhttp',
+      // h2 is deliberately included to prove the strict allowlist drops it.
+      ORIGIN_ENGINE_TRANSPORTS: 'ws,grpc,httpupgrade,xhttp,h2',
     };
     const bundle = JSON.parse(buildAdaptiveClientBundle(HOST, USER, {}, origin));
     const templates = bundle.origin.protocol_templates as Record<string, Record<string, unknown>>;
-    for (const key of ['vmess_ws', 'vless_grpc', 'vless_h2', 'vless_xhttp', 'trojan_xhttp']) {
+    for (const key of ['vmess_ws', 'vless_grpc', 'vless_httpupgrade', 'vless_xhttp', 'trojan_xhttp']) {
       assert.ok(templates[key], 'missing origin transport template ' + key);
     }
-    assert.deepEqual(templates.vless_h2.alpn, ['h2']);
+    assert.ok(!Object.keys(templates).some((key) => key.endsWith('_h2')), 'HTTP/2 must not be emitted');
 
     const cfg = JSON.parse(buildXrayJson(HOST, USER, {}, origin));
     const outbounds = cfg.outbounds as Array<Record<string, any>>;
     const tags = outbounds.map((outbound) => outbound.tag as string);
-    for (const tag of ['origin-vmess-ws', 'origin-vless-grpc', 'origin-vless-h2', 'origin-vless-xhttp']) {
+    for (const tag of ['origin-vmess-ws', 'origin-vless-grpc', 'origin-vless-httpupgrade', 'origin-vless-xhttp']) {
       assert.ok(tags.includes(tag), 'missing Xray origin outbound ' + tag);
     }
-    const h2 = outbounds.find((outbound) => outbound.tag === 'origin-vless-h2')!;
-    assert.equal(h2.streamSettings.network, 'h2');
-    assert.deepEqual(h2.streamSettings.tlsSettings.alpn, ['h2']);
-    assert.deepEqual(h2.streamSettings.httpSettings.host, ['origin.example']);
+    assert.ok(!outbounds.some((outbound) => outbound.streamSettings?.network === 'h2'), 'Xray h2 network must not be generated');
     assert.deepEqual(cfg.observatory.subjectSelector, ['gz-', 'origin-']);
     const selector: string[] = cfg.routing.balancers[0].selector;
-    assert.ok(['origin-vless-grpc', 'origin-vless-h2', 'origin-vless-xhttp'].every((tag) => selector.includes(tag)));
+    assert.ok(['origin-vless-grpc', 'origin-vless-httpupgrade', 'origin-vless-xhttp'].every((tag) => selector.includes(tag)));
   });
 
   /* ---------------- quota semantics ---------------- */

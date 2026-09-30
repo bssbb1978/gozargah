@@ -17,7 +17,7 @@ for (const protocol of ['wireguard', 'hysteria2']) {
 const withEngine = protocolCatalog(true);
 const available = withEngine.filter((x) => x.ready);
 for (const [protocol, transport] of [
-  ['vless', 'xhttp'], ['vless', 'grpc'], ['vless', 'h2'], ['trojan', 'h2'], ['vless', 'httpupgrade'], ['trojan', 'xhttp'], ['vmess', 'ws'],
+  ['vless', 'xhttp'], ['vless', 'grpc'], ['vless', 'httpupgrade'], ['trojan', 'xhttp'], ['vmess', 'ws'],
 ]) {
   const row = available.find((x) => x.protocol === protocol && x.transport === transport);
   if (!row || row.boundary !== 'ORIGIN_ENGINE_REQUIRED' || row.deploymentValidation !== 'declared-not-tested') {
@@ -38,4 +38,28 @@ if (restricted.find((x) => x.protocol === 'vless' && x.transport === 'xhttp')?.s
 if (restricted.find((x) => x.protocol === 'vless' && x.transport === 'xhttp')?.ready) throw new Error('disabled xhttp was emitted');
 if (buildAdaptiveProtocolPolicy(withEngine).some((x) => x.protocol === 'wireguard' || x.protocol === 'hysteria2')) throw new Error('policy generated a profile without validated security/transport');
 if (ALPN_PROFILES.length !== 6 || new Set(ALPN_PROFILES.map((x) => x.join(','))).size !== 6) throw new Error('alpn profile catalog mismatch');
-console.log('protocol-catalog: ok');
+
+// Strict capability schema: this exact key set and ready-pair golden are part
+// of the release contract; adding a field or claiming a transport is deliberate.
+const capabilityKeys = [
+  'protocol', 'transport', 'alpn', 'security', 'mode', 'boundary', 'status', 'layer',
+  'generatorAvailable', 'liveVerificationAvailable', 'clientSupportRequired', 'requirements',
+  'incompatibilities', 'riskClass', 'ready', 'deploymentValidation', 'reason',
+].sort().join(',');
+for (const row of [...withoutEngine, ...withEngine]) {
+  if (Object.keys(row).sort().join(',') !== capabilityKeys) throw new Error('capability schema key drift');
+}
+const readyGolden = [
+  'shadowsocks:ws', 'trojan:ws', 'vless:grpc', 'vless:httpupgrade',
+  'vless:ws', 'vless:xhttp', 'vmess:ws', 'trojan:xhttp',
+].sort();
+const readyActual = available.map((x) => x.protocol + ':' + x.transport).sort();
+if (JSON.stringify(readyActual) !== JSON.stringify(readyGolden)) {
+  throw new Error('ready capability golden drift: ' + JSON.stringify(readyActual));
+}
+const h2 = protocolCatalog(true, ['h2' as const]).filter((x) => x.transport === 'h2');
+if (h2.some((x) => x.ready || x.generatorAvailable || x.deploymentValidation !== 'unsupported')) {
+  throw new Error('HTTP/2 must not be emitted as a supported Xray origin transport');
+}
+if (parseOriginTransports('h2').length !== 0) throw new Error('HTTP/2 must not be operator-enableable');
+console.log('protocol-catalog: strict schema + golden capabilities: ok');

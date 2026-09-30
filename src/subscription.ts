@@ -87,8 +87,6 @@ function originTemplates(capabilities: ProtocolCapability[], transports: readonl
   if (canGenerate('vless', 'xhttp')) templates.vless_xhttp = { protocol: 'vless', transport: 'xhttp', server: host, port, id: uuid, tls, path };
   if (canGenerate('trojan', 'xhttp')) templates.trojan_xhttp = { protocol: 'trojan', transport: 'xhttp', server: host, port, password, tls, path };
   if (canGenerate('vless', 'grpc')) templates.vless_grpc = { protocol: 'vless', transport: 'grpc', server: host, port, id: uuid, tls, alpn: ['h2'], service_name: 'g' };
-  if (canGenerate('vless', 'h2')) templates.vless_h2 = { protocol: 'vless', transport: 'h2', server: host, port, id: uuid, tls, alpn: ['h2'], path, host_header: host };
-  if (canGenerate('trojan', 'h2')) templates.trojan_h2 = { protocol: 'trojan', transport: 'h2', server: host, port, password, tls, alpn: ['h2'], path, host_header: host };
   if (canGenerate('vless', 'httpupgrade')) templates.vless_httpupgrade = { protocol: 'vless', transport: 'httpupgrade', server: host, port, id: uuid, tls, alpn: ['http/1.1'], path };
   return templates;
 }
@@ -938,14 +936,6 @@ export function buildXrayJson(
     if (canGenerateOrigin('vless', 'grpc')) {
       const stream = { network: 'grpc', security: 'tls', tlsSettings: { ...tlsSettings, alpn: ['h2'] }, grpcSettings: { serviceName: grpcService, multiMode: true } };
       addOrigin('origin-vless-grpc', 'vless', 'grpc', stream, { vnext: [{ address: originHost, port: originPort, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] });
-    }
-    if (canGenerateOrigin('vless', 'h2') && canGenerateOrigin('trojan', 'h2')) {
-      const stream = {
-        network: 'h2', security: 'tls', tlsSettings: { ...tlsSettings, alpn: ['h2'] },
-        httpSettings: { path: originPath, host: [originSni] },
-      };
-      addOrigin('origin-vless-h2', 'vless', 'h2', stream, { vnext: [{ address: originHost, port: originPort, users: [{ id: user.uuid, encryption: 'none', level: 0 }] }] });
-      addOrigin('origin-trojan-h2', 'trojan', 'h2', stream, { servers: [{ address: originHost, port: originPort, password: user.trojanPass, level: 0 }] });
     }
     if (canGenerateOrigin('vless', 'httpupgrade')) {
       const stream = { network: 'httpupgrade', security: 'tls', tlsSettings, httpupgradeSettings: { path: originPath, host: originSni } };

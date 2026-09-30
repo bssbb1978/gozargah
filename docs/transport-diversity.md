@@ -2,9 +2,9 @@
 
 ## Capability boundary
 
-The Cloudflare Worker data plane terminates native WebSocket profiles only. `axr`'s native VLESS tunnel adapter also speaks WebSocket (`ws` and `ws-alt`, where `ws-alt` is the alternate Worker path/profile shape), not gRPC, HTTP/2, or XHTTP. Those three transports are emitted only as direct-to-origin Xray profiles when `ORIGIN_ENGINE_HOST` is configured and each transport is enabled by `ORIGIN_ENGINE_TRANSPORTS`; their capability rows remain `declared-not-tested` because this repository cannot verify the operator's remote listener from a local dry-run.
+The Cloudflare Worker data plane terminates native WebSocket profiles only. `axr`'s native VLESS tunnel adapter also speaks WebSocket (`ws` and `ws-alt`, where `ws-alt` is the alternate Worker path/profile shape), not gRPC, HTTP/2, or XHTTP. gRPC, HTTPUpgrade, and XHTTP templates are emitted only as direct-to-origin Xray profiles when `ORIGIN_ENGINE_HOST` is configured and each transport is enabled by `ORIGIN_ENGINE_TRANSPORTS`; their capability rows remain `declared-not-tested` because this repository cannot verify the operator's remote listener from a local dry-run. HTTP/2 (`h2`) is intentionally not generated: current Xray documentation directs users to XHTTP, and the repository has no validated `h2` profile.
 
-The Xray `observatory` now probes both Worker (`gz-`) and configured origin (`origin-`) outbounds, and the `leastPing` balancer uses those live probe results for fallback. The emitted HTTP/2 profile uses Xray's `h2` network, ALPN `h2`, and the configured origin host/path. This is client-side Xray measurement, not a claim that a remote deployment has been tested here.
+The Xray `observatory` probes both Worker (`gz-`) and configured origin (`origin-`) outbounds, and the `leastPing` balancer uses live client-side probes for fallback. A passing probe only establishes reachability for that outbound at probe time; it does not certify an operator's deployment or end-to-end application behavior.
 
 ## AXR routing health
 
